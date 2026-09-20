@@ -1,4 +1,7 @@
+import importlib.util
 from pathlib import Path
+from types import ModuleType
+from uuid import UUID
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -12,6 +15,16 @@ from agent_api.knowledge.domain.statuses import (
 from agent_api.knowledge.infrastructure.database.models import Base
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.infrastructure.startup import EXPECTED_DATABASE_REVISION
+
+
+def _load_initial_migration() -> ModuleType:
+    """按文件加载首个迁移，避免数字开头的模块名无法常规导入。"""
+    path = Path.cwd() / "migrations" / "versions" / "20260920_0001_create_knowledge_schema.py"
+    spec = importlib.util.spec_from_file_location("knowledge_schema_migration", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_knowledge_schema_contains_all_source_of_truth_tables() -> None:
@@ -103,3 +116,14 @@ def test_alembic_head_matches_startup_revision() -> None:
     scripts = ScriptDirectory.from_config(config)
 
     assert scripts.get_current_head() == EXPECTED_DATABASE_REVISION
+
+
+def test_default_workspace_migration_binds_a_native_uuid() -> None:
+    """真实 PostgreSQL UUID 列不能接收被推断成 VARCHAR 的字符串参数。"""
+    migration = _load_initial_migration()
+
+    statement = migration._default_workspace_insert()
+    workspace_id = statement._bindparams["workspace_id"]
+
+    assert isinstance(workspace_id.value, UUID)
+    assert workspace_id.type.python_type is UUID

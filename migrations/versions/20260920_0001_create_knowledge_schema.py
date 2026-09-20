@@ -5,6 +5,7 @@ Outbox 都必须先落 PostgreSQL，之后才能异步构建检索索引。
 """
 
 from collections.abc import Sequence
+from uuid import UUID
 
 import sqlalchemy as sa
 from alembic import op
@@ -16,6 +17,21 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 DEFAULT_WORKSPACE_ID = "00000000-0000-0000-0000-000000000001"
+
+
+def _default_workspace_insert() -> sa.TextClause:
+    """构造带原生 UUID 类型的默认工作区插入语句。"""
+    return sa.text(
+        "INSERT INTO workspaces (id, name) "
+        "VALUES (:workspace_id, :name) ON CONFLICT (id) DO NOTHING"
+    ).bindparams(
+        sa.bindparam(
+            "workspace_id",
+            value=UUID(DEFAULT_WORKSPACE_ID),
+            type_=postgresql.UUID(as_uuid=True),
+        ),
+        name="Default workspace",
+    )
 
 
 def upgrade() -> None:
@@ -33,12 +49,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("name"),
     )
-    op.execute(
-        sa.text(
-            "INSERT INTO workspaces (id, name) "
-            "VALUES (:workspace_id, :name) ON CONFLICT (id) DO NOTHING"
-        ).bindparams(workspace_id=DEFAULT_WORKSPACE_ID, name="Default workspace")
-    )
+    op.execute(_default_workspace_insert())
 
     op.create_table(
         "knowledge_bases",

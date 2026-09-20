@@ -24,6 +24,7 @@
 - 多模型策略技术设计：[`../superpowers/specs/2026-09-19-multi-provider-model-strategy-design.md`](../superpowers/specs/2026-09-19-multi-provider-model-strategy-design.md)
 - 多模型策略实施计划：[`../superpowers/plans/2026-09-19-multi-provider-model-strategy.md`](../superpowers/plans/2026-09-19-multi-provider-model-strategy.md)
 - 原生知识库与多级 RAG 技术设计：[`../superpowers/specs/2026-09-20-native-knowledge-rag-design.md`](../superpowers/specs/2026-09-20-native-knowledge-rag-design.md)
+- 原生知识库中文链路说明：[`knowledge-infrastructure-flow.md`](knowledge-infrastructure-flow.md)
 - 集成验收报告：[`../verification/VERIFY-001.md`](../verification/VERIFY-001.md)
 - Agent 记忆改造验收：[`../verification/VERIFY-002.md`](../verification/VERIFY-002.md)
 - 多模型策略验收：[`../verification/VERIFY-003.md`](../verification/VERIFY-003.md)

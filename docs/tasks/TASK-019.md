@@ -24,6 +24,8 @@ write_scope:
   - pyproject.toml
   - .env.example
   - README.md
+  - docs/development/README.md
+  - docs/development/knowledge-infrastructure-flow.md
   - compose.yaml
   - alembic.ini
   - migrations/
@@ -39,7 +41,7 @@ write_scope:
   - tests/conftest.py
   - docs/tasks/TASK-019.md
 base_revision: 83c58e29e87019acc449de54d6ef368726a85668
-updated_at: 2026-09-20T20:23:03+08:00
+updated_at: 2026-09-20T20:39:59+08:00
 ---
 
 ## 目标
@@ -65,6 +67,7 @@ REQ-005 AC-001、AC-005、AC-011 及已确认设计第 3、6、7、12 节。
 - 增加 PostgreSQL/Redis/Milvus 启动检查、Milvus Dense + BM25 schema 安全创建与兼容性校验、Alembic 初始迁移、异步数据库运行时、固定版本 Compose、独立上传目录及 `uv.lock`。
 - 按 Milvus 2.6 官方部署资料固定 Milvus `v2.6.23` 与配套 MinIO 版本；现有 collection 不兼容时只失败，不删除或重建。
 - 依赖审计发现并修复开发环境中的 pytest/setuptools 公告；锁定 pytest 9.1.1、setuptools 83.0.0 后重新审计为零已知漏洞。
+- 根据用户可读性要求，为配置、生命周期、状态、ORM 模型、启动检查、存储、迁移与 Compose 补充中文职责/安全边界注释；新增中文链路文档，区分已实现启动链和后续入库、检索链。
 
 ## 验证证据
 
@@ -92,3 +95,4 @@ REQ-005 AC-001、AC-005、AC-011 及已确认设计第 3、6、7、12 节。
 - 2026-09-20T17:53:12+08:00：创建 approved 高优先级基础任务，status=todo。
 - 2026-09-20T18:15:56+08:00：`zq-flow` 选择任务并开始执行，owner=/root，status=in_progress；记录 Docker 不可用边界。
 - 2026-09-20T20:23:03+08:00：本地实现和质量门完成，status=verifying；等待真实容器集成证据。
+- 2026-09-20T20:39:59+08:00：补充中文代码注释与端到端链路文档，保持 status=verifying。

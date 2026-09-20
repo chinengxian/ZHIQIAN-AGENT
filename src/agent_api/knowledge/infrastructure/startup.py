@@ -28,6 +28,8 @@ _EXPECTED_MILVUS_FIELDS = {
 
 
 def build_milvus_schema(embedding_dimension: int) -> CollectionSchema:
+    """构造子块检索 schema：Dense 向量、BM25 稀疏向量和范围过滤字段。"""
+
     schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
     schema.add_field(
         field_name="chunk_id",
@@ -74,6 +76,8 @@ def validate_milvus_description(
     *,
     expected_dimension: int,
 ) -> None:
+    """只校验已有 collection，不做破坏性修复或隐式维度迁移。"""
+
     raw_fields = description.get("fields", [])
     if not isinstance(raw_fields, list):
         raise RuntimeError("Milvus collection schema is incompatible")
@@ -98,6 +102,8 @@ def validate_milvus_description(
 
 
 def build_milvus_indexes() -> object:
+    """创建 Dense HNSW 与 BM25 sparse 两路召回所需索引参数。"""
+
     indexes = MilvusClient.prepare_index_params()
     indexes.add_index(
         field_name="dense_vector",
@@ -115,6 +121,8 @@ def build_milvus_indexes() -> object:
 
 
 class StartupCheck(Protocol):
+    """统一的启动检查协议，便于测试替身和后续替换基础设施。"""
+
     name: str
 
     async def check(self) -> None: ...
@@ -123,23 +131,29 @@ class StartupCheck(Protocol):
 
 
 class StartupCheckError(RuntimeError):
+    """对外只携带检查名称，不传播可能包含凭据的底层异常文本。"""
+
     def __init__(self, check_name: str) -> None:
         self.check_name = check_name
         super().__init__(f"knowledge startup check failed: {check_name}")
 
 
 class KnowledgeStartup:
+    """顺序执行知识基础设施检查，并在失败或停机时逆序释放资源。"""
+
     def __init__(self, storage: LocalFileStorage, checks: Sequence[StartupCheck]) -> None:
         self.storage = storage
         self.checks = tuple(checks)
         self._initialized: list[StartupCheck] = []
 
     async def start(self) -> None:
+        # 文件目录先验证，因为它不需要网络且能快速发现危险/只读路径。
         self.storage.ensure_ready()
         for check in self.checks:
             try:
                 await check.check()
             except Exception:
+                # 当前检查失败时，只关闭此前已经成功初始化的资源。
                 await self._close_initialized()
                 raise StartupCheckError(check.name) from None
             self._initialized.append(check)
@@ -153,6 +167,8 @@ class KnowledgeStartup:
 
 
 class DatabaseStartupCheck:
+    """确认 PostgreSQL 可连接，并且 schema 已升级到应用期望版本。"""
+
     name = "database"
 
     def __init__(self, database_url: str) -> None:
@@ -170,6 +186,8 @@ class DatabaseStartupCheck:
 
 
 class RedisStartupCheck:
+    """确认异步任务依赖的 Redis 可以响应。"""
+
     name = "redis"
 
     def __init__(self, redis_url: str) -> None:
@@ -184,6 +202,8 @@ class RedisStartupCheck:
 
 
 class MilvusStartupCheck:
+    """创建首个 collection，或校验已有 collection 与当前配置兼容。"""
+
     name = "milvus"
 
     def __init__(
@@ -200,6 +220,7 @@ class MilvusStartupCheck:
         self._client: MilvusClient | None = None
 
     async def check(self) -> None:
+        # PyMilvus 是同步客户端，放入线程避免阻塞 FastAPI 事件循环。
         await asyncio.to_thread(self._check_sync)
 
     def _check_sync(self) -> None:
@@ -209,6 +230,7 @@ class MilvusStartupCheck:
         client = MilvusClient(**kwargs)
         self._client = client
         if not client.has_collection(collection_name=self._collection):
+            # 仅首次缺失时创建；已有 collection 永远不会被静默删除或覆盖。
             client.create_collection(
                 collection_name=self._collection,
                 schema=build_milvus_schema(self._embedding_dimension),
@@ -231,6 +253,8 @@ KnowledgeStartupFactory = Callable[[Settings], KnowledgeStartup]
 
 
 def create_knowledge_startup(settings: Settings) -> KnowledgeStartup:
+    """把已验证配置装配为存储、数据库、Redis、Milvus 四段启动链。"""
+
     token = settings.milvus_token.get_secret_value() if settings.milvus_token else None
     return KnowledgeStartup(
         LocalFileStorage(settings.storage_root),

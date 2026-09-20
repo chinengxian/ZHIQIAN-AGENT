@@ -1,6 +1,7 @@
 name: streaming-chat-agent
 
 services:
+  # PostgreSQL 是知识业务状态、正文、版本和任务的事实源。
   postgres:
     image: postgres:17.6-alpine
     environment:
@@ -17,6 +18,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  # Redis 用于后续 Celery 任务投递，不保存不可恢复的业务事实。
   redis:
     image: redis:7.4.2-alpine
     command: ["redis-server", "--appendonly", "yes"]
@@ -30,6 +32,7 @@ services:
     volumes:
       - redis_data:/data
 
+  # etcd 与 MinIO 是 Milvus Standalone 的内部依赖，不与原文件存储混用。
   etcd:
     image: quay.io/coreos/etcd:v3.5.25
     environment:
@@ -67,6 +70,7 @@ services:
     volumes:
       - milvus_objects:/minio_data
 
+  # Milvus 只保存可从 PostgreSQL 活动版本重建的 Dense/BM25 索引。
   milvus:
     image: milvusdb/milvus:v2.6.23
     command: ["milvus", "run", "standalone"]
@@ -95,6 +99,7 @@ services:
       - milvus_data:/var/lib/milvus
 
 volumes:
+  # 应用上传文件卷与 Milvus 内部对象卷显式分离，避免清理索引时误删原文件。
   agent_uploads:
   etcd_data:
   milvus_data:

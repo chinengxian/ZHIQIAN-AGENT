@@ -60,6 +60,12 @@ def _validate_http_url(
 
 
 class Settings(BaseSettings):
+    """应用的唯一配置入口。
+
+    所有环境变量统一使用 ``AGENT_`` 前缀；密钥和带凭据的连接串使用
+    ``SecretStr``，避免在日志、异常和调试输出中泄露。
+    """
+
     model_config = SettingsConfigDict(
         env_prefix="AGENT_",
         env_file=".env",
@@ -71,6 +77,7 @@ class Settings(BaseSettings):
     app_name: str = "Streaming Chat Agent"
     model_provider: ModelProvider
 
+    # 对话模型配置：只校验当前选中的供应商，未选中的字段不会阻止启动。
     openai_base_url: AnyHttpUrl | str | None = None
     openai_api_key: SecretStr | None = None
     openai_model: str | None = None
@@ -79,16 +86,20 @@ class Settings(BaseSettings):
     anthropic_model: str | None = None
     anthropic_base_url: AnyHttpUrl | str | None = None
 
+    # 知识库总开关关闭时，原有纯聊天模式不需要连接任何知识基础设施。
     knowledge_enabled: bool = False
+    # PostgreSQL 保存权威数据；Redis 只承载异步任务和短期协调状态。
     database_url: SecretStr = SecretStr("postgresql+asyncpg://agent:agent@127.0.0.1:5432/agent")
     redis_url: SecretStr = SecretStr("redis://127.0.0.1:6379/0")
     storage_root: Path = Path("data/uploads")
     max_upload_bytes: PositiveInt = 50 * 1024 * 1024
 
+    # Milvus 是可重建索引，不作为文档正文或任务状态的事实源。
     milvus_uri: str = "http://127.0.0.1:19530"
     milvus_token: SecretStr | None = None
     milvus_collection: str = "knowledge_chunks"
 
+    # Embedding 与聊天模型解耦，允许分别使用不同服务、模型和向量维度。
     embedding_provider: EmbeddingProvider = EmbeddingProvider.OPENAI
     embedding_base_url: AnyHttpUrl | str | None = None
     embedding_api_key: SecretStr | None = None
@@ -96,12 +107,13 @@ class Settings(BaseSettings):
     embedding_dimension: PositiveInt = 1536
     embedding_batch_size: PositiveInt = 32
 
+    # Rerank 是可选后处理；none 表示只使用 Dense/BM25 的 RRF 融合结果。
     rerank_provider: RerankProvider = RerankProvider.NONE
     rerank_model: str | None = None
     rerank_device: str = "cpu"
     rerank_batch_size: PositiveInt = 8
 
-    # 钩子函数，用于校验大模型配置
+    # 根据模型供应商做条件校验，避免要求用户同时填写两套凭据。
     @model_validator(mode="after")
     def validate_selected_provider(self) -> Self:
         errors: list[InitErrorDetails] = []
@@ -195,6 +207,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_knowledge_configuration(self) -> Self:
+        """启用知识库时一次性校验所有必需配置，尽量在启动前失败。"""
+
         if not self.knowledge_enabled:
             return self
 
@@ -274,7 +288,7 @@ class Settings(BaseSettings):
             )
         return self
 
-    # 转化简化错误信息
+    # 重建 Pydantic 错误时清空 input，避免连接串和 API Key 进入异常文本。
     @model_validator(mode="wrap")
     @classmethod
     def sanitize_validation_errors(

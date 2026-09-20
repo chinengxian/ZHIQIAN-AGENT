@@ -1,3 +1,5 @@
+"""Alembic 运行入口：线上从环境变量取连接串，并使用异步 SQLAlchemy 引擎。"""
+
 import asyncio
 import os
 from logging.config import fileConfig
@@ -15,12 +17,15 @@ if config.config_file_name is not None:
 
 database_url = os.environ.get("AGENT_DATABASE_URL")
 if database_url:
+    # Alembic 的 ConfigParser 会解释百分号，写入前必须转义。
     config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 
 target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
+    """只生成 SQL，不连接数据库；用于 CI 和本机静态检查。"""
+
     context.configure(
         url=config.get_main_option("sqlalchemy.url"),
         target_metadata=target_metadata,
@@ -39,6 +44,8 @@ def run_sync_migrations(connection: Connection) -> None:
 
 
 async def run_migrations_online() -> None:
+    """连接 PostgreSQL，并把 Alembic 的同步迁移函数桥接到异步连接。"""
+
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",

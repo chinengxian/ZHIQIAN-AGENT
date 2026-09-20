@@ -27,6 +27,8 @@ from agent_api.knowledge.domain.statuses import (
     VersionStatus,
 )
 
+# PostgreSQL 是知识状态、正文、版本和引用的事实源；Milvus 只保存可重建索引。
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -37,6 +39,8 @@ class Base(DeclarativeBase):
 
 
 class TimestampMixin:
+    """为业务表提供带时区的 UTC 创建/更新时间。"""
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -46,6 +50,8 @@ class TimestampMixin:
 
 
 class Workspace(TimestampMixin, Base):
+    """工作区隔离边界；首版由迁移创建一个固定工作区。"""
+
     __tablename__ = "workspaces"
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -53,6 +59,8 @@ class Workspace(TimestampMixin, Base):
 
 
 class KnowledgeBase(TimestampMixin, Base):
+    """知识库及其分块、检索策略配置。"""
+
     __tablename__ = "knowledge_bases"
     __table_args__ = (
         UniqueConstraint("workspace_id", "name", name="uq_knowledge_bases_workspace_name"),
@@ -73,6 +81,12 @@ class KnowledgeBase(TimestampMixin, Base):
 
 
 class Document(TimestampMixin, Base):
+    """面向用户的文档记录。
+
+    ``active_version_id`` 是在线检索的唯一版本指针。新版本只有在解析、
+    Embedding、Milvus 写入和完整性检查都成功后才能原子切换到这里。
+    """
+
     __tablename__ = "documents"
     __table_args__ = (Index("ix_documents_kb_status", "knowledge_base_id", "status"),)
 
@@ -102,6 +116,8 @@ class Document(TimestampMixin, Base):
 
 
 class DocumentVersion(Base):
+    """不可变的文档处理版本，记录解析器和 Embedding 指纹以便重建。"""
+
     __tablename__ = "document_versions"
     __table_args__ = (
         UniqueConstraint("document_id", "version_no", name="uq_document_versions_number"),
@@ -136,6 +152,8 @@ class DocumentVersion(Base):
 
 
 class Chunk(Base):
+    """PostgreSQL 中保存的父子块正文及来源定位信息。"""
+
     __tablename__ = "chunks"
     __table_args__ = (
         UniqueConstraint(
@@ -169,6 +187,8 @@ class Chunk(Base):
 
 
 class IngestionJob(TimestampMixin, Base):
+    """异步入库任务及恢复所需的心跳、重试和幂等信息。"""
+
     __tablename__ = "ingestion_jobs"
     __table_args__ = (Index("ix_ingestion_jobs_status_heartbeat", "status", "heartbeat_at"),)
 
@@ -196,6 +216,12 @@ class IngestionJob(TimestampMixin, Base):
 
 
 class OutboxEvent(Base):
+    """与业务数据同事务写入的待投递事件。
+
+    Dispatcher 后续将 pending 事件投递到 Redis/Celery；即使队列短暂不可用，
+    已提交的文档任务仍可从本表恢复。
+    """
+
     __tablename__ = "outbox_events"
     __table_args__ = (Index("ix_outbox_events_status_available", "status", "available_at"),)
 

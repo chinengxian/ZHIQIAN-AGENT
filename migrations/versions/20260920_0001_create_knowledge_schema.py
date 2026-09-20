@@ -1,4 +1,8 @@
-"""Create the native knowledge source-of-truth schema."""
+"""创建原生知识库的 PostgreSQL 事实源 schema。
+
+Milvus 不保存权威状态，因此工作区、知识库、文档版本、父子块、任务和
+Outbox 都必须先落 PostgreSQL，之后才能异步构建检索索引。
+"""
 
 from collections.abc import Sequence
 
@@ -15,6 +19,7 @@ DEFAULT_WORKSPACE_ID = "00000000-0000-0000-0000-000000000001"
 
 
 def upgrade() -> None:
+    # 首版固定单工作区；保留 workspace_id 让后续多用户/多租户无需重做领域模型。
     op.create_table(
         "workspaces",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
@@ -121,6 +126,7 @@ def upgrade() -> None:
         "ix_document_versions_document_status", "document_versions", ["document_id", "status"]
     )
     op.create_index("ix_document_versions_sha256", "document_versions", ["sha256"])
+    # documents 与 versions 互相引用，先建两张表，再补活动版本外键以打破建表环。
     op.create_foreign_key(
         "fk_documents_active_version_id",
         "documents",
@@ -220,6 +226,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # 按依赖关系逆序删除；生产环境回滚仍优先使用新的前向迁移。
     op.drop_index("ix_outbox_events_status_available", table_name="outbox_events")
     op.drop_table("outbox_events")
     op.drop_index("ix_ingestion_jobs_status_heartbeat", table_name="ingestion_jobs")

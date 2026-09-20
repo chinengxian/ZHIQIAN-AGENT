@@ -7,6 +7,7 @@
 - Python 3.11+
 - Node.js 20 LTS 或 22 LTS
 - 支持 OpenAI Chat Completions 协议的模型服务，或 Anthropic API
+- 启用知识库时需要 Docker Desktop（WSL 2 后端）和至少 8 GB 可用内存
 
 ## 后端启动
 
@@ -37,6 +38,25 @@ AGENT_ANTHROPIC_MODEL=replace-me
 ```
 
 从旧版升级的 OpenAI 部署必须在原有三项配置之外增加 `AGENT_MODEL_PROVIDER=openai`，否则后端会因缺少必填供应商而无法启动。未选中供应商的配置字段会被忽略；为避免配置歧义，建议 `.env` 只保留当前所选供应商的字段。
+
+## 知识基础设施
+
+`.env.example` 默认启用原生知识库。PostgreSQL 保存权威业务状态和正文，Milvus 保存可重建的 Dense/BM25 索引，Redis 用于异步任务，原文件写入独立的 `AGENT_STORAGE_ROOT`。Embedding 配置与聊天模型完全独立。
+
+启动基础设施并应用迁移：
+
+```powershell
+docker compose up -d postgres redis etcd minio milvus
+.\.venv\Scripts\python.exe -m alembic upgrade head
+```
+
+首次启动 API 时，如果 Milvus collection 不存在，应用会按当前 `AGENT_EMBEDDING_DIMENSION` 创建包含 Dense、BM25 sparse 和知识范围字段的 collection；如果 collection 已存在但 schema 或维度不兼容，启动会安全失败且不会删除或重建已有索引。PostgreSQL、Redis、Milvus、迁移版本和存储目录任一校验失败时，API 都不会进入就绪状态。
+
+只运行原有聊天功能时可以设置：
+
+```dotenv
+AGENT_KNOWLEDGE_ENABLED=false
+```
 
 启动 API：
 
@@ -112,7 +132,9 @@ src/agent_api/
   api/          # HTTP 与 SSE 边界
   core/         # 配置和 lifespan 初始化
   llm/          # 统一 Agent、供应商策略注册表及 OpenAI/Anthropic 模型适配
+  knowledge/    # 知识领域状态、PostgreSQL/Milvus/Redis 与文件存储基础设施
   schemas/      # 请求模型
+migrations/     # Alembic 数据库迁移
 tests/          # 后端测试与浏览器联调夹具
 web/src/
   components/   # 对话工作台组件

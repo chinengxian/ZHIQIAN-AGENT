@@ -56,11 +56,11 @@
 - 实现与验证：前后端实现与 REQ-004 最终复验均已完成；历史失效证据、最终新鲜命令和边界说明见 VERIFY-003。
 - 增量改造：TASK-009～TASK-012 全部完成；`create_agent` 短期记忆、前端新契约和桌面／移动全栈验收均通过。
 - 多模型策略：REQ-004 已完成。TASK-016 与 TASK-017 均为 `done`，VERIFY-003 为 `PASS`。最终新鲜证据为 12 项聚焦验收、69 个后端测试、Ruff／format／mypy／依赖门，以及固定 Node v22.23.2 下 20 个前端测试、构建和 desktop/mobile E2E；未选中畸形 URL、不可变注册表、未知 provider 与同／异会话并发要求均已显式覆盖。
-- 原生知识库规划：REQ-005 与技术设计已确认；TASK-018 已完成任务拆解，TASK-019～TASK-025 为 approved 且尚未开始。Wiki 仅登记为 TASK-026 proposed，不进入当前阶段。
+- 原生知识库开发：REQ-005 与技术设计已确认；TASK-019 已完成本地基础设施实现并处于 `verifying`，96 项后端测试及静态质量门通过。当前主机缺少 Docker，真实 PostgreSQL/Redis/Milvus 验证尚未运行；TASK-020～TASK-025 尚未开始。Wiki 仅登记为 TASK-026 proposed。
 - Git：当前目录现为 Git 仓库；原生知识库设计基线为 `83c58e2`，新任务从该修订开始。
 
 ## 恢复入口
 
 REQ-003 与 REQ-004 均已完成，证据分别见 VERIFY-002 与 VERIFY-003。若继续多模型工作，从已关闭的 TASK-016／TASK-017 和 VERIFY-003 的范围边界恢复；当前没有遗留实现阻碍。部署时用户仍须在私有 `.env` 显式增加 `AGENT_MODEL_PROVIDER` 并重启；真实付费供应商验证为 `not_run`，生产持久化、工具调用、请求级选模、热切换和记忆治理不在当前范围。
 
-若开始原生知识库开发，默认按单任务顺序推进：TASK-019 → TASK-020 → TASK-021 → TASK-022 → TASK-023 → TASK-024 → TASK-025。只有用户明确要求并行时才调整分派；TASK-026 未获执行授权。
+恢复原生知识库开发时先完成 TASK-019 的容器验证：安装并启动 Docker Desktop（WSL 2），启动 Compose 的 PostgreSQL、Redis、etcd、MinIO、Milvus，应用 Alembic head，并以启用知识库的配置启动 API。通过后将 TASK-019 关闭，再按 TASK-020 → TASK-021 → TASK-022 → TASK-023 → TASK-024 → TASK-025 顺序推进；TASK-026 未获执行授权。

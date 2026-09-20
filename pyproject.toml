@@ -9,12 +9,17 @@ description = "Minimal full-stack streaming chat agent"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "alembic>=1.16,<2",
+  "asyncpg>=0.30,<1",
   "fastapi>=0.116,<1",
   "langchain>=1.0,<2",
   "langchain-anthropic>=1.0,<2",
   "langchain-openai>=1.0,<2",
   "langgraph>=1.0,<2",
   "pydantic-settings>=2.10,<3",
+  "pymilvus>=2.6,<3",
+  "redis>=6,<7",
+  "sqlalchemy[asyncio]>=2.0,<3",
   "uvicorn[standard]>=0.35,<1",
 ]
 
@@ -23,9 +28,10 @@ dev = [
   "asgi-lifespan>=2.1,<3",
   "httpx>=0.28,<1",
   "mypy>=1.17,<2",
-  "pytest>=8.4,<9",
+  "pytest>=9.0.3,<10",
   "pytest-asyncio>=1.1,<2",
   "ruff>=0.12,<1",
+  "setuptools>=83,<84",
 ]
 
 [tool.hatch.build.targets.wheel]

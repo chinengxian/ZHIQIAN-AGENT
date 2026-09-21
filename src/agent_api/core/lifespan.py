@@ -4,6 +4,8 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from fastapi import FastAPI
 
 from agent_api.core.config import Settings, get_settings
+from agent_api.knowledge.application.management import SqlAlchemyKnowledgeManagementService
+from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.infrastructure.startup import (
     KnowledgeStartupFactory,
     create_knowledge_startup,
@@ -32,26 +34,42 @@ def create_lifespan(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings = settings_factory()
         knowledge_startup = None
+        knowledge_database = None
+        knowledge_management = None
         try:
             # 知识库关闭时完全跳过 PostgreSQL、Redis、Milvus 和存储目录初始化。
             if settings.knowledge_enabled:
                 knowledge_startup = knowledge_startup_factory(settings)
                 await knowledge_startup.start()
+                knowledge_database = DatabaseRuntime(settings.database_url.get_secret_value())
+                knowledge_management = SqlAlchemyKnowledgeManagementService(
+                    knowledge_database.session_factory,
+                    knowledge_startup.storage,
+                    settings,
+                )
             chat_agent = agent_factory(settings)
             # 所有构造均成功后再一次性发布共享资源。
             app.state.settings = settings
             app.state.chat_agent = chat_agent
             if knowledge_startup is not None:
                 app.state.knowledge_startup = knowledge_startup
+                app.state.knowledge_database = knowledge_database
+                app.state.knowledge_management = knowledge_management
             yield
         finally:
             # 先撤销外部可见状态，再关闭底层连接，避免停机期间继续被读取。
             if hasattr(app.state, "knowledge_startup"):
                 del app.state.knowledge_startup
+            if hasattr(app.state, "knowledge_management"):
+                del app.state.knowledge_management
+            if hasattr(app.state, "knowledge_database"):
+                del app.state.knowledge_database
             if hasattr(app.state, "chat_agent"):
                 del app.state.chat_agent
             if hasattr(app.state, "settings"):
                 del app.state.settings
+            if knowledge_database is not None:
+                await knowledge_database.close()
             if knowledge_startup is not None:
                 await knowledge_startup.close()
 

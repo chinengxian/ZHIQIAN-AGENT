@@ -45,5 +45,6 @@ class OutboxStatus(StrEnum):
     """事务内事件投递状态，用于避免数据库已提交但队列消息丢失。"""
 
     PENDING = "pending"
+    PROCESSING = "processing"
     PUBLISHED = "published"
     FAILED = "failed"

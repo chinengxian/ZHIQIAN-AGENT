@@ -57,11 +57,11 @@
 - 实现与验证：前后端实现与 REQ-004 最终复验均已完成；历史失效证据、最终新鲜命令和边界说明见 VERIFY-003。
 - 增量改造：TASK-009～TASK-012 全部完成；`create_agent` 短期记忆、前端新契约和桌面／移动全栈验收均通过。
 - 多模型策略：REQ-004 已完成。TASK-016 与 TASK-017 均为 `done`，VERIFY-003 为 `PASS`。最终新鲜证据为 12 项聚焦验收、69 个后端测试、Ruff／format／mypy／依赖门，以及固定 Node v22.23.2 下 20 个前端测试、构建和 desktop/mobile E2E；未选中畸形 URL、不可变注册表、未知 provider 与同／异会话并发要求均已显式覆盖。
-- 原生知识库开发：REQ-005 与技术设计已确认；TASK-019 已完成，Docker/WSL2、PostgreSQL、Redis、etcd、MinIO、Milvus、Alembic 在线迁移与应用启动检查均已真实通过，97 项后端测试及静态质量门通过。TASK-020 为下一开发任务；TASK-021～TASK-025 尚未开始。Wiki 仅登记为 TASK-026 proposed。
+- 原生知识库开发：REQ-005 与技术设计已确认；TASK-019 与 TASK-020 已完成。TASK-020 的知识管理 API、四格式入库、版本切换、Worker/Redis/API 重启恢复等 25 项真实容器集成均通过；默认后端测试 137 passed、25 skipped，静态质量门通过。TASK-021 为下一开发任务；TASK-022～TASK-025 尚未开始。Wiki 仅登记为 TASK-026 proposed。
 - Git：当前目录现为 Git 仓库；原生知识库设计基线为 `83c58e2`，新任务从该修订开始。
 
 ## 恢复入口
 
 REQ-003 与 REQ-004 均已完成，证据分别见 VERIFY-002 与 VERIFY-003。若继续多模型工作，从已关闭的 TASK-016／TASK-017 和 VERIFY-003 的范围边界恢复；当前没有遗留实现阻碍。部署时用户仍须在私有 `.env` 显式增加 `AGENT_MODEL_PROVIDER` 并重启；真实付费供应商验证为 `not_run`，生产持久化、工具调用、请求级选模、热切换和记忆治理不在当前范围。
 
-恢复原生知识库开发时从 TASK-020 的文档入库后端开始，再按 TASK-021 → TASK-022 → TASK-023 → TASK-024 → TASK-025 顺序推进；TASK-019 的容器与迁移基线已完成，TASK-026 未获执行授权。
+恢复原生知识库开发时从 TASK-021 知识管理工作台开始，再按 TASK-022 → TASK-023 → TASK-024 → TASK-025 顺序推进；TASK-019 的容器与迁移基线、TASK-020 的文档入库后端均已完成，TASK-026 未获执行授权。

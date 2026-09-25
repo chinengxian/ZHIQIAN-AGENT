@@ -30,4 +30,16 @@ describe('createSseParser', () => {
     parser.push('event: message\ndata: {"content":"partial"}')
     expect(() => parser.finish()).toThrow('SSE 流意外中断')
   })
+
+  it('parses knowledge status and public sources', () => {
+    const events: unknown[] = []
+    const parser = createSseParser((event) => events.push(event))
+    parser.push('event: status\ndata: {"stage":"retrieving"}\n\n')
+    parser.push('event: sources\ndata: {"items":[{"citation_id":"[1]","chunk_id":"chunk","document_id":"doc","document_version_id":"version","title":"指南","filename":"guide.pdf","page_start":2,"page_end":3,"heading_path":["安装"],"excerpt":"步骤","score":0.8,"rank":1}]}\n\n')
+    parser.finish()
+    expect(events).toMatchObject([
+      { event: 'status', data: { stage: 'retrieving' } },
+      { event: 'sources', data: { items: [{ citation_id: '[1]', title: '指南', page_start: 2 }] } },
+    ])
+  })
 })

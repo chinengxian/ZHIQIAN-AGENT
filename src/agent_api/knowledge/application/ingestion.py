@@ -290,6 +290,9 @@ class IngestionPipeline:
     async def run(self, job_id: UUID) -> None:
         try:
             context = await self._repository.load_context(job_id)
+        except IngestionAlreadyClaimed:
+            # 至少一次队列投递的重复消息已由别的消费者领取，直接确认即可。
+            return
         except Exception:
             # 此处尚无版本上下文；交由队列重试，避免泄漏连接串或文件路径。
             raise IngestionPipelineError("ingestion_unavailable") from None
@@ -358,3 +361,7 @@ class IngestionPipelineError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class IngestionAlreadyClaimed(RuntimeError):
+    """当前任务已经被领取或完成，重复投递无需重试。"""

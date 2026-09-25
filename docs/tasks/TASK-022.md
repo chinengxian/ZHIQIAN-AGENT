@@ -1,11 +1,11 @@
 ---
 id: TASK-022
 title: 实现混合检索与 Agent 知识工具
-status: todo
+status: done
 execution_scope: approved
 kind: backend
 priority: high
-owner: unassigned
+owner: 23196
 depends_on:
   - TASK-020
 requirements:
@@ -22,6 +22,9 @@ read_refs:
   - src/agent_api/llm/protocol.py
   - src/agent_api/api/chat.py
   - src/agent_api/schemas/chat.py
+  - src/agent_api/core/lifespan.py
+  - pyproject.toml
+  - uv.lock
 write_scope:
   - src/agent_api/knowledge/application/retrieval.py
   - src/agent_api/knowledge/application/citations.py
@@ -37,8 +40,8 @@ write_scope:
   - tests/test_chat_knowledge_stream.py
   - tests/test_prompt_injection_boundary.py
   - docs/tasks/TASK-022.md
-base_revision: 83c58e29e87019acc449de54d6ef368726a85668
-updated_at: 2026-09-20T17:53:12+08:00
+base_revision: 4d95039a5f056caaca9b187c1cb747d92686ef0b
+updated_at: 2026-09-22T03:00:00+08:00
 ---
 
 ## 目标
@@ -58,19 +61,21 @@ REQ-005 AC-006～AC-008、AC-010 及设计第 8～10、13 节。
 
 ## 实施记录
 
-尚未开始。
+- 2026-09-22：`zq-flow` 在 TASK-021 完成后选中本任务，TASK-020 依赖已满足，开始检索、工具与聊天契约实现。
+- 2026-09-22：实现真实 Milvus Dense/BM25/RRF 检索、活动版本和启用范围过滤、可选 BGE Rerank 降级、父块上下文、三个受限只读工具、请求知识范围及 status/sources SSE。未显式提交知识范围的旧聊天仍使用原事件契约。
 
 ## 验证证据
 
 | AC／条件 | 环境与命令／操作 | 结果 | 证据与修订 |
 | --- | --- | --- | --- |
-| AC-006 | 待执行真实 Milvus 混合检索与降级测试 | not_run | 实现后记录 |
-| AC-007 | 待执行确定性 Agent 工具测试 | not_run | 实现后记录 |
-| AC-008/010 | 待执行 schema/SSE/引用测试 | not_run | 实现后记录 |
+| AC-006 | `RUN_KNOWLEDGE_INTEGRATION=1` 运行 `tests/test_hybrid_retrieval.py`，真实 PostgreSQL/Milvus | pass | 1 通过；hybrid/semantic/keyword、范围、停用和旧版本过滤、Rerank 故障回退 RRF |
+| AC-007 | `tests/test_knowledge_tools.py`、`tests/test_prompt_injection_boundary.py` | pass | 只读工具、受限 schema、来源去重和跨 chunk 引用过滤 |
+| AC-008/010 | `tests/test_chat_knowledge_stream.py`；`pytest -q` | pass | status/sources/message 及旧聊天契约；全套 143 通过、26 跳过 |
+| 启动和静态门 | `ruff check src tests`、`ruff format --check src tests`、`mypy src`、`uv lock --check`、真实 Uvicorn `/health` | pass | `/health` 返回 200 `{"status":"ok"}`；可选 Rerank 依赖未安装时保持基础检索可用 |
 
 ## 阻碍与解除条件
 
-依赖 TASK-020 的活动版本和 chunk hydrate 接口。Reranker 模型不可用时必须证明 RRF 降级，而不是阻塞核心检索。
+无。Reranker 模型为可选依赖；不可用或执行失败时退回 RRF，不阻塞核心检索。真实付费模型调用未在本任务执行。
 
 ## 后续事项
 
@@ -78,8 +83,10 @@ REQ-005 AC-006～AC-008、AC-010 及设计第 8～10、13 节。
 
 ## 交接
 
-完成后向 TASK-023 提供冻结的 `knowledge_scope`、`status` 和 `sources` 契约；向 TASK-025 提供检索测试入口和指标输出。
+向 TASK-023 提供请求 `knowledge_scope: {mode: "all_enabled" | "selected", knowledge_base_ids?: string[]}`；显式设置范围时 SSE 依次可出现 `status`、`sources`、`message`、`done`/`error`，旧请求仍只有旧事件。`sources` 的公开元数据由 `Source` 定义，不含磁盘路径。向 TASK-025 提供真实检索测试入口 `RUN_KNOWLEDGE_INTEGRATION=1`。
 
 ## 变更历史
 
 - 2026-09-20T17:53:12+08:00：创建 approved 后端检索任务，status=todo。
+- 2026-09-22T02:11:34+08:00：依赖已满足，`todo → in_progress`。
+- 2026-09-22：真实检索、完整回归和服务启动通过，`in_progress → done`。

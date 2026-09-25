@@ -13,6 +13,7 @@ from pymilvus import MilvusClient
 from sqlalchemy import select
 
 from agent_api.knowledge.application.management import SqlAlchemyKnowledgeManagementService
+from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.infrastructure.database.models import (
     Document,
     DocumentVersion,
@@ -154,7 +155,7 @@ async def test_worker_restart_recovers_stale_upload_from_outbox(tmp_path: Path) 
         await publisher.publish(
             PendingEvent(
                 id=uuid4(),
-                event_type="document.ingestion.requested",
+                event_type=OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
                 aggregate_id=version_id,
                 payload={"job_id": str(accepted["job_id"])},
             )
@@ -269,7 +270,7 @@ async def test_worker_embedding_outage_uses_durable_retry_outbox(tmp_path: Path)
         await publisher.publish(
             PendingEvent(
                 id=uuid4(),
-                event_type="document.ingestion.requested",
+                event_type=OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
                 aggregate_id=version_id,
                 payload={"job_id": str(accepted["job_id"])},
             )

@@ -26,6 +26,7 @@ from agent_api.knowledge.application.management import (
     KnowledgeConflictError,
     SqlAlchemyKnowledgeManagementService,
 )
+from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.infrastructure.database.models import (
     Chunk,
     Document,
@@ -551,8 +552,9 @@ async def test_embedding_outage_retries_same_persisted_job(tmp_path: Path) -> No
             knowledge_base_id, "embedding.txt", "text/plain", "向量故障正文".encode()
         )
         embedder = FlakyEmbedder()
+        repository = SqlAlchemyIngestionRepository(runtime.session_factory, storage)
         pipeline = IngestionPipeline(
-            repository=SqlAlchemyIngestionRepository(runtime.session_factory, storage),
+            repository=repository,
             parser=FixedParser(),
             chunker=ParentChildChunker(),
             embedder=embedder,
@@ -565,6 +567,7 @@ async def test_embedding_outage_retries_same_persisted_job(tmp_path: Path) -> No
             failed_job = await session.get(IngestionJob, accepted["job_id"])
         assert failed_job is not None and failed_job.status == "failed"
 
+        assert await repository.schedule_retry(accepted["job_id"], delay_seconds=0)
         await pipeline.run(accepted["job_id"])
 
         async with runtime.session_factory() as session:
@@ -982,7 +985,7 @@ async def test_real_redis_worker_consumes_document_deletion(tmp_path: Path) -> N
         await publisher.publish(
             PendingEvent(
                 id=uuid4(),
-                event_type="document.deletion.requested",
+                event_type=OutboxEventType.DOCUMENT_DELETION_REQUESTED,
                 aggregate_id=accepted["document_id"],
                 payload={
                     "job_id": str(deletion["job_id"]),
@@ -1070,7 +1073,7 @@ async def test_queued_upload_becomes_ready_after_worker_starts(tmp_path: Path) -
         await publisher.publish(
             PendingEvent(
                 id=uuid4(),
-                event_type="document.ingestion.requested",
+                event_type=OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
                 aggregate_id=version_id,
                 payload={"job_id": str(accepted["job_id"])},
             )

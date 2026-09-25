@@ -1,14 +1,15 @@
 ---
 id: TASK-026
 title: 设计 Wiki 衍生知识阶段
-status: todo
-execution_scope: proposed
+status: done
+execution_scope: approved
 kind: architecture
 priority: normal
-owner: unassigned
+owner: 23196
 depends_on:
   - TASK-025
-requirements: []
+requirements:
+  - REQ-006
 acceptance:
   - 定义 source knowledge base 到 Wiki synthesis 的关系和增量更新规则
   - 定义 Wiki 页面、版本、来源链接、编辑、diff、回滚和引用失效契约
@@ -18,15 +19,19 @@ read_refs:
   - docs/superpowers/specs/2026-09-20-native-knowledge-rag-design.md
   - docs/verification/VERIFY-004.md
   - docs/requirements/REQ-005.md
+  - docs/requirements/REQ-006.md
+  - docs/superpowers/specs/2026-09-22-wiki-synthesis-design.md
+  - docs/superpowers/plans/2026-09-22-wiki-synthesis.md
 write_scope:
   - docs/requirements/REQ-006.md
   - docs/decisions/
   - docs/superpowers/specs/
+  - docs/superpowers/plans/2026-09-22-wiki-synthesis.md
   - docs/tasks/TASK-026.md
   - docs/tasks/INDEX.md
   - docs/development/README.md
-base_revision: 83c58e29e87019acc449de54d6ef368726a85668
-updated_at: 2026-09-20T17:53:12+08:00
+base_revision: 4d95039a5f056caaca9b187c1cb747d92686ef0b
+updated_at: 2026-09-22T19:25:25+08:00
 ---
 
 ## 目标
@@ -46,17 +51,22 @@ updated_at: 2026-09-20T17:53:12+08:00
 
 ## 实施记录
 
-尚未开始。
+已根据用户请求完成 WeKnora 对照、REQ-006 需求草案、Wiki 技术设计与实施计划草案。用户随后要求“下一步”，继续本任务的需求收敛和架构设计；Wiki 代码实施仍未开始。
 
 ## 验证证据
 
 | AC／条件 | 环境与命令／操作 | 结果 | 证据与修订 |
 | --- | --- | --- | --- |
-| 独立设计门 | 待 TASK-025 完成后执行 | not_run | proposed，不进入当前阶段 |
+| 需求发现 | 查阅 WeKnora 当前 Wiki 文档及本仓库知识模型，记录用户选择 | pass | `docs/requirements/REQ-006.md` 修订 2；仅限需求草案 |
+| Wiki 数据与生成架构 | 检查现有模型、Worker、outbox、删除与 chunk 重写路径 | pass | `docs/superpowers/specs/2026-09-22-wiki-synthesis-design.md`；含来源、并发、用量和恢复契约 |
+| 页面版本与引用失效 | 对照 REQ-006 的人工编辑、回滚、来源删除规则 | pass | 设计稿“数据与权限”“接口契约”；REQ-006 修订 7 |
+| Wiki 与 GraphRAG 比较 | 对照现有 RAG 与 WeKnora 图谱参考 | pass | 设计稿“选择与影响”；GraphRAG 仅在独立收益证据成立后考虑 |
+| 独立实施计划 | 分解依赖、文件归属与集成验收 | pass | `docs/superpowers/plans/2026-09-22-wiki-synthesis.md`；未创建实现任务 |
+| 独立规格确认 | 提供完整需求、设计、计划供用户审阅 | pass | 用户于 2026-09-22 回复“按此规格实施”；REQ-006 修订 8；已建立 TASK-027～031 |
 
 ## 阻碍与解除条件
 
-执行范围尚未批准，且依赖 TASK-025。用户明确批准 Wiki 设计阶段并完成高级 RAG 验收后，才可改为 approved。
+无；独立规格已确认，Wiki 实现任务已获授权。
 
 ## 后续事项
 
@@ -64,8 +74,12 @@ updated_at: 2026-09-20T17:53:12+08:00
 
 ## 交接
 
-当前协调者只保留该任务记录；本轮不得开始 REQ-006 或 Wiki 代码。
+从 REQ-006 修订 8、已确认技术设计与实施计划恢复；TASK-027 是第一项实现任务，后续依赖见 TASK-028～031。
 
 ## 变更历史
 
 - 2026-09-20T17:53:12+08:00：登记 proposed 后续设计任务，status=todo。
+- 2026-09-22T18:51:04+08:00：完成需求发现，记录 REQ-006 草案；架构设计仍为 proposed。
+- 2026-09-22T18:56:41+08:00：用户要求继续“下一步”，设计任务转 approved/in_progress；不包含 Wiki 代码实施。
+- 2026-09-22T19:00:38+08:00：完成需求修订 7、设计及计划草案，进入 verifying，等待规格审阅。
+- 2026-09-22T19:25:25+08:00：用户确认“按此规格实施”；需求、设计、计划成为批准基线，任务完成并拆出 TASK-027～031。

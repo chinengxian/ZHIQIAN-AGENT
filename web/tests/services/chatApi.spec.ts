@@ -80,4 +80,23 @@ describe('streamChat', () => {
     )
     expect(onDone).not.toHaveBeenCalled()
   })
+
+  it('sends selected knowledge scope and forwards retrieval events', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(streamResponse([
+      'event: status\ndata: {"stage":"retrieving"}\n\n',
+      'event: sources\ndata: {"items":[]}\n\n',
+      'event: done\ndata: {}\n\n',
+    ]))
+    vi.stubGlobal('fetch', fetchMock)
+    const onStatus = vi.fn()
+    const onSources = vi.fn()
+    await streamChat('conversation-id', 'question', { onStatus, onSources }, undefined, {
+      mode: 'selected', knowledge_base_ids: ['kb-id'],
+    })
+    expect(JSON.parse(fetchMock.mock.calls[0]![1].body).knowledge_scope).toEqual({
+      mode: 'selected', knowledge_base_ids: ['kb-id'],
+    })
+    expect(onStatus).toHaveBeenCalledWith('retrieving')
+    expect(onSources).toHaveBeenCalledWith([])
+  })
 })

@@ -1,0 +1,15 @@
+{
+  "cases": [
+    { "keyword": "quasar", "question": "quasar", "text": "quasar quasar quasar engine maintenance and calibration" },
+    { "keyword": "lattice", "question": "lattice", "text": "lattice lattice lattice network topology and recovery" },
+    { "keyword": "saffron", "question": "saffron", "text": "saffron saffron saffron inventory and storage procedure" },
+    { "keyword": "harbor", "question": "harbor", "text": "harbor harbor harbor docking and inspection checklist" },
+    { "keyword": "turbine", "question": "turbine", "text": "turbine turbine turbine cooling and shutdown procedure" },
+    { "keyword": "cobalt", "question": "cobalt", "text": "cobalt cobalt cobalt battery handling and charging" },
+    { "keyword": "orchid", "question": "orchid", "text": "orchid orchid orchid greenhouse lighting and watering" },
+    { "keyword": "magnet", "question": "magnet", "text": "magnet magnet magnet alignment and safety protocol" },
+    { "keyword": "zenith", "question": "zenith", "text": "zenith zenith zenith telescope tracking and focus" },
+    { "keyword": "pixel", "question": "pixel", "text": "pixel pixel pixel display diagnostics and replacement" }
+  ],
+  "unanswerable": ["unseenkey", "missingtopic"]
+}

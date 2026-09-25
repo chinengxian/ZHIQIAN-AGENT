@@ -57,6 +57,7 @@ def test_settings() -> Settings:
         openai_base_url=AnyHttpUrl("https://example.com/v1"),
         openai_api_key=SecretStr("browser-test-key"),
         openai_model="browser-test-model",
+        knowledge_enabled=False,
         _env_file=None,  # type: ignore[call-arg]
     )
 

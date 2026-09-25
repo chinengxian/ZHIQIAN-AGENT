@@ -17,6 +17,7 @@ from agent_api.knowledge.application.management import (
 
 
 class ManagementService(Protocol):
+    # 知识库管理服务协议：路由层只依赖这些方法，便于测试时替换实现。
     max_upload_bytes: int
 
     async def create_knowledge_base(self, **values: object) -> Any: ...
@@ -51,6 +52,7 @@ class ManagementService(Protocol):
 
 
 class KnowledgeBaseCreate(BaseModel):
+    # 创建知识库的请求体。
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=4000)
 
@@ -64,6 +66,7 @@ class KnowledgeBaseCreate(BaseModel):
 
 
 class KnowledgeBaseResponse(BaseModel):
+    # 知识库列表和详情接口统一返回的结构，包含文档统计与处理中数量。
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
@@ -75,6 +78,7 @@ class KnowledgeBaseResponse(BaseModel):
 
 
 class KnowledgeBaseUpdate(BaseModel):
+    # 更新知识库的请求体；字段都可选，只更新调用方实际传入的字段。
     name: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=4000)
     enabled: bool | None = None
@@ -91,16 +95,19 @@ class KnowledgeBaseUpdate(BaseModel):
 
 
 class DocumentAcceptedResponse(BaseModel):
+    # 文档异步任务已受理时返回的基础结构。
     document_id: UUID
     job_id: UUID
     status: str
 
 
 class DocumentUploadAcceptedResponse(DocumentAcceptedResponse):
+    # 上传文档成功受理时额外返回本次入库的文档版本 ID。
     document_version_id: UUID
 
 
 class IngestionJobResponse(BaseModel):
+    # 文档解析、切分、向量化等入库任务的当前进度。
     id: UUID
     stage: str
     status: str
@@ -110,6 +117,7 @@ class IngestionJobResponse(BaseModel):
 
 
 class DocumentResponse(BaseModel):
+    # 文档详情结构，包含所属知识库、当前状态、激活版本和最近任务。
     id: UUID
     knowledge_base_id: UUID
     title: str
@@ -121,6 +129,7 @@ class DocumentResponse(BaseModel):
 
 
 def get_management_service(request: Request) -> ManagementService:
+    # 从 FastAPI 应用状态中取知识库管理服务；未启用知识库功能时返回 503。
     service = getattr(request.app.state, "knowledge_management", None)
     if service is None:
         raise HTTPException(
@@ -136,6 +145,7 @@ router = APIRouter(prefix="/api/v1", tags=["knowledge"])
 
 
 def _raise_http_error(error: KnowledgeManagementError) -> None:
+    # 将应用层的知识库异常统一转换成稳定的 HTTP 错误响应。
     if isinstance(error, KnowledgeNotFoundError):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -168,6 +178,7 @@ async def create_knowledge_base(
     payload: KnowledgeBaseCreate,
     service: ServiceDependency,
 ) -> Any:
+    """创建一个新的知识库，用于后续上传文档并作为检索范围。"""
     try:
         return await service.create_knowledge_base(**payload.model_dump())
     except KnowledgeManagementError as error:
@@ -176,11 +187,13 @@ async def create_knowledge_base(
 
 @router.get("/knowledge-bases", response_model=list[KnowledgeBaseResponse])
 async def list_knowledge_bases(service: ServiceDependency) -> Any:
+    """查询当前工作区下的全部知识库，供前端列表和知识范围选择器使用。"""
     return await service.list_knowledge_bases()
 
 
 @router.get("/knowledge-bases/{knowledge_base_id}", response_model=KnowledgeBaseResponse)
 async def get_knowledge_base(knowledge_base_id: UUID, service: ServiceDependency) -> Any:
+    """查询单个知识库的详情，包括启用状态和文档处理统计。"""
     try:
         return await service.get_knowledge_base(knowledge_base_id)
     except KnowledgeManagementError as error:
@@ -193,6 +206,7 @@ async def update_knowledge_base(
     payload: KnowledgeBaseUpdate,
     service: ServiceDependency,
 ) -> Any:
+    """修改知识库名称、描述或启用状态。"""
     try:
         return await service.update_knowledge_base(
             knowledge_base_id,
@@ -208,6 +222,7 @@ async def delete_knowledge_base(
     service: ServiceDependency,
     confirm: Annotated[bool, Query()] = False,
 ) -> None:
+    """删除知识库；包含文档时需要调用方通过 confirm=true 二次确认。"""
     try:
         await service.delete_knowledge_base(knowledge_base_id, confirm=confirm)
     except KnowledgeManagementError as error:
@@ -225,6 +240,7 @@ async def upload_document(
     file: Annotated[UploadFile, File()],
     on_duplicate: Annotated[Literal["reject", "new_version"], Query()] = "reject",
 ) -> Any:
+    """上传文档到指定知识库，并创建异步入库任务。"""
     try:
         # 限量读取，避免超大请求一次性占用无限内存。
         content = await file.read(service.max_upload_bytes + 1)
@@ -246,6 +262,7 @@ async def upload_document(
     response_model=list[DocumentResponse],
 )
 async def list_documents(knowledge_base_id: UUID, service: ServiceDependency) -> Any:
+    """查询指定知识库下的文档列表和每个文档最近一次入库任务状态。"""
     try:
         return await service.list_documents(knowledge_base_id)
     except KnowledgeManagementError as error:
@@ -254,6 +271,7 @@ async def list_documents(knowledge_base_id: UUID, service: ServiceDependency) ->
 
 @router.get("/documents/{document_id}", response_model=DocumentResponse)
 async def get_document(document_id: UUID, service: ServiceDependency) -> Any:
+    """查询单个文档详情，通常用于查看上传、解析或索引状态。"""
     try:
         return await service.get_document(document_id)
     except KnowledgeManagementError as error:
@@ -266,6 +284,7 @@ async def get_document(document_id: UUID, service: ServiceDependency) -> Any:
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def retry_document(document_id: UUID, service: ServiceDependency) -> Any:
+    """对失败的文档入库任务发起重试，重新进入解析和索引流程。"""
     try:
         return await service.request_document_action(document_id, "retry")
     except KnowledgeManagementError as error:
@@ -278,6 +297,7 @@ async def retry_document(document_id: UUID, service: ServiceDependency) -> Any:
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def reindex_document(document_id: UUID, service: ServiceDependency) -> Any:
+    """对已就绪的文档重新建立索引，常用于向量库或切分策略变更后的重建。"""
     try:
         return await service.request_document_action(document_id, "reindex")
     except KnowledgeManagementError as error:
@@ -290,6 +310,7 @@ async def reindex_document(document_id: UUID, service: ServiceDependency) -> Any
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def delete_document(document_id: UUID, service: ServiceDependency) -> Any:
+    """异步删除文档及其版本、切片、向量索引等关联资源。"""
     try:
         return await service.delete_document(document_id)
     except KnowledgeManagementError as error:
@@ -298,7 +319,9 @@ async def delete_document(document_id: UUID, service: ServiceDependency) -> Any:
 
 @router.get("/knowledge/events/stream")
 async def stream_knowledge_events(service: ServiceDependency) -> StreamingResponse:
+    """订阅知识库后台任务事件流，前端用它实时刷新处理进度。"""
     async def encode_events() -> AsyncIterator[str]:
+        # 按 Server-Sent Events 格式编码，event 字段用于区分进度、完成或失败事件。
         async for event in service.stream_events():
             event_type = str(event.get("type", "progress"))
             data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))

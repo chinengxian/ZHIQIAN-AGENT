@@ -36,6 +36,13 @@ def test_knowledge_schema_contains_all_source_of_truth_tables() -> None:
         "knowledge_bases",
         "outbox_events",
         "workspaces",
+        "wiki_claims",
+        "wiki_claim_sources",
+        "wiki_configs",
+        "wiki_jobs",
+        "wiki_pages",
+        "wiki_page_versions",
+        "wiki_token_usage",
     }
 
 

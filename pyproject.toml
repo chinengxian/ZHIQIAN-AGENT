@@ -36,6 +36,7 @@ dev = [
   "ruff>=0.12,<1",
   "setuptools>=83,<84",
 ]
+rerank = ["sentence-transformers>=3,<6"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_api"]

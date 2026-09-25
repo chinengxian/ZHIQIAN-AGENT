@@ -21,6 +21,11 @@ def create_celery_app(settings: Settings) -> Celery:
         task_reject_on_worker_lost=True,
         task_default_queue="knowledge",
         worker_prefetch_multiplier=1,
+        task_soft_time_limit=1500,
+        task_time_limit=1800,
+        worker_concurrency=2,
+        worker_max_memory_per_child=1_048_576,
+        worker_max_tasks_per_child=20,
         beat_schedule={
             "dispatch-knowledge-outbox": {
                 "task": "agent_api.knowledge.dispatch_outbox",
@@ -28,6 +33,10 @@ def create_celery_app(settings: Settings) -> Celery:
             },
             "recover-stale-ingestion-jobs": {
                 "task": "agent_api.knowledge.recover_stale_jobs",
+                "schedule": 60.0,
+            },
+            "recover-stale-wiki-jobs": {
+                "task": "agent_api.knowledge.recover_stale_wiki_jobs",
                 "schedule": 60.0,
             },
         },

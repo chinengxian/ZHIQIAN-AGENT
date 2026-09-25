@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_api.core.config import Settings
 from agent_api.knowledge.application.ingestion import UploadValidationError, validate_upload
+from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.domain.statuses import (
     DocumentStatus,
     IngestionJobStatus,
@@ -26,6 +27,7 @@ from agent_api.knowledge.infrastructure.database.models import (
     OutboxEvent,
 )
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
+from agent_api.knowledge.wiki.jobs import invalidate_document_claims
 
 DEFAULT_WORKSPACE_ID = UUID("00000000-0000-0000-0000-000000000001")
 
@@ -259,7 +261,7 @@ class SqlAlchemyKnowledgeManagementService:
                 outbox = OutboxEvent(
                     id=event_id,
                     event_key=f"ingest:{version_id}",
-                    event_type="document.ingestion.requested",
+                    event_type=OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
                     aggregate_id=version_id,
                     payload={
                         "job_id": str(job_id),
@@ -360,7 +362,7 @@ class SqlAlchemyKnowledgeManagementService:
                     file_size=latest.file_size,
                     pipeline_version="knowledge-v1",
                     embedding_provider=self._settings.embedding_provider.value,
-                    embedding_model=self._settings.embedding_model or "",
+                    delete_documentembedding_model=self._settings.embedding_model or "",
                     embedding_dimension=self._settings.embedding_dimension,
                     embedding_fingerprint=self._embedding_fingerprint(),
                 )
@@ -383,7 +385,7 @@ class SqlAlchemyKnowledgeManagementService:
             session.add(
                 OutboxEvent(
                     event_key=f"{action}:{job.id}",
-                    event_type="document.ingestion.requested",
+                    event_type=OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
                     aggregate_id=version.id,
                     payload={
                         "job_id": str(job.id),
@@ -427,12 +429,13 @@ class SqlAlchemyKnowledgeManagementService:
             session.add(
                 OutboxEvent(
                     event_key=f"delete:{document.id}",
-                    event_type="document.deletion.requested",
+                    event_type=OutboxEventType.DOCUMENT_DELETION_REQUESTED,
                     aggregate_id=version.id,
                     payload={"job_id": str(job.id), "document_id": str(document.id)},
                 )
             )
             document.status = DocumentStatus.DELETING.value
+            await invalidate_document_claims(session, document.id)
             return {"document_id": document.id, "job_id": job.id, "status": "deleting"}
 
     async def stream_events(self) -> AsyncIterator[dict[str, object]]:
@@ -524,7 +527,7 @@ class SqlAlchemyKnowledgeManagementService:
             session.add(
                 OutboxEvent(
                     event_key=f"delete-kb:{knowledge_base_id}",
-                    event_type="knowledge_base.deletion.requested",
+                    event_type=OutboxEventType.KNOWLEDGE_BASE_DELETION_REQUESTED,
                     aggregate_id=knowledge_base_id,
                     payload={"knowledge_base_id": str(knowledge_base_id)},
                 )

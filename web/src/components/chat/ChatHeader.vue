@@ -1,3 +1,11 @@
+<script setup lang="ts">
+import KnowledgeScopeSelector from './KnowledgeScopeSelector.vue'
+import type { KnowledgeScope } from '../../types/chat'
+
+defineProps<{ scope: KnowledgeScope; disabled: boolean }>()
+const emit = defineEmits<{ scopeChange: [scope: KnowledgeScope] }>()
+</script>
+
 <template>
   <header class="chat-header">
     <div class="brand">
@@ -7,13 +15,11 @@
       ></span>
       <h1>Agent</h1>
     </div>
-    <div class="service-status">
-      <span
-        class="status-dot"
-        aria-hidden="true"
-      ></span>
-      服务已连接
-    </div>
+    <KnowledgeScopeSelector
+      :scope="scope"
+      :disabled="disabled"
+      @change="emit('scopeChange', $event)"
+    />
   </header>
 </template>
 

@@ -10,6 +10,7 @@ from pymilvus import MilvusClient  # type: ignore[import-untyped]
 
 from agent_api.core.config import Settings
 from agent_api.knowledge.application.ingestion import IngestionPipeline, ParentChildChunker
+from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.infrastructure.docling.parser import DoclingParser
 from agent_api.knowledge.infrastructure.embedding.openai import create_embedding_adapter
@@ -20,28 +21,28 @@ from agent_api.knowledge.worker.cleanup import KnowledgeCleanupService
 
 
 async def handle_event(
-    event_type: str,
+    event_type: OutboxEventType,
     payload: Mapping[str, object],
     pipeline: IngestionPipeline,
     cleanup: CleanupHandler | None = None,
 ) -> None:
     """只接受显式白名单事件，队列数据不能选择任意函数。"""
 
-    if event_type == "document.ingestion.requested":
+    if event_type is OutboxEventType.DOCUMENT_INGESTION_REQUESTED:
         await pipeline.run(_payload_uuid(payload, "job_id"))
         return
     if cleanup is None:
         raise ValueError("unsupported_event_type")
-    if event_type == "document.deletion.requested":
+    if event_type is OutboxEventType.DOCUMENT_DELETION_REQUESTED:
         await cleanup.delete_document(
             _payload_uuid(payload, "document_id"),
             _payload_uuid(payload, "job_id"),
         )
         return
-    if event_type == "document.version.cleanup.requested":
+    if event_type is OutboxEventType.DOCUMENT_VERSION_CLEANUP_REQUESTED:
         await cleanup.cleanup_version(_payload_uuid(payload, "document_version_id"))
         return
-    if event_type == "knowledge_base.deletion.requested":
+    if event_type is OutboxEventType.KNOWLEDGE_BASE_DELETION_REQUESTED:
         await cleanup.delete_knowledge_base(_payload_uuid(payload, "knowledge_base_id"))
         return
     raise ValueError("unsupported_event_type")

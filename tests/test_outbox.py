@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from uuid import UUID
 
+from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.infrastructure.jobs.outbox import OutboxDispatcher, PendingEvent
 
 EVENT_ID = UUID("40000000-0000-0000-0000-000000000001")
@@ -36,7 +37,7 @@ class RecordingPublisher:
 def pending_event() -> PendingEvent:
     return PendingEvent(
         id=EVENT_ID,
-        event_type="document.ingestion.requested",
+        event_type=OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
         aggregate_id=UUID("50000000-0000-0000-0000-000000000001"),
         payload={"job_id": "safe-id"},
     )

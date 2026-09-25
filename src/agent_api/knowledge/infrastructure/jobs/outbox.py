@@ -10,14 +10,16 @@ from celery import Celery  # type: ignore[import-untyped]
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.domain.statuses import OutboxStatus
 from agent_api.knowledge.infrastructure.database.models import OutboxEvent
+from agent_api.knowledge.infrastructure.observability.events import record_event
 
 
 @dataclass(frozen=True, slots=True)
 class PendingEvent:
     id: UUID
-    event_type: str
+    event_type: OutboxEventType
     aggregate_id: UUID
     payload: dict[str, Any]
 
@@ -49,8 +51,10 @@ class OutboxDispatcher:
             except Exception:
                 reference = f"outbox-{uuid4()}"
                 await self._repository.mark_failed(event.id, reference)
+                record_event("outbox_publish_failed", event.id, error_reference=reference)
             else:
                 await self._repository.mark_published(event.id)
+                record_event("outbox_published", event.id)
                 published += 1
         return published
 
@@ -85,7 +89,13 @@ class SqlAlchemyOutboxRepository:
                 row.attempt_count += 1
                 row.available_at = now + self.CLAIM_LEASE
             return [
-                PendingEvent(row.id, row.event_type, row.aggregate_id, row.payload) for row in rows
+                PendingEvent(
+                    row.id,
+                    OutboxEventType(row.event_type),
+                    row.aggregate_id,
+                    row.payload,
+                )
+                for row in rows
             ]
 
     async def mark_published(self, event_id: UUID) -> None:

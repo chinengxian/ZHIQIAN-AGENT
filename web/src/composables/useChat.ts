@@ -1,7 +1,7 @@
 import { reactive, ref } from 'vue'
 
 import { ChatStreamError, streamChat } from '../services/chatApi'
-import type { ChatMessage } from '../types/chat'
+import type { ChatMessage, KnowledgeScope } from '../types/chat'
 
 let nextMessageId = 0
 
@@ -19,6 +19,7 @@ export function useChat() {
   const messages = ref<ChatMessage[]>([])
   const isStreaming = ref(false)
   const errorMessage = ref<string | null>(null)
+  const knowledgeScope = ref<KnowledgeScope>({ mode: 'all_enabled' })
   let controller: AbortController | null = null
 
   async function send(rawContent: string): Promise<void> {
@@ -43,10 +44,16 @@ export function useChat() {
         onMessage(chunk) {
           assistant.content += chunk
         },
+        onStatus(stage) {
+          assistant.retrievalStatus = stage
+        },
+        onSources(sources) {
+          assistant.sources = sources
+        },
         onDone() {
           assistant.status = 'complete'
         },
-      }, activeController.signal)
+      }, activeController.signal, knowledgeScope.value)
       if (assistant.status === 'streaming') assistant.status = 'complete'
     } catch (error) {
       if (isAbortError(error)) {
@@ -73,5 +80,9 @@ export function useChat() {
     errorMessage.value = null
   }
 
-  return { messages, isStreaming, errorMessage, send, stop, clearError }
+  function setKnowledgeScope(scope: KnowledgeScope): void {
+    knowledgeScope.value = scope
+  }
+
+  return { messages, isStreaming, errorMessage, knowledgeScope, setKnowledgeScope, send, stop, clearError }
 }

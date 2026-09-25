@@ -4,6 +4,7 @@ import pytest
 from pydantic import AnyHttpUrl, SecretStr
 
 from agent_api.core.config import ModelProvider, Settings
+from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.worker.celery_factory import create_celery_app
 from agent_api.knowledge.worker.runtime import handle_event
 
@@ -39,7 +40,7 @@ async def test_worker_routes_ingestion_event_to_idempotent_job() -> None:
     pipeline = RecordingPipeline()
 
     await handle_event(
-        "document.ingestion.requested",
+        OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
         {"job_id": str(JOB_ID)},
         pipeline,  # type: ignore[arg-type]
     )
@@ -54,7 +55,7 @@ async def test_worker_rejects_unknown_or_malformed_events() -> None:
         await handle_event("unknown", {}, pipeline)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="invalid_job_id"):
         await handle_event(
-            "document.ingestion.requested",
+            OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
             {"job_id": "invalid"},
             pipeline,  # type: ignore[arg-type]
         )
@@ -65,19 +66,19 @@ async def test_worker_routes_compensating_cleanup_events() -> None:
     cleanup = RecordingCleanup()
 
     await handle_event(
-        "document.deletion.requested",
+        OutboxEventType.DOCUMENT_DELETION_REQUESTED,
         {"document_id": str(DOCUMENT_ID), "job_id": str(JOB_ID)},
         pipeline,  # type: ignore[arg-type]
         cleanup,  # type: ignore[arg-type]
     )
     await handle_event(
-        "document.version.cleanup.requested",
+        OutboxEventType.DOCUMENT_VERSION_CLEANUP_REQUESTED,
         {"document_version_id": str(VERSION_ID)},
         pipeline,  # type: ignore[arg-type]
         cleanup,  # type: ignore[arg-type]
     )
     await handle_event(
-        "knowledge_base.deletion.requested",
+        OutboxEventType.KNOWLEDGE_BASE_DELETION_REQUESTED,
         {"knowledge_base_id": str(KB_ID)},
         pipeline,  # type: ignore[arg-type]
         cleanup,  # type: ignore[arg-type]
@@ -105,6 +106,10 @@ def test_celery_factory_uses_json_and_schedules_outbox_dispatch() -> None:
     assert app.conf.task_serializer == "json"
     assert app.conf.accept_content == ["json"]
     assert app.conf.task_acks_late is True
+    assert app.conf.task_soft_time_limit == 1500
+    assert app.conf.task_time_limit == 1800
+    assert app.conf.worker_concurrency == 2
+    assert app.conf.worker_max_memory_per_child == 1_048_576
     assert app.conf.beat_schedule["dispatch-knowledge-outbox"]["task"] == (
         "agent_api.knowledge.dispatch_outbox"
     )

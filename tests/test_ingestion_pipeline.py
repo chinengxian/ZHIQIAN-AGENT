@@ -279,6 +279,30 @@ class UnavailableRepository(FakePipelineRepository):
         raise OSError("postgresql://secret@127.0.0.1")
 
 
+class AlreadyClaimedRepository(FakePipelineRepository):
+    async def load_context(self, job_id: UUID) -> IngestionContext:
+        from agent_api.knowledge.application.ingestion import IngestionAlreadyClaimed
+
+        raise IngestionAlreadyClaimed()
+
+
+async def test_duplicate_delivery_is_acknowledged_without_reprocessing(tmp_path: Path) -> None:
+    repository = AlreadyClaimedRepository(tmp_path / "version.md")
+    parser = FakeParser()
+    pipeline = IngestionPipeline(
+        repository=repository,
+        parser=parser,
+        chunker=ParentChildChunker(),
+        embedder=FakeEmbedder(),
+        index=FakePipelineIndex(),
+    )
+
+    await pipeline.run(JOB_ID)
+
+    assert repository.stages == []
+    assert repository.failures == []
+
+
 async def test_database_connection_failure_is_retryable_and_redacted(tmp_path: Path) -> None:
     pipeline = IngestionPipeline(
         repository=UnavailableRepository(tmp_path / "version.md"),

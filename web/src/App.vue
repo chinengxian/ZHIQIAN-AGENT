@@ -1,71 +1,93 @@
 <script setup lang="ts">
-import { nextTick, ref, watch } from 'vue'
+import { ref } from 'vue'
+import { RouterLink, RouterView, useRoute } from 'vue-router'
 
-import ChatComposer from './components/chat/ChatComposer.vue'
-import ChatEmptyState from './components/chat/ChatEmptyState.vue'
-import ChatHeader from './components/chat/ChatHeader.vue'
-import ChatMessage from './components/chat/ChatMessage.vue'
-import { useChat } from './composables/useChat'
-
-const { messages, isStreaming, errorMessage, send, stop, clearError } = useChat()
-const endOfConversation = ref<HTMLElement | null>(null)
-
-watch(messages, async () => {
-  await nextTick()
-  endOfConversation.value?.scrollIntoView?.({ behavior: 'smooth', block: 'end' })
-}, { deep: true })
+const route = useRoute()
+const drawer = ref(false)
 </script>
 
 <template>
   <v-app>
-    <ChatHeader />
-    <main class="workspace">
-      <ChatEmptyState v-if="messages.length === 0" />
-      <section
-        v-else
-        class="conversation"
-        aria-label="对话消息"
-        aria-live="polite"
-      >
-        <ChatMessage
-          v-for="message in messages"
-          :key="message.id"
-          :message="message"
-        />
-        <div
-          ref="endOfConversation"
-          aria-hidden="true"
-        ></div>
-      </section>
-    </main>
-    <div
-      v-if="errorMessage"
-      class="error-banner"
-      role="alert"
+    <button
+      class="mobile-menu"
+      type="button"
+      aria-label="打开导航"
+      @click="drawer = true"
     >
-      <span>{{ errorMessage }}</span>
+      <span
+        class="mdi mdi-menu"
+        aria-hidden="true"
+      ></span>
+    </button>
+    <div
+      v-if="drawer"
+      class="nav-scrim"
+      @click="drawer = false"
+    ></div>
+    <aside
+      class="side-nav"
+      :class="{ open: drawer }"
+      aria-label="工作台导航"
+    >
+      <div class="nav-brand">
+        Agent <span>工作台</span>
+      </div>
       <button
+        class="nav-close"
         type="button"
-        aria-label="关闭错误提示"
-        @click="clearError"
+        aria-label="关闭导航"
+        @click="drawer = false"
       >
-        ×
+        <span
+          class="mdi mdi-close"
+          aria-hidden="true"
+        ></span>
       </button>
+      <nav>
+        <RouterLink
+          to="/"
+          :class="{ active: route.path === '/' }"
+          @click="drawer = false"
+        >
+          <span
+            class="mdi mdi-message-text-outline"
+            aria-hidden="true"
+          ></span>对话
+        </RouterLink>
+        <RouterLink
+          to="/knowledge"
+          :class="{ active: route.path.startsWith('/knowledge') }"
+          @click="drawer = false"
+        >
+          <span
+            class="mdi mdi-bookshelf"
+            aria-hidden="true"
+          ></span>知识库
+        </RouterLink>
+      </nav>
+    </aside>
+    <div class="app-content">
+      <RouterView />
     </div>
-    <ChatComposer
-      :disabled="isStreaming"
-      :streaming="isStreaming"
-      @send="send"
-      @stop="stop"
-    />
   </v-app>
 </template>
 
 <style scoped>
-:global(body) { background:radial-gradient(circle at 50% -15%,#fff 0,#f7f7f9 38%,#ececf1 100%); }
-.workspace { width:min(900px,calc(100% - 36px)); min-height:calc(100vh - 58px); margin:0 auto; display:flex; padding-bottom:150px; }
-.conversation { width:100%; display:flex; flex-direction:column; gap:28px; padding:54px 10px 24px; }
-.error-banner { position:fixed; z-index:5; right:22px; bottom:115px; display:flex; align-items:center; gap:18px; max-width:min(420px,calc(100vw - 32px)); padding:12px 14px 12px 16px; border:1px solid rgb(255 59 48 / 16%); border-radius:15px; color:#9f1c16; background:rgb(255 255 255 / 94%); box-shadow:0 12px 38px rgb(0 0 0 / 11%); backdrop-filter:blur(18px); font-size:13px; }
-.error-banner button { width:26px; height:26px; border:0; border-radius:8px; color:inherit; background:rgb(255 59 48 / 8%); cursor:pointer; }
-@media (max-width:640px) { .workspace { width:calc(100% - 24px); } .conversation { gap:23px; padding-top:32px; } .error-banner { right:12px; bottom:106px; } }
+.side-nav { width:216px; position:fixed; inset:0 auto 0 0; z-index:11; padding:23px 12px; background:#fff; border-right:1px solid #e6e6e9; }
+.nav-brand { font-size:17px; font-weight:700; margin:2px 12px 34px; }
+.nav-brand span { font-size:12px; color:var(--agent-muted); font-weight:400; margin-left:4px; }
+nav { display:grid; gap:4px; }
+nav a { display:flex; align-items:center; gap:13px; min-height:42px; padding:0 14px; color:#3b3b40; text-decoration:none; border-radius:7px; font-size:14px; }
+nav a:hover, nav a.active { background:#f0f0f8; color:#3732a0; }
+nav .mdi { font-size:20px; }
+.app-content { min-width:0; margin-left:216px; }
+.mobile-menu, .nav-close, .nav-scrim { display:none; }
+@media (max-width:700px) {
+  .side-nav { transform:translateX(-100%); transition:transform .18s ease; box-shadow:0 20px 40px #0002; }
+  .side-nav.open { transform:translateX(0); }
+  .app-content { margin-left:0; }
+  .mobile-menu { display:grid; place-items:center; position:fixed; top:8px; left:8px; z-index:8; width:42px; height:42px; border:0; border-radius:7px; background:#fff; color:#34343a; font-size:22px; }
+  .nav-close { display:block; position:absolute; top:20px; right:12px; border:0; background:none; font-size:21px; }
+  .nav-scrim { display:block; position:fixed; inset:0; z-index:10; background:#0005; }
+}
 </style>

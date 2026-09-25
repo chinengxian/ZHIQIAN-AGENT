@@ -30,3 +30,8 @@
 | TASK-024 | 强化知识任务恢复、安全与可观测性 | [TASK-024](TASK-024.md) |
 | TASK-025 | 验证原生知识库与多级 RAG 全栈闭环 | [TASK-025](TASK-025.md) |
 | TASK-026 | 设计 Wiki 衍生知识阶段 | [TASK-026](TASK-026.md) |
+| TASK-027 | 建立 Wiki 数据、版本与 API 契约 | [TASK-027](TASK-027.md) |
+| TASK-028 | 实现 Wiki 异步生成、额度和来源失效 | [TASK-028](TASK-028.md) |
+| TASK-029 | 实现 Wiki 浏览、编辑与审核工作台 | [TASK-029](TASK-029.md) |
+| TASK-030 | 接入 Agent 只读 Wiki 与可信引用过滤 | [TASK-030](TASK-030.md) |
+| TASK-031 | 验证 Wiki 全栈业务闭环 | [TASK-031](TASK-031.md) |

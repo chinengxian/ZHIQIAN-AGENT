@@ -54,6 +54,7 @@ describe('useChat', () => {
       'one',
       expect.any(Object),
       expect.any(AbortSignal),
+      { mode: 'all_enabled' },
     )
     expect(streamChatMock).toHaveBeenNthCalledWith(
       2,
@@ -61,6 +62,7 @@ describe('useChat', () => {
       'two',
       expect.any(Object),
       expect.any(AbortSignal),
+      { mode: 'all_enabled' },
     )
   })
 
@@ -117,5 +119,19 @@ describe('useChat', () => {
     expect(chat.errorMessage.value).toBe('模型暂时不可用')
     expect(chat.messages.value[1]?.status).toBe('error')
     expect(chat.isStreaming.value).toBe(false)
+  })
+
+  it('captures scope and sources on each assistant turn', async () => {
+    streamChatMock.mockImplementation(async (_id, _message, handlers) => {
+      handlers.onStatus?.('retrieving')
+      handlers.onSources?.([{ citation_id: '[1]', chunk_id: 'chunk', document_id: 'doc', document_version_id: 'version', title: '指南', filename: 'guide.pdf', page_start: 2, page_end: 2, heading_path: ['安装'], excerpt: '步骤', score: 0.8, rank: 1 }])
+      handlers.onMessage?.('见 [1]')
+      handlers.onDone?.()
+    })
+    const chat = useChat()
+    chat.setKnowledgeScope({ mode: 'selected', knowledge_base_ids: ['kb-id'] })
+    await chat.send('question')
+    expect(streamChatMock.mock.calls[0]?.[4]).toEqual({ mode: 'selected', knowledge_base_ids: ['kb-id'] })
+    expect(chat.messages.value[1]).toMatchObject({ content: '见 [1]', retrievalStatus: 'retrieving', sources: [{ title: '指南' }] })
   })
 })

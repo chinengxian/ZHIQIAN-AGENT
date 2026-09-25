@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/vue'
 import { afterEach, vi } from 'vitest'
 
-import App from '../src/App.vue'
+import App from '../src/views/ChatView.vue'
 
 describe('App', () => {
   afterEach(() => {

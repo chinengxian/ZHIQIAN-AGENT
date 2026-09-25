@@ -1,17 +1,23 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from agent_api.knowledge.application.retrieval import (
+    KnowledgeRetrievalService,
+    KnowledgeScopeError,
+)
+from agent_api.llm.agent import AgentStreamEvent, LangChainAgentStream
 from agent_api.llm.protocol import StreamAgent
 from agent_api.schemas.chat import ChatRequest
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
 
 
-def sse_event(event: str, data: dict[str, str]) -> str:
+def sse_event(event: str, data: dict[str, object]) -> str:
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {payload}\n\n"
 
@@ -26,7 +32,76 @@ async def first_non_empty(stream: AsyncIterator[str]) -> str | None:
 @router.post("/stream")
 async def stream_chat(payload: ChatRequest, request: Request) -> StreamingResponse:
     agent: StreamAgent = request.app.state.chat_agent
-    stream = agent.stream(payload.message, payload.conversation_id)
+    retrieval: KnowledgeRetrievalService | None = getattr(
+        request.app.state, "knowledge_retrieval", None
+    )
+    if (
+        payload.knowledge_scope is not None
+        and payload.knowledge_scope.mode == "selected"
+        and retrieval is None
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "knowledge_unavailable", "message": "Knowledge service unavailable"},
+        )
+    scope_ids: tuple[UUID, ...] = ()
+    if retrieval is not None:
+        scope = payload.knowledge_scope
+        try:
+            scope_ids = await retrieval.resolve_scope(
+                scope.mode if scope is not None else "all_enabled",
+                tuple(scope.knowledge_base_ids) if scope is not None else (),
+            )
+        except KnowledgeScopeError as error:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": str(error), "message": "Knowledge scope is unavailable"},
+            ) from None
+
+    if (
+        payload.knowledge_scope is not None
+        and retrieval is not None
+        and isinstance(agent, LangChainAgentStream)
+    ):
+        stream_events = agent.stream_events(payload.message, payload.conversation_id, scope_ids)
+        buffered: list[AgentStreamEvent] = []
+        try:
+            async for event in stream_events:
+                buffered.append(event)
+                if event.event == "message":
+                    break
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "upstream_unavailable", "message": "Model request failed"},
+            ) from exc
+
+        async def knowledge_events() -> AsyncIterator[str]:
+            for event in buffered:
+                yield sse_event(event.event, event.data)
+            try:
+                async for event in stream_events:
+                    yield sse_event(event.event, event.data)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                yield sse_event(
+                    "error",
+                    {"code": "upstream_stream_error", "message": "Model stream failed"},
+                )
+                return
+            yield sse_event("done", {})
+
+        return StreamingResponse(
+            knowledge_events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    if isinstance(agent, LangChainAgentStream) and retrieval is not None:
+        stream = agent.stream(payload.message, payload.conversation_id, scope_ids)
+    else:
+        stream = agent.stream(payload.message, payload.conversation_id)
     try:
         first = await first_non_empty(stream)
     except Exception as exc:

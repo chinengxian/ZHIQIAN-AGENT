@@ -3,15 +3,17 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import String, and_, cast, delete, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_api.knowledge.application.ingestion import (
     ChunkDraft,
+    IngestionAlreadyClaimed,
     IngestionContext,
     PersistedChunk,
 )
+from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.domain.statuses import (
     ChunkKind,
     DocumentStatus,
@@ -26,7 +28,9 @@ from agent_api.knowledge.infrastructure.database.models import (
     IngestionJob,
     OutboxEvent,
 )
+from agent_api.knowledge.infrastructure.observability.events import record_event
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
+from agent_api.knowledge.wiki.jobs import invalidate_document_claims, schedule_document_wiki
 
 
 class SqlAlchemyIngestionRepository:
@@ -41,21 +45,33 @@ class SqlAlchemyIngestionRepository:
         self._storage = storage
 
     async def load_context(self, job_id: UUID) -> IngestionContext:
-        async with self._sessions() as session:
-            job = await session.get(IngestionJob, job_id)
+        async with self._sessions() as session, session.begin():
+            job = await session.get(IngestionJob, job_id, with_for_update=True)
             if job is None:
-                raise RuntimeError("ingestion_job_not_found")
+                raise IngestionAlreadyClaimed()
+            now = datetime.now(UTC)
+            if job.status not in {
+                IngestionJobStatus.PENDING.value,
+                IngestionJobStatus.RETRY_WAIT.value,
+            } or (
+                job.status == IngestionJobStatus.RETRY_WAIT.value
+                and job.next_retry_at is not None
+                and job.next_retry_at > now
+            ):
+                raise IngestionAlreadyClaimed()
             version = await session.get(DocumentVersion, job.document_version_id)
             if version is None:
-                raise RuntimeError("document_version_not_found")
+                raise IngestionAlreadyClaimed()
             document = await session.get(Document, version.document_id)
             if document is None:
-                raise RuntimeError("document_not_found")
+                raise IngestionAlreadyClaimed()
             if document.status in {DocumentStatus.DELETING.value, DocumentStatus.DELETED.value}:
-                raise RuntimeError("ingestion_document_deleting")
+                raise IngestionAlreadyClaimed()
             file_path = (self._storage.root / version.file_path).resolve()
             if not file_path.is_relative_to(self._storage.root) or not file_path.is_file():
                 raise RuntimeError("stored_file_unavailable")
+            job.status = IngestionJobStatus.RUNNING.value
+            job.heartbeat_at = now
             return IngestionContext(
                 job_id=job.id,
                 document_id=document.id,
@@ -159,10 +175,13 @@ class SqlAlchemyIngestionRepository:
             version.status = VersionStatus.READY.value
             version.ready_at = datetime.now(UTC)
             if previous_version_id is not None and previous_version_id != version_id:
+                await invalidate_document_claims(session, document_id)
+            await schedule_document_wiki(session, document.knowledge_base_id, version_id)
+            if previous_version_id is not None and previous_version_id != version_id:
                 session.add(
                     OutboxEvent(
                         event_key=f"cleanup-version:{previous_version_id}",
-                        event_type="document.version.cleanup.requested",
+                        event_type=OutboxEventType.DOCUMENT_VERSION_CLEANUP_REQUESTED,
                         aggregate_id=previous_version_id,
                         payload={"document_version_id": str(previous_version_id)},
                     )
@@ -215,7 +234,7 @@ class SqlAlchemyIngestionRepository:
                 .values(
                     id=uuid4(),
                     event_key=f"failed-version:{version_id}",
-                    event_type="document.version.cleanup.requested",
+                    event_type=OutboxEventType.DOCUMENT_VERSION_CLEANUP_REQUESTED,
                     aggregate_id=version_id,
                     payload={"document_version_id": str(version_id)},
                     status=OutboxStatus.PENDING.value,
@@ -249,7 +268,7 @@ class SqlAlchemyIngestionRepository:
             session.add(
                 OutboxEvent(
                     event_key=f"retry-job:{job.id}:{job.attempt_count}",
-                    event_type="document.ingestion.requested",
+                    event_type=OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
                     aggregate_id=job.document_version_id,
                     payload={
                         "job_id": str(job.id),
@@ -262,9 +281,19 @@ class SqlAlchemyIngestionRepository:
             return True
 
     async def recover_stale_jobs(self, *, stale_before: datetime, limit: int) -> list[UUID]:
-        """领取心跳超时任务并在同一事务写入新的 outbox 投递。"""
+        """恢复心跳超时或已发布却未消费的任务，并原子写入新投递。"""
 
         recovered: list[UUID] = []
+        outcomes: list[tuple[str, UUID, str | None]] = []
+        published_event = (
+            select(OutboxEvent.id)
+            .where(
+                OutboxEvent.event_type == OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
+                OutboxEvent.status == OutboxStatus.PUBLISHED.value,
+                OutboxEvent.payload["job_id"].astext == cast(IngestionJob.id, String),
+            )
+            .exists()
+        )
         async with self._sessions() as session, session.begin():
             jobs = list(
                 await session.scalars(
@@ -283,8 +312,29 @@ class SqlAlchemyIngestionRepository:
                                     ["document_parse_failed", "retry_exhausted"]
                                 ),
                             ),
+                            and_(
+                                IngestionJob.status.in_(
+                                    [
+                                        IngestionJobStatus.PENDING.value,
+                                        IngestionJobStatus.RETRY_WAIT.value,
+                                    ]
+                                ),
+                                IngestionJob.updated_at < stale_before,
+                                or_(
+                                    IngestionJob.next_retry_at.is_(None),
+                                    IngestionJob.next_retry_at < stale_before,
+                                ),
+                                published_event,
+                            ),
                         ),
-                        IngestionJob.heartbeat_at < stale_before,
+                        or_(
+                            IngestionJob.heartbeat_at < stale_before,
+                            and_(
+                                IngestionJob.heartbeat_at.is_(None),
+                                IngestionJob.updated_at < stale_before,
+                                published_event,
+                            ),
+                        ),
                         Document.status.not_in(
                             [DocumentStatus.DELETING.value, DocumentStatus.DELETED.value]
                         ),
@@ -295,11 +345,33 @@ class SqlAlchemyIngestionRepository:
                 )
             )
             for job in jobs:
+                version = await session.get(DocumentVersion, job.document_version_id)
+                document = await session.get(Document, version.document_id) if version else None
+                if version is None or document is None:
+                    continue
+                if (
+                    document.active_version_id == version.id
+                    and version.status == VersionStatus.READY.value
+                ):
+                    job.status = IngestionJobStatus.SUCCEEDED.value
+                    job.current_stage = "ready"
+                    job.progress = 100
+                    outcomes.append(("job_already_activated", job.id, None))
+                    continue
                 job.attempt_count += 1
                 if job.attempt_count >= job.max_attempts:
                     job.status = IngestionJobStatus.FAILED.value
                     job.error_code = "retry_exhausted"
                     job.error_reference = f"ingestion-{uuid4()}"
+                    version.status = VersionStatus.FAILED.value
+                    version.error_code = "retry_exhausted"
+                    version.error_reference = job.error_reference
+                    document.status = (
+                        DocumentStatus.READY.value
+                        if document.active_version_id is not None
+                        else DocumentStatus.FAILED.value
+                    )
+                    outcomes.append(("job_retry_exhausted", job.id, job.error_reference))
                     continue
                 job.status = IngestionJobStatus.RETRY_WAIT.value
                 job.next_retry_at = datetime.now(UTC)
@@ -307,7 +379,7 @@ class SqlAlchemyIngestionRepository:
                 session.add(
                     OutboxEvent(
                         event_key=f"recover:{job.id}:{job.attempt_count}",
-                        event_type="document.ingestion.requested",
+                        event_type=OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
                         aggregate_id=job.document_version_id,
                         payload={
                             "job_id": str(job.id),
@@ -317,4 +389,12 @@ class SqlAlchemyIngestionRepository:
                     )
                 )
                 recovered.append(job.id)
+                outcomes.append(("job_requeued", job.id, None))
+        for outcome, job_id, error_reference in outcomes:
+            if outcome == "job_retry_exhausted":
+                record_event("job_retry_exhausted", job_id, error_reference=error_reference)
+            elif outcome == "job_already_activated":
+                record_event("job_already_activated", job_id)
+            else:
+                record_event("job_requeued", job_id)
         return recovered

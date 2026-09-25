@@ -1,8 +1,11 @@
 import { createSseParser } from './sseParser'
+import type { ChatSource, KnowledgeScope } from '../types/chat'
 
 interface ChatHandlers {
   onMessage?: (content: string) => void
   onDone?: () => void
+  onStatus?: (stage: 'retrieving' | 'generating') => void
+  onSources?: (sources: ChatSource[]) => void
 }
 
 export class ChatStreamError extends Error {
@@ -39,11 +42,12 @@ export async function streamChat(
   message: string,
   handlers: ChatHandlers,
   signal?: AbortSignal,
+  knowledgeScope?: KnowledgeScope,
 ): Promise<void> {
   const response = await fetch('/api/v1/chat/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ conversation_id: conversationId, message }),
+    body: JSON.stringify({ conversation_id: conversationId, message, ...(knowledgeScope ? { knowledge_scope: knowledgeScope } : {}) }),
     ...(signal ? { signal } : {}),
   })
 
@@ -56,6 +60,8 @@ export async function streamChat(
   let completed = false
   const parser = createSseParser((event) => {
     if (event.event === 'message') handlers.onMessage?.(event.data.content)
+    if (event.event === 'status') handlers.onStatus?.(event.data.stage)
+    if (event.event === 'sources') handlers.onSources?.(event.data.items)
     if (event.event === 'done') {
       completed = true
       handlers.onDone?.()

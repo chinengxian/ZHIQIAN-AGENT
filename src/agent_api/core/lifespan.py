@@ -9,7 +9,7 @@ from agent_api.core.config import RerankProvider, Settings, get_settings
 from agent_api.knowledge.application.management import SqlAlchemyKnowledgeManagementService
 from agent_api.knowledge.application.retrieval import KnowledgeRetrievalService
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
-from agent_api.knowledge.infrastructure.embedding.openai import create_embedding_adapter
+from agent_api.knowledge.infrastructure.embedding.embedding import create_embedding_adapter
 from agent_api.knowledge.infrastructure.milvus.index import MilvusChunkIndex
 from agent_api.knowledge.infrastructure.rerank.bge import LocalBGEReranker
 from agent_api.knowledge.infrastructure.startup import (

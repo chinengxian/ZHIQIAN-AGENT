@@ -66,6 +66,7 @@ def main() -> int:
             "AGENT_REDIS_URL": "redis://127.0.0.1:6379/0",
             "AGENT_MILVUS_URI": "http://127.0.0.1:19530",
             "AGENT_STORAGE_ROOT": str(DATA / "uploads"),
+            "AGENT_EMBEDDING_PROVIDER": "openai",
             "AGENT_EMBEDDING_BASE_URL": "http://127.0.0.1:8011/v1",
             "AGENT_EMBEDDING_API_KEY": "local-embedding-key",
             "AGENT_EMBEDDING_MODEL": "text-embedding-3-small",

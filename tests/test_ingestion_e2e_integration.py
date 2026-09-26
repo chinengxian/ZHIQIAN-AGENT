@@ -9,7 +9,7 @@ from pydantic import AnyHttpUrl, SecretStr
 from pymilvus import MilvusClient  # type: ignore[import-untyped]
 from sqlalchemy import select
 
-from agent_api.core.config import ModelProvider, Settings
+from agent_api.core.config import EmbeddingProvider, ModelProvider, Settings
 from agent_api.knowledge.application.ingestion import (
     IngestionPipeline,
     IngestionPipelineError,
@@ -61,6 +61,7 @@ def settings_for_e2e(storage_root: Path) -> Settings:
         storage_root=storage_root,
         milvus_uri="http://127.0.0.1:19530",
         milvus_collection="knowledge_chunks",
+        embedding_provider=EmbeddingProvider.OPENAI,
         embedding_base_url=AnyHttpUrl("https://embedding.example.test/v1"),
         embedding_api_key=SecretStr("embedding-secret"),
         embedding_model="embedding-model",

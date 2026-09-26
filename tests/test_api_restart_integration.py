@@ -87,6 +87,7 @@ async def test_api_process_restart_keeps_committed_upload(tmp_path: Path) -> Non
             "AGENT_REDIS_URL": "redis://127.0.0.1:6379/0",
             "AGENT_MILVUS_URI": "http://127.0.0.1:19530",
             "AGENT_STORAGE_ROOT": str(settings.storage_root),
+            "AGENT_EMBEDDING_PROVIDER": "openai",
             "AGENT_EMBEDDING_BASE_URL": "https://example.test/v1",
             "AGENT_EMBEDDING_API_KEY": "test-embedding-key",
             "AGENT_EMBEDDING_MODEL": "text-embedding-3-small",

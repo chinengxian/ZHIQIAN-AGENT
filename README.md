@@ -43,6 +43,8 @@ AGENT_ANTHROPIC_MODEL=replace-me
 
 `.env.example` 默认启用原生知识库。PostgreSQL 保存权威业务状态和正文，Milvus 保存可重建的 Dense/BM25 索引，Redis 用于异步任务，原文件写入独立的 `AGENT_STORAGE_ROOT`。Embedding 配置与聊天模型完全独立。
 
+Embedding 默认使用 DashScopeEmbeddings：设置 `AGENT_EMBEDDING_PROVIDER=dashscope`、`AGENT_EMBEDDING_API_KEY`、`AGENT_EMBEDDING_MODEL=text-embedding-v1` 以及匹配的 `AGENT_EMBEDDING_DIMENSION` 即可。需要切换到 OpenAI-compatible embedding 服务时，将 `AGENT_EMBEDDING_PROVIDER=openai`，并补充 `AGENT_EMBEDDING_BASE_URL`。
+
 启动、数据模型、文档入库以及 Agent 检索的完整中文链路见 [`docs/development/knowledge-infrastructure-flow.md`](docs/development/knowledge-infrastructure-flow.md)。文档会明确区分当前已实现部分和后续任务范围。
 
 启动基础设施并应用迁移：

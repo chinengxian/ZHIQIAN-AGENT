@@ -15,7 +15,7 @@ from pymilvus import MilvusClient
 from redis.asyncio import Redis
 from sqlalchemy import delete, func, select
 
-from agent_api.core.config import ModelProvider, Settings
+from agent_api.core.config import EmbeddingProvider, ModelProvider, Settings
 from agent_api.knowledge.application.ingestion import (
     IngestionPipeline,
     IngestionPipelineError,
@@ -86,6 +86,7 @@ def knowledge_settings(storage_root: Path) -> Settings:
         knowledge_enabled=True,
         database_url=SecretStr(DATABASE_URL),
         storage_root=storage_root,
+        embedding_provider=EmbeddingProvider.OPENAI,
         embedding_base_url=AnyHttpUrl("https://embedding.example.test/v1"),
         embedding_api_key=SecretStr("embedding-secret"),
         embedding_model="embedding-model",
@@ -956,6 +957,7 @@ async def test_real_redis_worker_consumes_document_deletion(tmp_path: Path) -> N
                 "AGENT_DATABASE_URL": DATABASE_URL,
                 "AGENT_REDIS_URL": "redis://127.0.0.1:6379/0",
                 "AGENT_STORAGE_ROOT": str(settings.storage_root),
+                "AGENT_EMBEDDING_PROVIDER": "openai",
                 "AGENT_EMBEDDING_BASE_URL": "https://example.test/v1",
                 "AGENT_EMBEDDING_API_KEY": "test-embedding-key",
                 "AGENT_EMBEDDING_MODEL": "embedding-model",
@@ -1115,6 +1117,7 @@ async def test_queued_upload_becomes_ready_after_worker_starts(tmp_path: Path) -
                 "AGENT_DATABASE_URL": DATABASE_URL,
                 "AGENT_REDIS_URL": "redis://127.0.0.1:6379/0",
                 "AGENT_STORAGE_ROOT": str(settings.storage_root),
+                "AGENT_EMBEDDING_PROVIDER": "openai",
                 "AGENT_EMBEDDING_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
                 "AGENT_EMBEDDING_API_KEY": "test-embedding-key",
                 "AGENT_EMBEDDING_MODEL": "text-embedding-3-small",

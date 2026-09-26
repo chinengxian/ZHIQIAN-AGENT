@@ -3,7 +3,7 @@ from pathlib import Path
 
 from pydantic import AnyHttpUrl, SecretStr
 
-from agent_api.core.config import ModelProvider, Settings
+from agent_api.core.config import EmbeddingProvider, ModelProvider, Settings
 from agent_api.llm.agent import LangChainAgentStream
 from agent_api.main import create_app
 from tests.integration.knowledge_chat_model import DeterministicKnowledgeModel
@@ -21,6 +21,7 @@ def test_settings() -> Settings:
         redis_url=SecretStr("redis://127.0.0.1:6379/0"),
         storage_root=Path(os.environ["AGENT_STORAGE_ROOT"]),
         milvus_uri="http://127.0.0.1:19530",
+        embedding_provider=EmbeddingProvider.OPENAI,
         embedding_base_url=AnyHttpUrl(os.environ["AGENT_EMBEDDING_BASE_URL"]),
         embedding_api_key=SecretStr("local-embedding-key"),
         embedding_model="text-embedding-3-small",

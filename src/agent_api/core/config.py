@@ -24,6 +24,7 @@ class ModelProvider(StrEnum):
 
 
 class EmbeddingProvider(StrEnum):
+    DASHSCOPE = "dashscope"
     OPENAI = "openai"
 
 
@@ -100,7 +101,7 @@ class Settings(BaseSettings):
     milvus_collection: str = "knowledge_chunks"
 
     # Embedding 与聊天模型解耦，允许分别使用不同服务、模型和向量维度。
-    embedding_provider: EmbeddingProvider = EmbeddingProvider.OPENAI
+    embedding_provider: EmbeddingProvider = EmbeddingProvider.DASHSCOPE
     embedding_base_url: AnyHttpUrl | str | None = None
     embedding_api_key: SecretStr | None = None
     embedding_model: str | None = None
@@ -238,19 +239,30 @@ class Settings(BaseSettings):
                 _configuration_error("milvus_collection", "Milvus collection must not be blank")
             )
 
-        if self.embedding_base_url is None:
-            errors.append(
-                _configuration_error(
-                    "embedding_base_url",
-                    "embedding base URL is required when knowledge is enabled",
+        if self.embedding_provider is EmbeddingProvider.OPENAI:
+            if self.embedding_base_url is None:
+                errors.append(
+                    _configuration_error(
+                        "embedding_base_url",
+                        "embedding base URL is required for the openai embedding provider",
+                    )
                 )
-            )
+            else:
+                self.embedding_base_url = _validate_http_url(
+                    "embedding_base_url",
+                    self.embedding_base_url,
+                    errors,
+                )
+        elif self.embedding_provider is EmbeddingProvider.DASHSCOPE:
+            if self.embedding_base_url is not None:
+                self.embedding_base_url = _validate_http_url(
+                    "embedding_base_url",
+                    self.embedding_base_url,
+                    errors,
+                )
         else:
-            self.embedding_base_url = _validate_http_url(
-                "embedding_base_url",
-                self.embedding_base_url,
-                errors,
-            )
+            # 防止 Embedding 供应商配置有误
+            assert_never(self.embedding_provider)
         if self.embedding_api_key is None:
             errors.append(
                 _configuration_error(

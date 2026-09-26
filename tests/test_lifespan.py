@@ -5,7 +5,7 @@ from asgi_lifespan import LifespanManager
 from fastapi import FastAPI
 from pydantic import AnyHttpUrl, SecretStr
 
-from agent_api.core.config import ModelProvider, Settings, get_settings
+from agent_api.core.config import EmbeddingProvider, ModelProvider, Settings, get_settings
 from agent_api.core.lifespan import create_lifespan
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
 from agent_api.llm.agent import LangChainAgentStream
@@ -91,6 +91,7 @@ async def test_lifespan_publishes_and_closes_knowledge_application_services(
         knowledge_enabled=True,
         database_url=SecretStr("postgresql+asyncpg://agent:agent@127.0.0.1:5432/agent"),
         storage_root=tmp_path / "uploads",
+        embedding_provider=EmbeddingProvider.OPENAI,
         embedding_base_url=AnyHttpUrl("https://embedding.example.test/v1"),
         embedding_api_key=SecretStr("embedding-secret"),
         embedding_model="embedding-model",

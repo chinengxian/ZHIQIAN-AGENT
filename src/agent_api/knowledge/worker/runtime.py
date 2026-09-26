@@ -13,7 +13,7 @@ from agent_api.knowledge.application.ingestion import IngestionPipeline, ParentC
 from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.infrastructure.docling.parser import DoclingParser
-from agent_api.knowledge.infrastructure.embedding.openai import create_embedding_adapter
+from agent_api.knowledge.infrastructure.embedding.embedding import create_embedding_adapter
 from agent_api.knowledge.infrastructure.jobs.repository import SqlAlchemyIngestionRepository
 from agent_api.knowledge.infrastructure.milvus.index import MilvusChunkIndex
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage

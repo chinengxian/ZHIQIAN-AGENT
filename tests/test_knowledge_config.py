@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from agent_api.core.config import ModelProvider, Settings
+from agent_api.core.config import EmbeddingProvider, ModelProvider, Settings
 
 
 def knowledge_settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -19,8 +19,7 @@ def knowledge_settings(tmp_path: Path, **overrides: object) -> Settings:
         "milvus_uri": "http://milvus:19530",
         "milvus_token": "milvus-secret",
         "milvus_collection": "knowledge_chunks",
-        "embedding_provider": "openai",
-        "embedding_base_url": "https://embedding.example.test/v1",
+        "embedding_base_url": None,
         "embedding_api_key": "embedding-secret",
         "embedding_model": "text-embedding-test",
         "embedding_dimension": 1024,
@@ -43,6 +42,31 @@ def test_knowledge_configuration_keeps_credentials_secret(tmp_path: Path) -> Non
     assert "embedding-secret" not in repr(settings)
     assert "milvus-secret" not in repr(settings)
     assert "secret@db" not in repr(settings)
+
+
+def test_embedding_provider_defaults_to_dashscope() -> None:
+    settings = Settings(
+        model_provider=ModelProvider.OPENAI,
+        openai_base_url="https://chat.example.test/v1",
+        openai_api_key=SecretStr("chat-secret"),
+        openai_model="chat-model",
+        knowledge_enabled=False,
+        _env_file=None,  # type: ignore[call-arg]
+    )
+
+    assert settings.embedding_provider is EmbeddingProvider.DASHSCOPE
+
+
+def test_dashscope_embedding_does_not_require_base_url(tmp_path: Path) -> None:
+    settings = knowledge_settings(tmp_path)
+
+    assert settings.embedding_provider is EmbeddingProvider.DASHSCOPE
+    assert settings.embedding_base_url is None
+
+
+def test_openai_embedding_requires_base_url(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="embedding_base_url"):
+        knowledge_settings(tmp_path, embedding_provider="openai")
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
 
-from agent_api.core.config import ModelProvider, Settings
+from agent_api.core.config import EmbeddingProvider, ModelProvider, Settings
 from agent_api.core.lifespan import create_lifespan
 from agent_api.knowledge.infrastructure.startup import (
     KnowledgeStartup,
@@ -44,6 +44,7 @@ def enabled_settings(tmp_path: Path) -> Settings:
         redis_url=SecretStr("redis://redis:6379/0"),
         storage_root=tmp_path / "uploads",
         milvus_uri="http://milvus:19530",
+        embedding_provider=EmbeddingProvider.OPENAI,
         embedding_base_url="https://embedding.example.test/v1",
         embedding_api_key=SecretStr("embedding-secret"),
         embedding_model="embedding-model",

@@ -11,10 +11,10 @@ from asgi_lifespan import LifespanManager
 from pydantic import AnyHttpUrl, SecretStr
 from pymilvus import MilvusClient  # type: ignore[import-untyped]
 
-from agent_api.core.config import ModelProvider, Settings
+from agent_api.core.config import EmbeddingProvider, ModelProvider, Settings
 from agent_api.knowledge.application.ingestion import IngestionPipeline, ParentChildChunker
 from agent_api.knowledge.infrastructure.docling.parser import DoclingParser
-from agent_api.knowledge.infrastructure.embedding.openai import create_embedding_adapter
+from agent_api.knowledge.infrastructure.embedding.embedding import create_embedding_adapter
 from agent_api.knowledge.infrastructure.jobs.repository import SqlAlchemyIngestionRepository
 from agent_api.knowledge.infrastructure.milvus.index import MilvusChunkIndex
 from agent_api.llm.agent import LangChainAgentStream
@@ -61,6 +61,7 @@ async def test_four_formats_upload_to_real_index_and_cited_chat(tmp_path: Path) 
         redis_url=SecretStr("redis://127.0.0.1:6379/0"),
         storage_root=tmp_path / "uploads",
         milvus_uri="http://127.0.0.1:19530",
+        embedding_provider=EmbeddingProvider.OPENAI,
         embedding_base_url=AnyHttpUrl(f"http://127.0.0.1:{server.server_port}/v1"),
         embedding_api_key=SecretStr("local-embedding-key"),
         embedding_model="text-embedding-3-small",

@@ -76,6 +76,7 @@ class LangChainAgentStream:
         conversation_id: UUID,
         scope_ids: tuple[UUID, ...] = (),
     ) -> AsyncIterator[str]:
+        # 兼容旧接口：只向外暴露 message 内容，隐藏 status 和 sources 等增强事件。
         async for event in self.stream_events(message, conversation_id, scope_ids):
             if event.event == "message":
                 yield str(event.data["content"])
@@ -86,39 +87,49 @@ class LangChainAgentStream:
         conversation_id: UUID,
         scope_ids: tuple[UUID, ...] = (),
     ) -> AsyncIterator[AgentStreamEvent]:
+        # 节点 A：conversation_id 映射到 LangGraph thread_id，用于延续多轮上下文。
         thread_id = str(conversation_id)
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        # 节点 B：同一会话串行执行，避免两个请求同时改写同一份检查点消息。
         lock = self._locks.setdefault(thread_id, asyncio.Lock())
 
         async with lock:
+            # 节点 C：记录本轮开始前的消息快照，后续异常时可回滚到干净状态。
             baseline = await self._messages(config)
+            # 节点 D：把本轮知识库范围放入上下文变量，供只读知识工具读取。
             turn = TurnKnowledgeState(scope_ids)
             current_turn.set(turn)
             published_sources = 0
             generating = False
             retrieving = False
+            # 节点 E：过滤模型输出中的引用标记，只保留本轮真实返回过的来源编号。
             citations = CitationStreamFilter()
             try:
+                # 节点 F：把用户消息交给 LangChain Agent，并逐个消费模型流式消息。
                 async for item in self._agent.astream(
                     {"messages": [HumanMessage(content=message)]},
                     config=config,
                     stream_mode="messages",
                 ):
                     chunk, metadata = cast(tuple[BaseMessage, dict[str, Any]], item)
+                    # 节点 G：知识工具一旦新增来源，立即发布 sources 事件给前端。
                     if len(turn.sources) > published_sources:
                         published_sources = len(turn.sources)
                         yield AgentStreamEvent(
                             "sources",
                             {"items": [source.public_dict() for source in turn.sources]},
                         )
+                    # 节点 H：只处理模型节点产生的 AIMessageChunk，忽略工具节点等内部消息。
                     if (
                         isinstance(chunk, AIMessageChunk)
                         and metadata.get("langgraph_node") == "model"
                     ):
+                        # 节点 I：模型开始发起工具调用时，通知前端进入检索阶段。
                         if chunk.tool_call_chunks and not retrieving:
                             retrieving = True
                             yield AgentStreamEvent("status", {"stage": "retrieving"})
                         if isinstance(chunk.content, str) and chunk.content:
+                            # 节点 J：知识库开启时先清洗引用，避免模型编造未返回的 [数字]。
                             content = (
                                 citations.push(chunk.content, len(turn.sources))
                                 if self._knowledge_enabled
@@ -126,21 +137,26 @@ class LangChainAgentStream:
                             )
                             if not content:
                                 continue
+                            # 节点 K：首个可展示文本前发布 generating 状态。
                             if not generating:
                                 generating = True
                                 yield AgentStreamEvent("status", {"stage": "generating"})
+                            # 节点 L：把模型文本片段作为 message 事件向路由层输出。
                             yield AgentStreamEvent("message", {"content": content})
+                # 节点 M：模型流结束后，补发尚未发布的来源。
                 if len(turn.sources) > published_sources:
                     yield AgentStreamEvent(
                         "sources",
                         {"items": [source.public_dict() for source in turn.sources]},
                     )
+                # 节点 N：处理跨 chunk 残留的引用文本，避免末尾引用被截断。
                 tail = citations.finish() if self._knowledge_enabled else ""
                 if tail:
                     if not generating:
                         yield AgentStreamEvent("status", {"stage": "generating"})
                     yield AgentStreamEvent("message", {"content": tail})
             except BaseException:
+                # 节点 O：任意异常都会回滚本轮写入的上下文，避免失败对话污染后续请求。
                 with suppress(BaseException):
                     await self._rollback(config, baseline)
                 raise

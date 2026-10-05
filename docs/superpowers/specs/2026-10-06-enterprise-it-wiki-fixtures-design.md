@@ -1,7 +1,7 @@
 # 企业 IT 运维 Wiki 测试语料设计
 
 - 日期：2026-10-06
-- 状态：待用户复核
+- 状态：approved / confirmed
 - 输出目录：`tests/fixtures/wiki/enterprise-it-operations/`
 - 目标：提供一组可导入知识库与 Wiki 的企业 IT 运维文档，验证跨文档主题归并、冲突消解、引用追溯及多跳问答。
 

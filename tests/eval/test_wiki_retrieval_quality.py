@@ -26,7 +26,11 @@ from agent_api.knowledge.infrastructure.docling.parser import DoclingParser
 from agent_api.knowledge.infrastructure.jobs.repository import SqlAlchemyIngestionRepository
 from agent_api.knowledge.infrastructure.milvus.index import MilvusChunkIndex
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
-from agent_api.knowledge.wiki.generator import WikiGeneratedClaim, WikiGeneration
+from agent_api.knowledge.wiki.generator import (
+    WikiGeneratedClaim,
+    WikiGeneratedSection,
+    WikiGeneration,
+)
 from agent_api.knowledge.wiki.processor import WikiProcessor
 from agent_api.knowledge.wiki.retrieval import WikiRetrievalService, WikiSearchResult
 from agent_api.knowledge.wiki.service import WikiService
@@ -46,6 +50,13 @@ class DeterministicGroundedWikiGenerator:
     async def generate(self, title: str, excerpts: list[str]) -> WikiGeneration:
         del title
         return WikiGeneration(
+            summary_sections=(
+                WikiGeneratedSection(
+                    "概述",
+                    "评测用摘要。",
+                    tuple(range(1, len(excerpts) + 1)),
+                ),
+            ),
             summary_claims=tuple(
                 WikiGeneratedClaim(text=excerpt, source_indices=(index,))
                 for index, excerpt in enumerate(excerpts, 1)

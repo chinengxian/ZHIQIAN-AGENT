@@ -189,8 +189,17 @@ def parse_generation_checkpoint(
     return tuple(sections), tuple(claims), tuple(topics)
 
 
-def render_summary_content(title: str, claims: tuple[GroundedClaim, ...]) -> str:
-    """只渲染有来源的原子事实和定位信息，不复制原文片段。"""
+def render_summary_content(title: str, sections: tuple[GroundedSection, ...]) -> str:
+    """渲染可读摘要段落，来源由结构化 Claim 响应单独提供。"""
+
+    del title
+    return "\n\n".join(
+        f"## {section.title}\n\n{section.text}" for section in sections
+    )
+
+
+def render_legacy_summary_content(title: str, claims: tuple[GroundedClaim, ...]) -> str:
+    """保留仅供在途 wiki-v1 任务发布的兼容正文。"""
 
     lines = [f"# {title}", "", "## 摘要"]
     footnotes: list[str] = []
@@ -468,7 +477,7 @@ class WikiProcessor:
                 )
             )
             try:
-                _, claims, topics = parse_generation_checkpoint(
+                sections, claims, topics = parse_generation_checkpoint(
                     data,
                     chunks,
                     allow_legacy_sections=job.idempotency_key.endswith(":wiki-v1"),
@@ -479,8 +488,11 @@ class WikiProcessor:
                 job.error_code = str(error)
                 return
             presentation = extract_wiki_presentation(document.title, chunks)
-            summary = "\n".join(claim.text for claim in claims)
-            body = render_summary_content(presentation.title, claims)
+            summary = "\n".join(section.text for section in sections)
+            body = render_summary_content(presentation.title, sections)
+            if not sections:
+                summary = "\n".join(claim.text for claim in claims)
+                body = render_legacy_summary_content(presentation.title, claims)
             topic_metadata = [
                 {
                     "name": topic.name,
@@ -504,9 +516,40 @@ class WikiProcessor:
                         {"key": item.key, "label": item.label, "value": item.value}
                         for item in presentation.metadata
                     ],
+                    "summary_sections": [
+                        {"claim_key": f"section-{position + 1}", "title": section.title}
+                        for position, section in enumerate(sections)
+                    ],
                     "topics": topic_metadata,
                 },
             )
+            for position, grounded_section in enumerate(sections if created else ()):
+                claim = WikiClaim(
+                    page_version_id=version.id,
+                    claim_key=f"section-{position + 1}",
+                    text=grounded_section.text,
+                    trust_state="verified",
+                    position=position,
+                    claim_type="summary_section",
+                )
+                session.add(claim)
+                await session.flush()
+                for chunk in grounded_section.chunks:
+                    session.add(
+                        WikiClaimSource(
+                            claim_id=claim.id,
+                            document_id=document.id,
+                            document_version_id=job.document_version_id,
+                            chunk_id=chunk.id,
+                            chunk_kind=chunk.kind,
+                            chunk_ordinal=chunk.ordinal,
+                            content_sha256=sha256(chunk.content.encode()).hexdigest(),
+                            document_title=document.title,
+                            heading_path=list(chunk.heading_path),
+                            page_start=chunk.page_start,
+                            page_end=chunk.page_end,
+                        )
+                    )
             for position, grounded_claim in enumerate(claims if created else ()):
                 claim = WikiClaim(
                     page_version_id=version.id,
@@ -698,6 +741,7 @@ class WikiProcessor:
                         .where(
                             WikiClaim.page_version_id == version.id,
                             WikiClaim.trust_state == "verified",
+                            WikiClaim.claim_type == "summary_fact",
                         )
                         .order_by(WikiClaim.position, WikiClaim.id)
                     )

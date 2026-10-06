@@ -30,6 +30,8 @@ from agent_api.knowledge.wiki.ranking import reciprocal_rank_fusion, select_mmr
 
 logger = logging.getLogger(__name__)
 
+RETRIEVABLE_CLAIM_TYPES = ("summary_fact", "topic_fact")
+
 
 class SourceRetrieval(Protocol):
     async def search_candidates(
@@ -384,6 +386,8 @@ class WikiRetrievalService:
         ranks = source_ranks or {}
         scored: list[tuple[_ClaimRecord, float, str]] = []
         for claim in claims:
+            if claim.claim_type not in RETRIEVABLE_CLAIM_TYPES:
+                continue
             matched = [
                 ranks[source.chunk_id]
                 for source in claim.sources
@@ -418,7 +422,14 @@ class WikiRetrievalService:
                 raise ValueError("invalid_wiki_query")
             claims = [claim for claim, _ in self.rank_page_claims(normalized, page.claims)]
         else:
-            claims = sorted(page.claims, key=lambda claim: (claim.position, claim.id))
+            claims = sorted(
+                (
+                    claim
+                    for claim in page.claims
+                    if claim.claim_type in RETRIEVABLE_CLAIM_TYPES
+                ),
+                key=lambda claim: (claim.position, claim.id),
+            )
         selected = claims[cursor : cursor + limit]
         next_cursor = cursor + len(selected) if cursor + len(selected) < len(claims) else None
         return {
@@ -500,6 +511,7 @@ class WikiRetrievalService:
                             WikiPage.knowledge_base_id.in_(scope_ids),
                             WikiPage.deleted_at.is_(None),
                             WikiClaim.trust_state == "verified",
+                            WikiClaim.claim_type.in_(RETRIEVABLE_CLAIM_TYPES),
                             WikiClaimSource.chunk_id.in_(tuple(source_order)),
                             Document.active_version_id == WikiClaimSource.document_version_id,
                             Document.knowledge_base_id == WikiPage.knowledge_base_id,
@@ -574,6 +586,7 @@ class WikiRetrievalService:
                         .where(
                             WikiPage.id.in_(page_ids),
                             WikiClaim.trust_state == "verified",
+                            WikiClaim.claim_type.in_(RETRIEVABLE_CLAIM_TYPES),
                             Document.active_version_id == WikiClaimSource.document_version_id,
                             Document.knowledge_base_id == WikiPage.knowledge_base_id,
                             Document.status == "ready",

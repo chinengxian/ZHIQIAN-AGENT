@@ -55,11 +55,29 @@ class WikiClaimResponse(BaseModel):
     sources: list[WikiSourceResponse]
 
 
+class WikiSummarySectionResponse(BaseModel):
+    id: UUID
+    title: str
+    text: str
+    position: int
+    trust_state: Literal["verified", "needs_review"]
+    reason: str | None
+    sources: list[WikiSourceResponse]
+
+
+class WikiMetadataResponse(BaseModel):
+    key: str
+    label: str
+    value: str
+
+
 class WikiPageResponse(WikiPageSummary):
     version_no: int
     content: str
     summary: str
     origin: Literal["pipeline", "user", "revert"]
+    summary_sections: list[WikiSummarySectionResponse]
+    metadata: list[WikiMetadataResponse]
     claims: list[WikiClaimResponse]
 
 

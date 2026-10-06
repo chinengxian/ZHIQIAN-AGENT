@@ -23,6 +23,7 @@ from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.wiki.api import router as wiki_router
 from agent_api.knowledge.wiki.generator import (
     WikiGeneratedClaim,
+    WikiGeneratedSection,
     WikiGeneratedTopic,
     WikiGeneration,
 )
@@ -38,6 +39,13 @@ class FakeWikiGenerator:
         assert excerpts
         tail_fact = excerpts[-1] if len(excerpts) > 1 else f"{title} 的来源已验证。"
         return WikiGeneration(
+            summary_sections=(
+                WikiGeneratedSection(
+                    "概述",
+                    f"{title} 的身份与访问控制要求。",
+                    (1,),
+                ),
+            ),
             summary_claims=(
                 WikiGeneratedClaim(f"{title} 讨论共同主题。", (1,)),
                 WikiGeneratedClaim(tail_fact, (len(excerpts),)),

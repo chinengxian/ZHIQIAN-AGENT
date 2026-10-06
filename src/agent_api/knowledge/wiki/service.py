@@ -185,12 +185,17 @@ class WikiService:
             version = await session.get(WikiPageVersion, page.current_version_id)
             if version is None:
                 raise WikiError("wiki_page_version_not_found", 404)
-            claims = await self._claims_response(session, version.id)
-            return self._page_response(page, version, claims)
+            all_claims = await self._claims_response(session, version.id)
+            summary_sections = self._summary_sections_response(version, all_claims)
+            claims = [claim for claim in all_claims if claim["claim_type"] != "summary_section"]
+            return self._page_response(page, version, claims, summary_sections)
 
     @staticmethod
     def _page_response(
-        page: WikiPage, version: WikiPageVersion, claims: list[dict[str, Any]]
+        page: WikiPage,
+        version: WikiPageVersion,
+        claims: list[dict[str, Any]],
+        summary_sections: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         return {
             "id": page.id,
@@ -203,8 +208,55 @@ class WikiService:
             "content": version.content,
             "summary": version.summary,
             "origin": version.origin,
+            "summary_sections": summary_sections or [],
+            "metadata": WikiService._metadata_response(version),
             "claims": claims,
         }
+
+    @staticmethod
+    def _metadata_response(version: WikiPageVersion) -> list[dict[str, str]]:
+        """仅向自动摘要页返回经过发布器白名单处理的信息卡数据。"""
+
+        if version.origin != "pipeline":
+            return []
+        raw_items = version.generation_metadata.get("presentation_metadata", [])
+        if not isinstance(raw_items, list):
+            return []
+        return [
+            {"key": item["key"], "label": item["label"], "value": item["value"]}
+            for item in raw_items
+            if isinstance(item, dict)
+            and all(isinstance(item.get(field), str) for field in ("key", "label", "value"))
+        ]
+
+    @staticmethod
+    def _summary_sections_response(
+        version: WikiPageVersion,
+        claims: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """把摘要段落标题从发布元数据与其可验证来源重新组合。"""
+
+        raw_sections = version.generation_metadata.get("summary_sections", [])
+        titles = {
+            item["claim_key"]: item["title"]
+            for item in raw_sections
+            if isinstance(item, dict)
+            and isinstance(item.get("claim_key"), str)
+            and isinstance(item.get("title"), str)
+        } if isinstance(raw_sections, list) else {}
+        return [
+            {
+                "id": claim["id"],
+                "title": titles.get(claim["claim_key"], "概述"),
+                "text": claim["text"],
+                "position": claim["position"],
+                "trust_state": claim["trust_state"],
+                "reason": claim["reason"],
+                "sources": claim["sources"],
+            }
+            for claim in claims
+            if claim["claim_type"] == "summary_section"
+        ]
 
     async def _claims_response(
         self, session: AsyncSession, page_version_id: UUID

@@ -88,18 +88,92 @@ class KnowledgeRetrievalService:
         mode: str = "hybrid",
         limit: int = 8,
     ) -> tuple[list[Source], bool]:
-        if not query.strip() or not scope_ids:
-            return [], False
         if mode not in {"hybrid", "semantic", "keyword"} or not 1 <= limit <= 8:
             raise ValueError("invalid_search_options")
+        return await self._search_sources(
+            query,
+            scope_ids,
+            mode=mode,
+            output_limit=limit,
+            index_limit=20,
+            deduplicate_parents=True,
+        )
+
+    async def search_candidates(
+        self,
+        query: str,
+        scope_ids: tuple[UUID, ...],
+        *,
+        mode: str = "hybrid",
+        limit: int = 40,
+    ) -> tuple[list[Source], bool]:
+        """为 Wiki 返回扩大后的 child 候选池，不套用公共工具的八条上限。"""
+
+        if not 1 <= limit <= 100:
+            raise ValueError("invalid_candidate_limit")
+        if mode not in {"hybrid", "semantic", "keyword"}:
+            raise ValueError("invalid_search_options")
+        return await self._search_sources(
+            query,
+            scope_ids,
+            mode=mode,
+            output_limit=limit,
+            index_limit=min(200, max(limit * 2, 40)),
+            deduplicate_parents=False,
+        )
+
+    async def _search_sources(
+        self,
+        query: str,
+        scope_ids: tuple[UUID, ...],
+        *,
+        mode: str,
+        output_limit: int,
+        index_limit: int,
+        deduplicate_parents: bool,
+    ) -> tuple[list[Source], bool]:
+        if not query.strip() or not scope_ids:
+            return [], False
         vector = None
         if mode != "keyword":
             vector = (await self._embedder.embed_documents([query]))[0]
         hits = await self._index.search(
-            query, vector=vector, knowledge_base_ids=scope_ids, mode=mode, limit=20
+            query,
+            vector=vector,
+            knowledge_base_ids=scope_ids,
+            mode=mode,
+            limit=index_limit,
         )
         if not hits:
             return [], False
+        sources = await self._fetch_sources(
+            hits,
+            scope_ids,
+            deduplicate_parents=deduplicate_parents,
+        )
+        degraded = False
+        if self._reranker is not None and len(sources) > 1:
+            try:
+                order = await self._reranker.rerank(query, [source.excerpt for source in sources])
+                if sorted(order) != list(range(len(sources))):
+                    raise ValueError("invalid_rerank_result")
+                sources = [sources[index] for index in order]
+            except Exception:
+                degraded = True
+        return [
+            replace(source, citation_id=f"[{rank}]", rank=rank)
+            for rank, source in enumerate(sources[:output_limit], 1)
+        ], degraded
+
+    async def _fetch_sources(
+        self,
+        hits: list[SearchHit],
+        scope_ids: tuple[UUID, ...],
+        *,
+        deduplicate_parents: bool,
+    ) -> list[Source]:
+        """批量把活动 child 命中转换为可引用来源。"""
+
         async with self._sessions() as session:
             rows = list(
                 (
@@ -133,7 +207,7 @@ class KnowledgeRetrievalService:
                 continue
             chunk, document = row
             parent_id = chunk.parent_chunk_id or chunk.id
-            if parent_id in seen or remaining <= 0:
+            if (deduplicate_parents and parent_id in seen) or remaining <= 0:
                 continue
             seen.add(parent_id)
             parent = parents.get(parent_id)
@@ -156,19 +230,7 @@ class KnowledgeRetrievalService:
                     rank=len(sources) + 1,
                 )
             )
-        degraded = False
-        if self._reranker is not None and len(sources) > 1:
-            try:
-                order = await self._reranker.rerank(query, [source.excerpt for source in sources])
-                if sorted(order) != list(range(len(sources))):
-                    raise ValueError("invalid_rerank_result")
-                sources = [sources[index] for index in order]
-            except Exception:
-                degraded = True
-        return [
-            replace(source, citation_id=f"[{rank}]", rank=rank)
-            for rank, source in enumerate(sources[:limit], 1)
-        ], degraded
+        return sources
 
     async def read(
         self,

@@ -70,7 +70,10 @@ def _source(chunk_id: UUID, rank: int) -> Source:
 async def test_search_candidates_uses_expanded_pool_without_public_limit() -> None:
     base_id = uuid4()
     chunk_ids = [uuid4() for _ in range(50)]
-    hits = [SearchHit(chunk_id, uuid4(), base_id, 1 / rank) for rank, chunk_id in enumerate(chunk_ids, 1)]
+    hits = [
+        SearchHit(chunk_id, uuid4(), base_id, 1 / rank)
+        for rank, chunk_id in enumerate(chunk_ids, 1)
+    ]
     sources = {chunk_id: _source(chunk_id, rank) for rank, chunk_id in enumerate(chunk_ids, 1)}
     index = RecordingChunkIndex(hits)
     service = CandidateRetrievalService(index, sources)

@@ -7,6 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
+from agent_api.knowledge.wiki.retrieval import WikiRetrievalError, WikiRetrievalService
 from agent_api.knowledge.wiki.service import WikiError, WikiService
 
 
@@ -47,6 +48,8 @@ class WikiClaimResponse(BaseModel):
     id: UUID
     claim_key: str
     text: str
+    position: int
+    claim_type: Literal["summary_fact", "topic_fact", "source_excerpt", "manual"]
     trust_state: Literal["verified", "needs_review"]
     reason: str | None
     sources: list[WikiSourceResponse]
@@ -103,11 +106,46 @@ class WikiJobResponse(BaseModel):
     created_at: datetime
 
 
-class WikiSearchResponse(BaseModel):
+class WikiSearchSourceResponse(BaseModel):
+    chunk_id: UUID
+    document_id: UUID
+    document_version_id: UUID
+    title: str
+    filename: str
+    page_start: int | None
+    page_end: int | None
+    heading_path: tuple[str, ...]
+    excerpt: str
+    score: float
+    rank: int
+
+
+class WikiMatchedClaimResponse(BaseModel):
     id: UUID
+    text: str
+    position: int
+    claim_type: Literal["summary_fact", "topic_fact", "source_excerpt", "manual"]
+    score: float
+    sources: list[WikiSearchSourceResponse]
+
+
+class WikiMatchedPageResponse(BaseModel):
+    id: UUID
+    knowledge_base_id: UUID
     slug: str
     title: str
     page_type: Literal["summary", "topic", "index"]
+    score: float
+    matched_fields: list[str]
+    matched_claims: list[WikiMatchedClaimResponse]
+    omitted_claim_count: int
+
+
+class WikiSearchResponse(BaseModel):
+    pages: list[WikiMatchedPageResponse]
+    degraded: bool
+    degradation_reason: str | None
+    truncation_reason: str | None
 
 
 def get_wiki_service(request: Request) -> WikiService:
@@ -120,7 +158,18 @@ def get_wiki_service(request: Request) -> WikiService:
     return service  # type: ignore[no-any-return]
 
 
+def get_wiki_retrieval(request: Request) -> WikiRetrievalService:
+    service = getattr(request.app.state, "wiki_retrieval", None)
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "wiki_unavailable", "message": "Wiki search unavailable"},
+        )
+    return service  # type: ignore[no-any-return]
+
+
 WikiServiceDependency = Annotated[WikiService, Depends(get_wiki_service)]
+WikiRetrievalDependency = Annotated[WikiRetrievalService, Depends(get_wiki_retrieval)]
 router = APIRouter(prefix="/api/v1/knowledge-bases/{knowledge_base_id}/wiki", tags=["wiki"])
 
 
@@ -259,14 +308,30 @@ async def list_jobs(
         _raise_http_error(error)
 
 
-@router.get("/search", response_model=list[WikiSearchResponse])
+@router.get("/search", response_model=WikiSearchResponse)
 async def search_pages(
     knowledge_base_id: UUID,
-    service: WikiServiceDependency,
+    service: WikiRetrievalDependency,
     q: str = Query(min_length=1, max_length=200),
-    limit: int = Query(default=20, ge=1, le=100),
+    mode: Literal["hybrid", "semantic", "keyword"] = "hybrid",
+    limit: int = Query(default=5, ge=1, le=20),
+    claim_limit: int = Query(default=12, ge=1, le=50),
 ) -> Any:
     try:
-        return await service.search_pages(knowledge_base_id, q, limit=limit)
-    except WikiError as error:
-        _raise_http_error(error)
+        return await service.search(
+            q,
+            (knowledge_base_id,),
+            mode=mode,
+            page_limit=limit,
+            claim_limit=claim_limit,
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_wiki_search", "message": "Invalid Wiki search"},
+        ) from None
+    except WikiRetrievalError:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "wiki_retrieval_unavailable", "message": "Wiki search unavailable"},
+        ) from None

@@ -88,10 +88,22 @@ async def test_startup_failure_closes_initialized_checks_and_redacts_cause(
     assert events == ["check:database", "check:redis", "close:database"]
 
 
-async def test_lifespan_starts_and_closes_enabled_knowledge(tmp_path: Path) -> None:
+async def test_lifespan_starts_and_closes_enabled_knowledge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     settings = enabled_settings(tmp_path)
     events: list[str] = []
     manager = startup(tmp_path, [RecordingCheck("database", events)])
+
+    class FakeMilvusClient:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    milvus = FakeMilvusClient()
+    monkeypatch.setattr("agent_api.core.lifespan.MilvusClient", lambda **_: milvus)
     lifespan = create_lifespan(
         settings_factory=lambda: settings,
         agent_factory=lambda _: FakeStreamAgent(),
@@ -104,6 +116,7 @@ async def test_lifespan_starts_and_closes_enabled_knowledge(tmp_path: Path) -> N
         assert events == ["check:database"]
 
     assert events == ["check:database", "close:database"]
+    assert milvus.close_calls == 1
     assert not hasattr(app.state, "knowledge_startup")
 
 

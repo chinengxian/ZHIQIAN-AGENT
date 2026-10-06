@@ -7,6 +7,12 @@ from agent_api.knowledge.tools.readonly import (
     create_knowledge_tools,
     current_turn,
 )
+from agent_api.knowledge.wiki.retrieval import (
+    WikiMatchedClaim,
+    WikiMatchedPage,
+    WikiSearchResult,
+    _ClaimRecord,
+)
 from agent_api.llm.agent import KNOWLEDGE_SYSTEM_PROMPT
 
 BASE_ID = UUID("00000000-0000-0000-0000-000000000021")
@@ -60,50 +66,92 @@ class FakeRetrieval:
 
 
 class FakeWiki:
+    """写服务占位；只读工具不能再调用旧的 agent_pages。"""
+
+
+class FakeWikiRetrieval:
     def __init__(self) -> None:
-        self.scopes: list[UUID] = []
+        self.search_scopes: list[tuple[UUID, ...]] = []
+        self.read_calls: list[dict[str, object]] = []
 
-    async def agent_pages(self, knowledge_base_id: UUID, query: str, *, limit: int):
-        self.scopes.append(knowledge_base_id)
-        return [await self.agent_read_page(knowledge_base_id, PAGE_ID)]
+    @staticmethod
+    def _source() -> Source:
+        return Source(
+            citation_id="",
+            chunk_id=CHUNK_ID,
+            document_id=DOCUMENT_ID,
+            document_version_id=UUID(int=25),
+            title="指南",
+            filename="guide.pdf",
+            page_start=3,
+            page_end=3,
+            heading_path=("使用",),
+            excerpt="第九条但最相关的结论",
+            score=0.9,
+            rank=1,
+        )
 
-    async def agent_read_page(self, knowledge_base_id: UUID, page_id: UUID):
-        self.scopes.append(knowledge_base_id)
+    async def search(
+        self,
+        query: str,
+        scope_ids: tuple[UUID, ...],
+        **options: object,
+    ) -> WikiSearchResult:
+        del query, options
+        self.search_scopes.append(scope_ids)
+        claim = WikiMatchedClaim(
+            id=UUID(int=30),
+            text="第九条但最相关的结论",
+            position=9,
+            claim_type="summary_fact",
+            score=1.0,
+            sources=(self._source(),),
+        )
+        page = WikiMatchedPage(
+            id=PAGE_ID,
+            knowledge_base_id=BASE_ID,
+            slug="topic/wiki-guide",
+            title="Wiki 指南",
+            page_type="topic",
+            score=0.8,
+            matched_fields=("source_chunk",),
+            matched_claims=(claim,),
+            omitted_claim_count=2,
+        )
+        return WikiSearchResult((page,), False, None, "claim_limit")
+
+    async def read_page(
+        self,
+        knowledge_base_id: UUID,
+        page_id: UUID,
+        *,
+        query: str,
+        cursor: int,
+        limit: int,
+    ) -> dict[str, object]:
+        self.read_calls.append(
+            {
+                "knowledge_base_id": knowledge_base_id,
+                "page_id": page_id,
+                "query": query,
+                "cursor": cursor,
+                "limit": limit,
+            }
+        )
         return {
             "page_id": page_id,
             "title": "Wiki 指南",
             "claims": [
-                {
-                    "text": "有效结论",
-                    "sources": [
-                        {
-                            "chunk_id": CHUNK_ID,
-                            "document_id": DOCUMENT_ID,
-                            "document_version_id": UUID(int=25),
-                            "document_title": "指南",
-                            "page_start": 3,
-                            "page_end": 3,
-                            "heading_path": ["使用"],
-                            "valid": True,
-                        }
-                    ],
-                },
-                {
-                    "text": "失效结论",
-                    "sources": [
-                        {
-                            "chunk_id": UUID(int=27),
-                            "document_id": DOCUMENT_ID,
-                            "document_version_id": UUID(int=25),
-                            "document_title": "旧指南",
-                            "page_start": None,
-                            "page_end": None,
-                            "heading_path": [],
-                            "valid": False,
-                        }
-                    ],
-                },
+                _ClaimRecord(
+                    UUID(int=31),
+                    "有效结论",
+                    0,
+                    "summary_fact",
+                    (self._source(),),
+                )
             ],
+            "next_cursor": 20,
+            "omitted_claim_count": 1,
         }
 
 
@@ -150,9 +198,12 @@ async def test_tool_content_remains_data_and_no_write_tool_is_registered() -> No
 
 async def test_wiki_tools_enforce_scope_and_only_register_valid_sources() -> None:
     wiki = FakeWiki()
+    wiki_retrieval = FakeWikiRetrieval()
     tools = {
         item.name: item
-        for item in create_knowledge_tools(FakeRetrieval(), wiki)  # type: ignore[arg-type]
+        for item in create_knowledge_tools(  # type: ignore[arg-type]
+            FakeRetrieval(), wiki, wiki_retrieval
+        )
     }
     token = current_turn.set(TurnKnowledgeState((BASE_ID,)))
     try:
@@ -162,12 +213,33 @@ async def test_wiki_tools_enforce_scope_and_only_register_valid_sources() -> Non
             )
         )
         assert denied["status"] == "knowledge_scope_unavailable"
-        assert wiki.scopes == []
         found = json.loads(await tools["wiki_search"].ainvoke({"query": "指南"}))
         assert found["pages"][0]["claims"] == [
-            {"text": "有效结论", "citations": ["[1]"]}
+            {
+                "text": "第九条但最相关的结论",
+                "position": 9,
+                "claim_type": "summary_fact",
+                "score": 1.0,
+                "citations": ["[1]"],
+            }
         ]
+        assert found["pages"][0]["matched_fields"] == ["source_chunk"]
+        assert found["pages"][0]["omitted_claim_count"] == 2
+        assert found["degraded"] is False
+        assert wiki_retrieval.search_scopes == [(BASE_ID,)]
+        read = json.loads(
+            await tools["wiki_read_page"].ainvoke(
+                {
+                    "knowledge_base_id": str(BASE_ID),
+                    "page_id": str(PAGE_ID),
+                    "query": "有效",
+                    "cursor": 0,
+                    "limit": 20,
+                }
+            )
+        )
+        assert read["pages"][0]["claims"][0]["text"] == "有效结论"
+        assert read["pages"][0]["next_cursor"] == 20
         assert len(current_turn.get().sources) == 1  # type: ignore[union-attr]
-        assert set(wiki.scopes) == {BASE_ID}
     finally:
         current_turn.reset(token)

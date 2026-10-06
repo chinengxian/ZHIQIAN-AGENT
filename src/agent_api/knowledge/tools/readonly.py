@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from agent_api.knowledge.application.citations import Source
 from agent_api.knowledge.application.retrieval import KnowledgeRetrievalService
+from agent_api.knowledge.wiki.retrieval import WikiRetrievalService
 from agent_api.knowledge.wiki.service import WikiService
 
 
@@ -76,6 +77,9 @@ class WikiSearchInput(BaseModel):
 class WikiReadInput(BaseModel):
     knowledge_base_id: UUID
     page_id: UUID
+    query: str = Field(default="", max_length=200)
+    cursor: int = Field(default=0, ge=0)
+    limit: int = Field(default=20, ge=1, le=50)
 
 
 def _scope(requested: list[UUID] | None = None) -> tuple[UUID, ...] | None:
@@ -90,7 +94,9 @@ def _scope(requested: list[UUID] | None = None) -> tuple[UUID, ...] | None:
 
 
 def create_knowledge_tools(
-    service: KnowledgeRetrievalService, wiki_service: WikiService | None = None
+    service: KnowledgeRetrievalService,
+    wiki_service: WikiService | None = None,
+    wiki_retrieval: WikiRetrievalService | None = None,
 ) -> list[BaseTool]:
     @tool("search_knowledge", args_schema=SearchInput)
     async def search_knowledge(
@@ -165,42 +171,23 @@ def create_knowledge_tools(
         return json.dumps({"status": "ok", "documents": documents}, ensure_ascii=False)
 
     tools: list[BaseTool] = [search_knowledge, read_document, list_documents]
-    if wiki_service is None:
+    if wiki_service is None or wiki_retrieval is None:
         return tools
 
-    def trusted_claims(pages: list[dict[str, Any]]) -> list[dict[str, object]]:
+    def register_claim(claim: Any, *, score: float | None = None) -> dict[str, object] | None:
         turn = current_turn.get()
         assert turn is not None
-        result: list[dict[str, object]] = []
-        for page in pages:
-            entries: list[dict[str, object]] = []
-            for claim in page["claims"]:
-                citations: list[str] = []
-                for origin in claim["sources"]:
-                    chunk_id = origin["chunk_id"]
-                    if chunk_id is None or not origin["valid"]:
-                        continue
-                    source = Source(
-                        citation_id="",
-                        chunk_id=chunk_id,
-                        document_id=origin["document_id"],
-                        document_version_id=origin["document_version_id"],
-                        title=origin["document_title"],
-                        filename=origin["document_title"],
-                        page_start=origin["page_start"],
-                        page_end=origin["page_end"],
-                        heading_path=tuple(origin["heading_path"]),
-                        excerpt=claim["text"],
-                        score=1.0,
-                        rank=0,
-                    )
-                    citations.extend(item.citation_id for item in turn.register([source]))
-                if citations:
-                    entries.append({"text": claim["text"], "citations": citations})
-            if entries:
-                result.append(
-                    {"page_id": str(page["page_id"]), "title": page["title"], "claims": entries}
-                )
+        registered = turn.register(list(claim.sources))
+        if not registered:
+            return None
+        result: dict[str, object] = {
+            "text": claim.text,
+            "position": claim.position,
+            "claim_type": claim.claim_type,
+            "citations": [source.citation_id for source in registered],
+        }
+        if score is not None:
+            result["score"] = score
         return result
 
     @tool("wiki_search", args_schema=WikiSearchInput)
@@ -211,31 +198,86 @@ def create_knowledge_tools(
         if scope_ids is None:
             return json.dumps({"status": "knowledge_scope_unavailable"})
         try:
-            pages = []
-            for knowledge_base_id in scope_ids:
-                pages.extend(await wiki_service.agent_pages(knowledge_base_id, query, limit=5))
-            results = trusted_claims(pages[:8])
+            result = await wiki_retrieval.search(query, scope_ids)
         except Exception:
             return json.dumps({"status": "retrieval_unavailable"})
+        turn = current_turn.get()
+        assert turn is not None
+        turn.degraded |= result.degraded
+        pages: list[dict[str, object]] = []
+        for page in result.pages:
+            claims = [
+                registered
+                for claim in page.matched_claims
+                if (registered := register_claim(claim, score=claim.score)) is not None
+            ]
+            if not claims:
+                continue
+            pages.append(
+                {
+                    "page_id": str(page.id),
+                    "knowledge_base_id": str(page.knowledge_base_id),
+                    "slug": page.slug,
+                    "title": page.title,
+                    "score": page.score,
+                    "matched_fields": list(page.matched_fields),
+                    "claims": claims,
+                    "omitted_claim_count": page.omitted_claim_count,
+                }
+            )
         return json.dumps(
-            {"status": "ok" if results else "no_relevant_knowledge", "pages": results},
+            {
+                "status": "ok" if pages else "no_relevant_knowledge",
+                "pages": pages,
+                "degraded": result.degraded,
+                "degradation_reason": result.degradation_reason,
+                "truncation_reason": result.truncation_reason,
+            },
             ensure_ascii=False,
         )
 
     @tool("wiki_read_page", args_schema=WikiReadInput)
-    async def wiki_read_page(knowledge_base_id: UUID, page_id: UUID) -> str:
+    async def wiki_read_page(
+        knowledge_base_id: UUID,
+        page_id: UUID,
+        query: str = "",
+        cursor: int = 0,
+        limit: int = 20,
+    ) -> str:
         """读取当前范围内 Wiki 页面的有效结论及原文引用。"""
 
         scope_ids = _scope([knowledge_base_id])
         if scope_ids is None:
             return json.dumps({"status": "knowledge_scope_unavailable"})
         try:
-            page = await wiki_service.agent_read_page(knowledge_base_id, page_id)
-            results = trusted_claims([page] if page is not None else [])
+            page = await wiki_retrieval.read_page(
+                knowledge_base_id,
+                page_id,
+                query=query,
+                cursor=cursor,
+                limit=limit,
+            )
         except Exception:
             return json.dumps({"status": "retrieval_unavailable"})
+        pages: list[dict[str, object]] = []
+        if page is not None:
+            claims = [
+                registered
+                for claim in page["claims"]
+                if (registered := register_claim(claim)) is not None
+            ]
+            if claims:
+                pages.append(
+                    {
+                        "page_id": str(page["page_id"]),
+                        "title": page["title"],
+                        "claims": claims,
+                        "next_cursor": page["next_cursor"],
+                        "omitted_claim_count": page["omitted_claim_count"],
+                    }
+                )
         return json.dumps(
-            {"status": "ok" if results else "no_relevant_knowledge", "pages": results},
+            {"status": "ok" if pages else "no_relevant_knowledge", "pages": pages},
             ensure_ascii=False,
         )
 

@@ -4,7 +4,7 @@ from hashlib import sha256
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_api.knowledge.application.management import DEFAULT_WORKSPACE_ID
@@ -213,7 +213,7 @@ class WikiService:
             await session.scalars(
                 select(WikiClaim)
                 .where(WikiClaim.page_version_id == page_version_id)
-                .order_by(WikiClaim.claim_key)
+                .order_by(WikiClaim.position, WikiClaim.id)
             )
         )
         output: list[dict[str, Any]] = []
@@ -248,6 +248,8 @@ class WikiService:
                     "id": claim.id,
                     "claim_key": claim.claim_key,
                     "text": claim.text,
+                    "position": claim.position,
+                    "claim_type": claim.claim_type,
                     "trust_state": "verified" if trusted else "needs_review",
                     "reason": claim.reason if trusted else claim.reason or "source_not_current",
                     "sources": rendered_sources,
@@ -342,6 +344,8 @@ class WikiService:
                     text=content,
                     trust_state="needs_review",
                     reason="manual_edit_without_source",
+                    position=0,
+                    claim_type="manual",
                 )
             )
             await session.flush()
@@ -459,6 +463,8 @@ class WikiService:
                 text=source_claim.text,
                 trust_state=source_claim.trust_state,
                 reason=source_claim.reason,
+                position=source_claim.position,
+                claim_type=source_claim.claim_type,
             )
             session.add(claim)
             await session.flush()
@@ -514,91 +520,3 @@ class WikiService:
                     "created_at": job.created_at,
                 })
             return output
-
-    async def search_pages(
-        self, knowledge_base_id: UUID, query: str, *, limit: int = 20
-    ) -> list[dict[str, Any]]:
-        async with self._sessions() as session:
-            await self._base(session, knowledge_base_id)
-            pattern = f"%{query.strip()}%"
-            pages = list(
-                await session.scalars(
-                    select(WikiPage)
-                    .join(WikiPageVersion, WikiPage.current_version_id == WikiPageVersion.id)
-                    .where(
-                        WikiPage.knowledge_base_id == knowledge_base_id,
-                        WikiPage.deleted_at.is_(None),
-                        or_(
-                            WikiPage.title.ilike(pattern),
-                            WikiPage.slug.ilike(pattern),
-                            WikiPageVersion.content.ilike(pattern),
-                        ),
-                    )
-                    .order_by(WikiPage.title, WikiPage.id)
-                    .limit(limit)
-                )
-            )
-            return [
-                {"id": page.id, "slug": page.slug, "title": page.title, "page_type": page.page_type}
-                for page in pages
-            ]
-
-    async def agent_pages(
-        self, knowledge_base_id: UUID, query: str, *, limit: int = 5
-    ) -> list[dict[str, Any]]:
-        """只向 Agent 提供启用状态下、来源仍有效的结论。"""
-
-        async with self._sessions() as session:
-            base = await self._base(session, knowledge_base_id)
-            config = await session.get(WikiConfig, knowledge_base_id)
-            if not base.enabled or config is None or not config.enabled:
-                return []
-            pattern = f"%{query.strip()}%"
-            pages = list(
-                await session.scalars(
-                    select(WikiPage)
-                    .join(WikiPageVersion, WikiPage.current_version_id == WikiPageVersion.id)
-                    .where(
-                        WikiPage.knowledge_base_id == knowledge_base_id,
-                        WikiPage.deleted_at.is_(None),
-                        WikiPage.page_type != "index",
-                        or_(
-                            WikiPage.title.ilike(pattern),
-                            WikiPageVersion.content.ilike(pattern),
-                        ),
-                    )
-                    .order_by(WikiPage.title)
-                    .limit(limit)
-                )
-            )
-            output: list[dict[str, Any]] = []
-            for page in pages:
-                if page.current_version_id is None:
-                    continue
-                claims = await self._claims_response(session, page.current_version_id)
-                trusted = [claim for claim in claims if claim["trust_state"] == "verified"]
-                if trusted:
-                    output.append(
-                        {"page_id": page.id, "title": page.title, "claims": trusted[:8]}
-                    )
-            return output
-
-    async def agent_read_page(
-        self, knowledge_base_id: UUID, page_id: UUID
-    ) -> dict[str, Any] | None:
-        """读取页面的可信结论；人工正文和失效引用不能进入工具输出。"""
-
-        async with self._sessions() as session:
-            base = await self._base(session, knowledge_base_id)
-            config = await session.get(WikiConfig, knowledge_base_id)
-            if not base.enabled or config is None or not config.enabled:
-                return None
-            page = await self._page(session, knowledge_base_id, page_id)
-            if page.current_version_id is None:
-                return None
-            claims = await self._claims_response(session, page.current_version_id)
-            return {
-                "page_id": page.id,
-                "title": page.title,
-                "claims": [claim for claim in claims if claim["trust_state"] == "verified"][:8],
-            }

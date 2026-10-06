@@ -27,6 +27,8 @@
 - 原生知识库与多级 RAG 技术设计：[`../superpowers/specs/2026-09-20-native-knowledge-rag-design.md`](../superpowers/specs/2026-09-20-native-knowledge-rag-design.md)
 - Wiki 技术设计：[`../superpowers/specs/2026-09-22-wiki-synthesis-design.md`](../superpowers/specs/2026-09-22-wiki-synthesis-design.md)（confirmed）
 - Wiki 实施计划：[`../superpowers/plans/2026-09-22-wiki-synthesis.md`](../superpowers/plans/2026-09-22-wiki-synthesis.md)（approved）
+- Wiki 来源驱动混合检索设计：[`../superpowers/specs/2026-10-06-wiki-provenance-hybrid-search-design.md`](../superpowers/specs/2026-10-06-wiki-provenance-hybrid-search-design.md)（confirmed）
+- Wiki 来源驱动混合检索计划：[`../superpowers/plans/2026-10-06-wiki-provenance-hybrid-search.md`](../superpowers/plans/2026-10-06-wiki-provenance-hybrid-search.md)（approved）
 - 原生知识库中文链路说明：[`knowledge-infrastructure-flow.md`](knowledge-infrastructure-flow.md)
 - 集成验收报告：[`../verification/VERIFY-001.md`](../verification/VERIFY-001.md)
 - Agent 记忆改造验收：[`../verification/VERIFY-002.md`](../verification/VERIFY-002.md)
@@ -64,6 +66,24 @@
 - 多模型策略：REQ-004 已完成。TASK-016 与 TASK-017 均为 `done`，VERIFY-003 为 `PASS`。最终新鲜证据为 12 项聚焦验收、69 个后端测试、Ruff／format／mypy／依赖门，以及固定 Node v22.23.2 下 20 个前端测试、构建和 desktop/mobile E2E；未选中畸形 URL、不可变注册表、未知 provider 与同／异会话并发要求均已显式覆盖。
 - 原生知识库开发：REQ-005 的 TASK-019～TASK-025 均已完成，最终证据见 VERIFY-004。四格式上传、异步入库、真实 Milvus 检索、选定范围聊天与引用已通过真实 API/Worker 和桌面／移动浏览器闭环；真实容器后端 183 项、真实浏览器 4 项、前端单测 27 项均通过。固定集 Recall@8=1.0；真实付费供应商联网未运行。Wiki 规格已确认，TASK-026 完成，TASK-027～031 按依赖实施。
 - Git：当前目录现为 Git 仓库；原生知识库设计基线为 `83c58e2`，新任务从该修订开始。
+
+## Wiki 固定检索评测
+
+固定集包含 16 道企业 IT 运维问题，每题至少 3 个查询变体。结构检查不依赖外部服务：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/eval/test_wiki_retrieval_quality.py::test_wiki_eval_cases_cover_all_approved_questions -q
+```
+
+真实质量评测会写入测试数据，必须使用已迁移到 Alembic head 的独立 PostgreSQL 测试库和本地 Milvus；不得指向业务库或共享开发库：
+
+```powershell
+$env:RUN_KNOWLEDGE_INTEGRATION='1'
+$env:AGENT_WIKI_TEST_DATABASE_URL='postgresql+asyncpg://<user>:<password>@127.0.0.1:5432/<isolated-test-db>'
+.\.venv\Scripts\python.exe -m pytest tests/eval/test_wiki_retrieval_quality.py -q -s
+```
+
+评测生成器会把原文分块确定性地发布为带来源 claim，用于隔离检索质量；该结果不代表真实付费模型的摘要生成质量。
 
 ## 恢复入口
 

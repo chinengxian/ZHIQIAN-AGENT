@@ -15,13 +15,20 @@ from agent_api.knowledge.infrastructure.database.models import (
     DocumentVersion,
     KnowledgeBase,
     WikiJob,
+    WikiPage,
+    WikiPageAlias,
+    WikiPageVersion,
 )
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.wiki.api import router as wiki_router
-from agent_api.knowledge.wiki.generator import WikiGeneration
+from agent_api.knowledge.wiki.generator import (
+    WikiGeneratedClaim,
+    WikiGeneratedTopic,
+    WikiGeneration,
+)
 from agent_api.knowledge.wiki.jobs import schedule_document_wiki
 from agent_api.knowledge.wiki.processor import WikiProcessor
-from agent_api.knowledge.wiki.service import WikiService
+from agent_api.knowledge.wiki.service import WikiError, WikiService
 
 
 class FakeWikiGenerator:
@@ -29,7 +36,21 @@ class FakeWikiGenerator:
 
     async def generate(self, title: str, excerpts: list[str]) -> WikiGeneration:
         assert excerpts
-        return WikiGeneration(f"{title} 讨论共同主题。", ("共同主题",), 64)
+        tail_fact = excerpts[-1] if len(excerpts) > 1 else f"{title} 的来源已验证。"
+        return WikiGeneration(
+            summary_claims=(
+                WikiGeneratedClaim(f"{title} 讨论共同主题。", (1,)),
+                WikiGeneratedClaim(tail_fact, (len(excerpts),)),
+            ),
+            topics=(
+                WikiGeneratedTopic(
+                    "共同主题",
+                    ("共享主题",),
+                    tuple(range(1, len(excerpts) + 1)),
+                ),
+            ),
+            measured_tokens=64,
+        )
 
 
 @pytest.mark.knowledge_integration
@@ -124,8 +145,24 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
         detail = await service.get_page(knowledge_base_id, topic["id"])
         assert detail["claims"]
         assert all(claim["trust_state"] == "verified" for claim in detail["claims"])
+        assert all(claim["claim_type"] == "topic_fact" for claim in detail["claims"])
+        assert [claim["position"] for claim in detail["claims"]] == list(
+            range(len(detail["claims"]))
+        )
         assert any(claim["text"] == "文档尾部证据 13。" for claim in detail["claims"])
+        async with database.session_factory() as session:
+            aliases = list(
+                await session.scalars(
+                    select(WikiPageAlias.alias).where(WikiPageAlias.page_id == topic["id"])
+                )
+            )
+        assert aliases == ["共享主题"]
         summary = next(page for page in pages if page["slug"] == f"summary/{document_ids[0]}")
+        summary_detail = await service.get_page(knowledge_base_id, summary["id"])
+        assert all(
+            claim["claim_type"] == "summary_fact" for claim in summary_detail["claims"]
+        )
+        assert "文档 1 的共同主题原文证据。" not in summary_detail["content"]
         edited = await service.edit_page(
             knowledge_base_id,
             summary["id"],
@@ -204,7 +241,6 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
         disabled = await service.update_config(knowledge_base_id, enabled=False, token_limit=None)
         assert disabled["enabled"] is False
         assert await service.get_page(knowledge_base_id, summary["id"])
-        assert await service.agent_pages(knowledge_base_id, "共同主题") == []
         app = FastAPI()
         app.state.wiki_service = service
         app.include_router(wiki_router)
@@ -222,7 +258,6 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
             document.status = "deleting"
         stale_topic = await service.get_page(knowledge_base_id, topic["id"])
         assert any(claim["trust_state"] == "needs_review" for claim in stale_topic["claims"])
-        assert await service.agent_read_page(knowledge_base_id, topic["id"]) is None
         budget_version_id = uuid4()
         async with database.session_factory() as session, session.begin():
             document = await session.get(Document, document_ids[1])
@@ -259,10 +294,11 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
             knowledge_base_id, enabled=True, token_limit=previous_usage + 1
         )
         assert resumed["tokens_charged"] == previous_usage
-        trusted_topic = await service.agent_read_page(knowledge_base_id, topic["id"])
-        assert trusted_topic is not None
+        trusted_topic = await service.get_page(knowledge_base_id, topic["id"])
         assert all(
-            all(source["valid"] for source in claim["sources"]) for claim in trusted_topic["claims"]
+            all(source["valid"] for source in claim["sources"])
+            for claim in trusted_topic["claims"]
+            if claim["trust_state"] == "verified"
         )
         async with database.session_factory() as session:
             budget_job = await session.scalar(
@@ -283,6 +319,40 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
             for job in await service.list_jobs(knowledge_base_id)
         )
         assert (await service.get_config(knowledge_base_id))["tokens_charged"] > previous_usage
+        async with database.session_factory() as session, session.begin():
+            summary_versions = list(
+                await session.execute(
+                    select(WikiPage, WikiPageVersion)
+                    .join(
+                        WikiPageVersion,
+                        WikiPage.current_version_id == WikiPageVersion.id,
+                    )
+                    .where(
+                        WikiPage.knowledge_base_id == knowledge_base_id,
+                        WikiPage.page_type == "summary",
+                    )
+                    .order_by(WikiPage.slug)
+                )
+            )
+            _, version_without_topic = summary_versions[0]
+            metadata = dict(version_without_topic.generation_metadata)
+            metadata["topics"] = []
+            version_without_topic.generation_metadata = metadata
+            await WikiProcessor._rebuild_topic_pages(session, knowledge_base_id)
+            await WikiProcessor._rebuild_index(session, knowledge_base_id)
+        assert all(
+            page_item["page_type"] != "topic"
+            for page_item in await service.list_pages(knowledge_base_id)
+        )
+        async with database.session_factory() as session:
+            retired_aliases = list(
+                await session.scalars(
+                    select(WikiPageAlias).where(WikiPageAlias.page_id == topic["id"])
+                )
+            )
+        assert retired_aliases == []
+        with pytest.raises(WikiError, match="wiki_page_not_found"):
+            await service.get_page(knowledge_base_id, topic["id"])
     finally:
         async with database.session_factory() as session, session.begin():
             await session.execute(

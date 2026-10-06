@@ -5,7 +5,7 @@ from uuid import UUID
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import CheckConstraint, UniqueConstraint
 
 from agent_api.knowledge.domain.statuses import (
     DocumentStatus,
@@ -40,10 +40,31 @@ def test_knowledge_schema_contains_all_source_of_truth_tables() -> None:
         "wiki_claim_sources",
         "wiki_configs",
         "wiki_jobs",
+        "wiki_page_aliases",
         "wiki_pages",
         "wiki_page_versions",
         "wiki_token_usage",
     }
+
+
+def test_wiki_search_schema_declares_aliases_claim_metadata_and_reverse_indexes() -> None:
+    """Wiki 检索结构必须同时支持别名、稳定排序和来源反查。"""
+
+    aliases = Base.metadata.tables["wiki_page_aliases"]
+    claims = Base.metadata.tables["wiki_claims"]
+    sources = Base.metadata.tables["wiki_claim_sources"]
+
+    assert {"page_id", "alias", "normalized_alias"} <= set(aliases.c.keys())
+    assert claims.c.position.nullable is False
+    assert claims.c.claim_type.nullable is False
+    assert any(
+        isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_wiki_claim_type"
+        for constraint in claims.constraints
+    )
+    assert any(index.name == "ix_wiki_aliases_normalized" for index in aliases.indexes)
+    assert any(index.name == "ix_wiki_claim_sources_chunk" for index in sources.indexes)
+    assert any(index.name == "ix_wiki_claim_sources_locator" for index in sources.indexes)
 
 
 def test_knowledge_schema_declares_required_uniqueness_and_indexes() -> None:
@@ -122,6 +143,7 @@ def test_alembic_head_matches_startup_revision() -> None:
     config = Config(str(Path.cwd() / "alembic.ini"))
     scripts = ScriptDirectory.from_config(config)
 
+    assert EXPECTED_DATABASE_REVISION == "20261006_0003"
     assert scripts.get_current_head() == EXPECTED_DATABASE_REVISION
 
 

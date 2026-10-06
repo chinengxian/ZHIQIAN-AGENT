@@ -82,6 +82,7 @@ async def test_lifespan_initializes_and_cleans_shared_resources(settings: Settin
 
 async def test_lifespan_publishes_and_closes_knowledge_application_services(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     knowledge_settings = Settings(
         model_provider=ModelProvider.OPENAI,
@@ -110,6 +111,16 @@ async def test_lifespan_publishes_and_closes_knowledge_application_services(
             self.closed = True
 
     startup = FakeKnowledgeStartup()
+
+    class FakeMilvusClient:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    milvus = FakeMilvusClient()
+    monkeypatch.setattr("agent_api.core.lifespan.MilvusClient", lambda **_: milvus)
     app = FastAPI(
         lifespan=create_lifespan(
             lambda: knowledge_settings,
@@ -121,7 +132,12 @@ async def test_lifespan_publishes_and_closes_knowledge_application_services(
     async with LifespanManager(app):
         assert app.state.knowledge_database is not None
         assert app.state.knowledge_management is not None
+        assert app.state.knowledge_retrieval is not None
+        assert app.state.wiki_retrieval is not None
 
     assert startup.closed is True
+    assert milvus.close_calls == 1
     assert not hasattr(app.state, "knowledge_database")
     assert not hasattr(app.state, "knowledge_management")
+    assert not hasattr(app.state, "knowledge_retrieval")
+    assert not hasattr(app.state, "wiki_retrieval")

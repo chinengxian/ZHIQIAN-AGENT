@@ -59,6 +59,8 @@ export interface WikiClaim {
   id: string
   claim_key: string
   text: string
+  position: number
+  claim_type: 'summary_fact' | 'topic_fact' | 'source_excerpt' | 'manual'
   trust_state: 'verified' | 'needs_review'
   reason: string | null
   sources: Array<{
@@ -105,4 +107,46 @@ export interface WikiJob {
   actual_tokens: number | null
   charged_tokens: number
   created_at: string
+}
+
+export interface WikiSearchSource {
+  chunk_id: string
+  document_id: string
+  document_version_id: string
+  title: string
+  filename: string
+  page_start: number | null
+  page_end: number | null
+  heading_path: string[]
+  excerpt: string
+  score: number
+  rank: number
+}
+
+export interface WikiSearchClaim {
+  id: string
+  text: string
+  position: number
+  claim_type: 'summary_fact' | 'topic_fact' | 'source_excerpt' | 'manual'
+  score: number
+  sources: WikiSearchSource[]
+}
+
+export interface WikiSearchPage {
+  id: string
+  knowledge_base_id: string
+  slug: string
+  title: string
+  page_type: 'summary' | 'topic' | 'index'
+  score: number
+  matched_fields: string[]
+  matched_claims: WikiSearchClaim[]
+  omitted_claim_count: number
+}
+
+export interface WikiSearchResult {
+  pages: WikiSearchPage[]
+  degraded: boolean
+  degradation_reason: string | null
+  truncation_reason: string | null
 }

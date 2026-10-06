@@ -392,6 +392,14 @@ class WikiProcessor:
             job.payload = {
                 **job.payload,
                 "generation": {
+                    "summary_sections": [
+                        {
+                            "title": section.title,
+                            "text": section.text,
+                            "source_indices": list(section.source_indices),
+                        }
+                        for section in result.summary_sections
+                    ],
                     "summary_claims": [
                         {
                             "text": claim.text,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
@@ -16,6 +18,9 @@ async def test_generator_keeps_global_chunk_sources_across_batches() -> None:
             '{"summary_claims":[{"text":"尾部事实","source_indices":[13]}],'
             '"topics":[{"name":"身份认证","aliases":["多因素认证"],'
             '"source_indices":[13]}]}',
+            '{"summary_sections":['
+            '{"title":"概述","text":"制度概述","source_indices":[1,13]},'
+            '{"title":"核心要求","text":"关键控制","source_indices":[1]}]}',
         ]
     )
 
@@ -26,7 +31,11 @@ async def test_generator_keeps_global_chunk_sources_across_batches() -> None:
     assert [claim.source_indices for claim in result.summary_claims] == [(1,), (13,)]
     assert result.topics[0].aliases == ("MFA", "多因素认证")
     assert result.topics[0].source_indices == (1, 13)
-    assert result.summary == "首批事实\n尾部事实"
+    assert [(section.title, section.source_indices) for section in result.summary_sections] == [
+        ("概述", (1, 13)),
+        ("核心要求", (1,)),
+    ]
+    assert result.summary == "制度概述\n关键控制"
 
 
 @pytest.mark.parametrize("source_indices", ([], [99], [0]))
@@ -52,4 +61,33 @@ async def test_generator_rejects_unknown_json_shape() -> None:
     model = FakeListChatModel(responses=['{"summary":"旧摘要","topics":[]}'])
 
     with pytest.raises(ValueError, match="wiki_generation_invalid_shape"):
+        await ChatWikiGenerator(model, "fake").generate("规范", ["唯一分块"])
+
+
+@pytest.mark.parametrize(
+    "sections",
+    (
+        [],
+        [{"title": "概述", "text": "无来源", "source_indices": []}],
+        [{"title": "概述", "text": "越界来源", "source_indices": [0]}],
+        [
+            {"title": "概述", "text": "第一段", "source_indices": [1]},
+            {"title": "概述", "text": "第二段", "source_indices": [1]},
+        ],
+    ),
+)
+async def test_generator_rejects_invalid_summary_sections(
+    sections: list[dict[str, object]],
+) -> None:
+    """可读摘要必须使用白名单标题且逐段具有有效来源。"""
+
+    model = FakeListChatModel(
+        responses=[
+            '{"summary_claims":[{"text":"唯一事实","source_indices":[1]}],'
+            '"topics":[]}',
+            json.dumps({"summary_sections": sections}, ensure_ascii=False),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="wiki_generation_invalid_(shape|source)"):
         await ChatWikiGenerator(model, "fake").generate("规范", ["唯一分块"])

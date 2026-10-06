@@ -62,6 +62,13 @@ def test_wiki_search_schema_declares_aliases_claim_metadata_and_reverse_indexes(
         and constraint.name == "ck_wiki_claim_type"
         for constraint in claims.constraints
     )
+    claim_type_constraint = next(
+        constraint
+        for constraint in claims.constraints
+        if isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_wiki_claim_type"
+    )
+    assert "summary_section" in str(claim_type_constraint.sqltext)
     assert any(index.name == "ix_wiki_aliases_normalized" for index in aliases.indexes)
     assert any(index.name == "ix_wiki_claim_sources_chunk" for index in sources.indexes)
     assert any(index.name == "ix_wiki_claim_sources_locator" for index in sources.indexes)

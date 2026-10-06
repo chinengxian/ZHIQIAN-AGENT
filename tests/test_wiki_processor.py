@@ -40,11 +40,60 @@ def test_generation_checkpoint_maps_claims_and_topics_to_exact_chunks() -> None:
             ],
         },
         chunks,
+        allow_legacy_sections=True,
     )
 
     assert claims[0].chunks == (chunks[2],)
     assert topics[0].chunks == (chunks[1], chunks[2])
     assert topics[0].aliases == ("ＭＦＡ", "双因素校验")
+
+
+def test_generation_checkpoint_maps_summary_sections_to_exact_chunks() -> None:
+    """摘要段落与原子事实必须各自绑定精确来源。"""
+
+    chunks = [_chunk(0, "开头"), _chunk(1, "中段"), _chunk(2, "尾部")]
+    sections, claims, _ = parse_generation_checkpoint(
+        {
+            "summary_sections": [
+                {
+                    "title": "概述",
+                    "text": "制度覆盖身份与访问控制。",
+                    "source_indices": [1, 3],
+                }
+            ],
+            "summary_claims": [
+                {"text": "必须使用唯一身份。", "source_indices": [2]}
+            ],
+            "topics": [],
+        },
+        chunks,
+    )
+
+    assert sections[0].chunks == (chunks[0], chunks[2])
+    assert claims[0].chunks == (chunks[1],)
+
+
+def test_generation_checkpoint_only_allows_missing_sections_for_v1() -> None:
+    """新版任务不能把缺少分段的检查点静默发布为旧格式。"""
+
+    data = {
+        "summary_claims": [{"text": "唯一身份。", "source_indices": [1]}],
+        "topics": [],
+    }
+    chunks = [_chunk(0, "证据")]
+
+    with pytest.raises(ValueError, match="wiki_generation_invalid_shape"):
+        parse_generation_checkpoint(data, chunks)
+
+    sections, claims, topics = parse_generation_checkpoint(
+        data,
+        chunks,
+        allow_legacy_sections=True,
+    )
+
+    assert sections == ()
+    assert claims[0].text == "唯一身份。"
+    assert topics == ()
 
 
 def test_generation_checkpoint_rejects_stale_source_index() -> None:
@@ -57,6 +106,7 @@ def test_generation_checkpoint_rejects_stale_source_index() -> None:
                 "topics": [],
             },
             [_chunk(0, "唯一分块")],
+            allow_legacy_sections=True,
         )
 
 
@@ -70,6 +120,7 @@ def test_summary_content_contains_claims_and_locators_not_chunk_prefixes() -> No
             "topics": [],
         },
         chunks,
+        allow_legacy_sections=True,
     )
 
     content = render_summary_content("安全规范", claims)

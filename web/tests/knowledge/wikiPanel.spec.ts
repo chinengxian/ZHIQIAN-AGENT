@@ -47,6 +47,29 @@ beforeEach(() => {
     degradation_reason: null,
     truncation_reason: null,
   })
+  api.getWikiPage.mockResolvedValue({
+    id: 'page-auth',
+    knowledge_base_id: 'base',
+    slug: 'topic/authentication',
+    title: '身份认证',
+    page_type: 'topic',
+    current_version_id: 'version-auth',
+    version_no: 1,
+    content: '# 身份认证',
+    summary: '认证要求',
+    origin: 'pipeline',
+    claims: [{
+      id: 'claim-auth',
+      claim_key: 'authentication-factor',
+      text: '普通员工需要两个独立认证因素。',
+      position: 0,
+      claim_type: 'topic_fact',
+      trust_state: 'verified',
+      reason: null,
+      sources: [],
+    }],
+  })
+  api.listWikiVersions.mockResolvedValue([])
 })
 
 it('按主题与来源语义搜索 Wiki，并显示命中的结论', async () => {
@@ -65,5 +88,51 @@ it('按主题与来源语义搜索 Wiki，并显示命中的结论', async () =>
   expect(wrapper.text()).toContain('身份认证')
   expect(wrapper.text()).toContain('普通员工需要两个独立认证因素。')
   expect(wrapper.text()).toContain('语义来源命中')
+
+  await wrapper.get('[data-search-page-id="page-auth"]').trigger('click')
+  await flushPromises()
+  expect(api.getWikiPage).toHaveBeenCalledWith('base', 'page-auth')
+  expect(wrapper.get('[data-claim-id="claim-auth"]').classes()).toContain('claim-highlight')
+})
+
+it('明确显示语义检索降级状态', async () => {
+  api.searchWiki.mockResolvedValueOnce({
+    pages: [],
+    degraded: true,
+    degradation_reason: 'embedding_unavailable',
+    truncation_reason: null,
+  })
+  const wrapper = mount(WikiPanel, { props: { knowledgeBaseId: 'base' } })
+  await flushPromises()
+
+  await wrapper.get('input[aria-label="搜索 Wiki"]').setValue('认证')
+  await wrapper.get('form[aria-label="Wiki 搜索"]').trigger('submit')
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('语义检索暂不可用，当前结果已降级')
+  expect(wrapper.text()).toContain('没有找到相关 Wiki 页面')
+})
+
+it('搜索失败后可清除查询并恢复目录', async () => {
+  api.listWikiPages.mockResolvedValueOnce([{
+    id: 'page-directory',
+    knowledge_base_id: 'base',
+    slug: 'summary/directory',
+    page_type: 'summary',
+    title: '目录中的页面',
+    current_version_id: 'version-directory',
+  }])
+  api.searchWiki.mockRejectedValueOnce(new Error('network'))
+  const wrapper = mount(WikiPanel, { props: { knowledgeBaseId: 'base' } })
+  await flushPromises()
+
+  await wrapper.get('input[aria-label="搜索 Wiki"]').setValue('认证')
+  await wrapper.get('form[aria-label="Wiki 搜索"]').trigger('submit')
+  await flushPromises()
+  expect(wrapper.text()).toContain('Wiki 搜索失败，请重试')
+
+  await wrapper.get('button[aria-label="清除 Wiki 搜索"]').trigger('click')
+  expect(wrapper.get('input[aria-label="搜索 Wiki"]').element).toHaveProperty('value', '')
+  expect(wrapper.text()).toContain('目录中的页面')
 })
 

@@ -520,4 +520,3 @@ class WikiService:
                     "created_at": job.created_at,
                 })
             return output
-

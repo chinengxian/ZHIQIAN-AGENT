@@ -26,6 +26,7 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiTokenUsage,
 )
 from agent_api.knowledge.wiki.generator import WikiGeneration, WikiGenerator
+from agent_api.knowledge.wiki.presentation import extract_wiki_presentation
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,8 +478,9 @@ class WikiProcessor:
                 job.stage = "failed"
                 job.error_code = str(error)
                 return
+            presentation = extract_wiki_presentation(document.title, chunks)
             summary = "\n".join(claim.text for claim in claims)
-            body = render_summary_content(document.title, claims)
+            body = render_summary_content(presentation.title, claims)
             topic_metadata = [
                 {
                     "name": topic.name,
@@ -492,12 +494,16 @@ class WikiProcessor:
                 job.knowledge_base_id,
                 slug=f"summary/{document.id}",
                 page_type="summary",
-                title=document.title,
+                title=presentation.title,
                 content=body,
                 summary=summary,
                 metadata={
                     "document_id": str(document.id),
                     "document_version_id": str(job.document_version_id),
+                    "presentation_metadata": [
+                        {"key": item.key, "label": item.label, "value": item.value}
+                        for item in presentation.metadata
+                    ],
                     "topics": topic_metadata,
                 },
             )
@@ -570,6 +576,7 @@ class WikiProcessor:
         )
         if (
             current is not None
+            and current.title == title
             and current.content == content
             and current.generation_metadata == metadata
         ):

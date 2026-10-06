@@ -15,7 +15,9 @@ from agent_api.knowledge.infrastructure.database.models import (
     DocumentVersion,
     KnowledgeBase,
     WikiJob,
+    WikiPage,
     WikiPageAlias,
+    WikiPageVersion,
 )
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.wiki.api import router as wiki_router
@@ -26,7 +28,7 @@ from agent_api.knowledge.wiki.generator import (
 )
 from agent_api.knowledge.wiki.jobs import schedule_document_wiki
 from agent_api.knowledge.wiki.processor import WikiProcessor
-from agent_api.knowledge.wiki.service import WikiService
+from agent_api.knowledge.wiki.service import WikiError, WikiService
 
 
 class FakeWikiGenerator:
@@ -317,6 +319,40 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
             for job in await service.list_jobs(knowledge_base_id)
         )
         assert (await service.get_config(knowledge_base_id))["tokens_charged"] > previous_usage
+        async with database.session_factory() as session, session.begin():
+            summary_versions = list(
+                await session.execute(
+                    select(WikiPage, WikiPageVersion)
+                    .join(
+                        WikiPageVersion,
+                        WikiPage.current_version_id == WikiPageVersion.id,
+                    )
+                    .where(
+                        WikiPage.knowledge_base_id == knowledge_base_id,
+                        WikiPage.page_type == "summary",
+                    )
+                    .order_by(WikiPage.slug)
+                )
+            )
+            _, version_without_topic = summary_versions[0]
+            metadata = dict(version_without_topic.generation_metadata)
+            metadata["topics"] = []
+            version_without_topic.generation_metadata = metadata
+            await WikiProcessor._rebuild_topic_pages(session, knowledge_base_id)
+            await WikiProcessor._rebuild_index(session, knowledge_base_id)
+        assert all(
+            page_item["page_type"] != "topic"
+            for page_item in await service.list_pages(knowledge_base_id)
+        )
+        async with database.session_factory() as session:
+            retired_aliases = list(
+                await session.scalars(
+                    select(WikiPageAlias).where(WikiPageAlias.page_id == topic["id"])
+                )
+            )
+        assert retired_aliases == []
+        with pytest.raises(WikiError, match="wiki_page_not_found"):
+            await service.get_page(knowledge_base_id, topic["id"])
     finally:
         async with database.session_factory() as session, session.begin():
             await session.execute(

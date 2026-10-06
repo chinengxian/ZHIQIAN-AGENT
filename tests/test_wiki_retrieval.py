@@ -9,10 +9,10 @@ from sqlalchemy.dialects import postgresql
 from agent_api.knowledge.application.citations import Source
 from agent_api.knowledge.wiki.retrieval import (
     WikiRetrievalService,
-    _ClaimRecord,
-    _PageRecord,
     _build_metadata_statement,
+    _ClaimRecord,
     _escape_like_pattern,
+    _PageRecord,
 )
 
 

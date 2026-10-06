@@ -4,13 +4,12 @@ from uuid import uuid4
 
 import pytest
 
-from agent_api.knowledge.infrastructure.database.models import Chunk
-from agent_api.knowledge.infrastructure.database.models import WikiPage
+from agent_api.knowledge.infrastructure.database.models import Chunk, WikiPage
 from agent_api.knowledge.wiki.processor import (
     normalize_wiki_alias,
     parse_generation_checkpoint,
-    retire_stale_topic_pages,
     render_summary_content,
+    retire_stale_topic_pages,
 )
 
 

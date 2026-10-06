@@ -52,6 +52,35 @@ def normalize_wiki_alias(value: str) -> str:
     return re.sub(r"[^\w]+", " ", normalized).strip()
 
 
+async def retire_stale_topic_pages(
+    session: AsyncSession,
+    knowledge_base_id: UUID,
+    expected_slugs: set[str],
+) -> None:
+    """软删除本轮已不满足跨文档条件的主题，并清除其别名。"""
+
+    pages = list(
+        await session.scalars(
+            select(WikiPage).where(
+                WikiPage.knowledge_base_id == knowledge_base_id,
+                WikiPage.page_type == "topic",
+                WikiPage.deleted_at.is_(None),
+            )
+        )
+    )
+    stale = [page for page in pages if page.slug not in expected_slugs]
+    if not stale:
+        return
+    retired_at = datetime.now(UTC)
+    for page in stale:
+        page.deleted_at = retired_at
+    await session.execute(
+        delete(WikiPageAlias).where(
+            WikiPageAlias.page_id.in_([page.id for page in stale])
+        )
+    )
+
+
 def _checkpoint_chunks(value: object, chunks: list[Chunk]) -> tuple[Chunk, ...]:
     if not isinstance(value, list) or not value:
         raise ValueError("wiki_generation_invalid_source")
@@ -478,6 +507,7 @@ class WikiProcessor:
             )
             session.add(page)
             await session.flush()
+        page.deleted_at = None
         current = (
             await session.get(WikiPageVersion, page.current_version_id)
             if page.current_version_id
@@ -532,7 +562,9 @@ class WikiProcessor:
                 select(WikiPage, WikiPageVersion)
                 .join(WikiPageVersion, WikiPage.current_version_id == WikiPageVersion.id)
                 .where(
-                    WikiPage.knowledge_base_id == knowledge_base_id, WikiPage.page_type == "summary"
+                    WikiPage.knowledge_base_id == knowledge_base_id,
+                    WikiPage.page_type == "summary",
+                    WikiPage.deleted_at.is_(None),
                 )
             )
         )
@@ -586,6 +618,7 @@ class WikiProcessor:
                         continue
                 if valid_source_ids:
                     entry["items"].append((page, version, valid_source_ids))
+        expected_topic_slugs: set[str] = set()
         for key, entry in by_topic.items():
             items = entry["items"]
             if len({item[0].id for item in items}) < 2:
@@ -633,6 +666,7 @@ class WikiProcessor:
                     )
             if not selected:
                 continue
+            expected_topic_slugs.add(slug)
             topic_page, topic_version, created = await WikiProcessor._upsert_page(
                 session,
                 knowledge_base_id,
@@ -686,6 +720,7 @@ class WikiProcessor:
                             page_end=source.page_end,
                         )
                     )
+        await retire_stale_topic_pages(session, knowledge_base_id, expected_topic_slugs)
 
     @staticmethod
     async def _replace_aliases(
@@ -717,6 +752,7 @@ class WikiProcessor:
                     WikiPage.knowledge_base_id == knowledge_base_id,
                     WikiPage.page_type.in_(["summary", "topic"]),
                     WikiPage.current_version_id.is_not(None),
+                    WikiPage.deleted_at.is_(None),
                 )
                 .order_by(WikiPage.page_type, WikiPage.title)
             )

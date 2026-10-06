@@ -123,6 +123,69 @@ def _text_relevance(query: str, text: str) -> float:
     return len(query_tokens & text_tokens) / len(query_tokens)
 
 
+def _escape_like_pattern(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
+    title_score = func.similarity(func.lower(WikiPage.title), query)
+    summary_score = func.similarity(func.lower(WikiPageVersion.summary), query)
+    alias_similarity = func.similarity(func.lower(WikiPageAlias.alias), query)
+    alias_score = func.coalesce(func.max(alias_similarity), 0.0)
+    alias_matched = func.coalesce(func.bool_or(alias_similarity > 0.1), False)
+    alias_exact = func.coalesce(
+        func.bool_or(func.lower(WikiPageAlias.alias) == query), False
+    )
+    slug_query = query.replace(" ", "-")
+    slug_matched = func.lower(WikiPage.slug).like(
+        f"{_escape_like_pattern(slug_query)}%", escape="\\"
+    )
+    exact_match = or_(func.lower(WikiPage.title) == query, alias_exact)
+    relevance = func.greatest(title_score, summary_score, alias_score)
+    return (
+        select(
+            WikiPage.id,
+            WikiPage.title,
+            WikiPage.slug,
+            WikiPageVersion.summary,
+            title_score.label("title_score"),
+            summary_score.label("summary_score"),
+            alias_score.label("alias_score"),
+            alias_matched.label("alias_matched"),
+            exact_match.label("exact_match"),
+        )
+        .join(
+            WikiPageVersion,
+            WikiPage.current_version_id == WikiPageVersion.id,
+        )
+        .join(KnowledgeBase, KnowledgeBase.id == WikiPage.knowledge_base_id)
+        .join(WikiConfig, WikiConfig.knowledge_base_id == KnowledgeBase.id)
+        .outerjoin(WikiPageAlias, WikiPageAlias.page_id == WikiPage.id)
+        .where(
+            WikiPage.knowledge_base_id.in_(scope_ids),
+            WikiPage.deleted_at.is_(None),
+            WikiPage.page_type != "index",
+            KnowledgeBase.workspace_id == DEFAULT_WORKSPACE_ID,
+            KnowledgeBase.enabled.is_(True),
+            WikiConfig.enabled.is_(True),
+            or_(
+                title_score > 0.1,
+                summary_score > 0.1,
+                alias_similarity > 0.1,
+                slug_matched,
+            ),
+        )
+        .group_by(
+            WikiPage.id,
+            WikiPage.title,
+            WikiPage.slug,
+            WikiPageVersion.summary,
+        )
+        .order_by(exact_match.desc(), relevance.desc(), WikiPage.id)
+        .limit(200)
+    )
+
+
 class WikiRetrievalService:
     """融合页面元数据和原文 chunk 命中，返回当前且可追溯的 Wiki 事实。"""
 
@@ -147,7 +210,7 @@ class WikiRetrievalService:
         character_budget: int = 12_000,
     ) -> WikiSearchResult:
         normalized = _normalize_query(query)
-        if not normalized or len(normalized) > 200:
+        if not normalized or len(normalized) > 200 or not _query_tokens(normalized):
             raise ValueError("invalid_wiki_query")
         if mode not in {"hybrid", "semantic", "keyword"}:
             raise ValueError("invalid_search_options")
@@ -363,61 +426,19 @@ class WikiRetrievalService:
         query: str,
         scope_ids: tuple[UUID, ...],
     ) -> tuple[list[UUID], dict[UUID, tuple[str, ...]]]:
-        title_score = func.similarity(func.lower(WikiPage.title), query)
-        summary_score = func.similarity(func.lower(WikiPageVersion.summary), query)
-        alias_score = func.similarity(func.lower(WikiPageAlias.alias), query)
         slug_query = query.replace(" ", "-")
         async with self._sessions() as session:
-            rows = list(
-                (
-                    await session.execute(
-                        select(
-                            WikiPage.id,
-                            WikiPage.title,
-                            WikiPage.slug,
-                            WikiPageVersion.summary,
-                            WikiPageAlias.alias,
-                            title_score.label("title_score"),
-                            summary_score.label("summary_score"),
-                            alias_score.label("alias_score"),
-                        )
-                        .join(
-                            WikiPageVersion,
-                            WikiPage.current_version_id == WikiPageVersion.id,
-                        )
-                        .join(KnowledgeBase, KnowledgeBase.id == WikiPage.knowledge_base_id)
-                        .join(WikiConfig, WikiConfig.knowledge_base_id == KnowledgeBase.id)
-                        .outerjoin(WikiPageAlias, WikiPageAlias.page_id == WikiPage.id)
-                        .where(
-                            WikiPage.knowledge_base_id.in_(scope_ids),
-                            WikiPage.deleted_at.is_(None),
-                            WikiPage.page_type != "index",
-                            KnowledgeBase.workspace_id == DEFAULT_WORKSPACE_ID,
-                            KnowledgeBase.enabled.is_(True),
-                            WikiConfig.enabled.is_(True),
-                            or_(
-                                title_score > 0.1,
-                                summary_score > 0.1,
-                                alias_score > 0.1,
-                                func.lower(WikiPage.slug).like(f"{slug_query}%"),
-                            ),
-                        )
-                        .limit(200)
-                    )
-                ).all()
-            )
+            rows = list((await session.execute(_build_metadata_statement(query, scope_ids))).all())
         page_scores: dict[UUID, float] = {}
         matched: dict[UUID, list[str]] = {}
         exact: dict[UUID, bool] = {}
         for row in rows:
             fields = matched.setdefault(row.id, [])
-            title_value = _normalize_query(row.title)
-            alias_value = _normalize_query(row.alias) if row.alias else ""
             if row.title_score > 0.1:
                 fields.append("title")
             if row.summary_score > 0.1:
                 fields.append("summary")
-            if row.alias and row.alias_score > 0.1:
+            if row.alias_matched:
                 fields.append("alias")
             if row.slug.casefold().startswith(slug_query):
                 fields.append("slug")
@@ -427,7 +448,7 @@ class WikiRetrievalService:
                 float(row.summary_score or 0),
                 float(row.alias_score or 0),
             )
-            exact[row.id] = exact.get(row.id, False) or query in {title_value, alias_value}
+            exact[row.id] = bool(row.exact_match)
         ordered = sorted(
             page_scores,
             key=lambda page_id: (-int(exact[page_id]), -page_scores[page_id], str(page_id)),

@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -581,6 +582,25 @@ class WikiPage(TimestampMixin, Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class WikiPageAlias(Base):
+    """Wiki 页面的可检索别名；规范化值用于精确归并。"""
+
+    __tablename__ = "wiki_page_aliases"
+    __table_args__ = (
+        UniqueConstraint("page_id", "normalized_alias", name="uq_wiki_page_alias_normalized"),
+        Index("ix_wiki_aliases_normalized", "normalized_alias"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    page_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("wiki_pages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    alias: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_alias: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 class WikiPageVersion(Base):
     """正文与来源不可变；审核状态可以单向转换。"""
 
@@ -615,6 +635,10 @@ class WikiClaim(Base):
     __tablename__ = "wiki_claims"
     __table_args__ = (
         UniqueConstraint("page_version_id", "claim_key", name="uq_wiki_claim_version_key"),
+        CheckConstraint(
+            "claim_type IN ('summary_fact', 'topic_fact', 'source_excerpt', 'manual')",
+            name="ck_wiki_claim_type",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -627,6 +651,10 @@ class WikiClaim(Base):
     text: Mapped[str] = mapped_column(Text, nullable=False)
     trust_state: Mapped[str] = mapped_column(String(24), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    claim_type: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="source_excerpt"
+    )
 
 
 class WikiClaimSource(Base):
@@ -640,6 +668,13 @@ class WikiClaimSource(Base):
             "chunk_kind",
             "chunk_ordinal",
             name="uq_wiki_claim_source_locator",
+        ),
+        Index("ix_wiki_claim_sources_chunk", "chunk_id"),
+        Index(
+            "ix_wiki_claim_sources_locator",
+            "document_version_id",
+            "chunk_kind",
+            "chunk_ordinal",
         ),
     )
 

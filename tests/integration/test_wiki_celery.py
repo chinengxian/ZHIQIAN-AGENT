@@ -48,7 +48,21 @@ class WikiModelStub(BaseHTTPRequestHandler):
                     "message": {
                         "role": "assistant",
                         "content": json.dumps(
-                            {"summary": "这篇文档介绍离线运行。", "topics": ["离线运行"]},
+                            {
+                                "summary_claims": [
+                                    {
+                                        "text": "这篇文档介绍离线运行。",
+                                        "source_indices": [1],
+                                    }
+                                ],
+                                "topics": [
+                                    {
+                                        "name": "离线运行",
+                                        "aliases": ["离线模式"],
+                                        "source_indices": [1],
+                                    }
+                                ],
+                            },
                             ensure_ascii=False,
                         ),
                     },

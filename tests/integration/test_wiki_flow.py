@@ -18,7 +18,11 @@ from agent_api.knowledge.infrastructure.database.models import (
 )
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.wiki.api import router as wiki_router
-from agent_api.knowledge.wiki.generator import WikiGeneration
+from agent_api.knowledge.wiki.generator import (
+    WikiGeneratedClaim,
+    WikiGeneratedTopic,
+    WikiGeneration,
+)
 from agent_api.knowledge.wiki.jobs import schedule_document_wiki
 from agent_api.knowledge.wiki.processor import WikiProcessor
 from agent_api.knowledge.wiki.service import WikiService
@@ -29,7 +33,20 @@ class FakeWikiGenerator:
 
     async def generate(self, title: str, excerpts: list[str]) -> WikiGeneration:
         assert excerpts
-        return WikiGeneration(f"{title} 讨论共同主题。", ("共同主题",), 64)
+        return WikiGeneration(
+            summary_claims=(
+                WikiGeneratedClaim(f"{title} 讨论共同主题。", (1,)),
+                WikiGeneratedClaim(excerpts[-1], (len(excerpts),)),
+            ),
+            topics=(
+                WikiGeneratedTopic(
+                    "共同主题",
+                    ("共享主题",),
+                    tuple(range(1, len(excerpts) + 1)),
+                ),
+            ),
+            measured_tokens=64,
+        )
 
 
 @pytest.mark.knowledge_integration

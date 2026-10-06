@@ -35,6 +35,7 @@ from tests.test_knowledge_management_integration import cleanup_knowledge_base
 
 CASES_PATH = Path(__file__).with_name("wiki_cases.json")
 FIXTURE_PATH = Path(__file__).parents[1] / "fixtures" / "wiki" / "enterprise-it-operations"
+WIKI_DATABASE_URL = os.getenv("AGENT_WIKI_TEST_DATABASE_URL")
 
 
 class DeterministicGroundedWikiGenerator:
@@ -138,15 +139,16 @@ async def _count_source_leaks(
 
 @pytest.mark.knowledge_integration
 @pytest.mark.skipif(
-    os.getenv("RUN_KNOWLEDGE_INTEGRATION") != "1",
-    reason="设置 RUN_KNOWLEDGE_INTEGRATION=1 后使用本地 PostgreSQL 与 Milvus",
+    os.getenv("RUN_KNOWLEDGE_INTEGRATION") != "1" or not WIKI_DATABASE_URL,
+    reason="需同时设置 RUN_KNOWLEDGE_INTEGRATION=1 和独立 Wiki 测试数据库 URL",
 )
 async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
     payload: dict[str, list[dict[str, Any]]] = json.loads(
         CASES_PATH.read_text(encoding="utf-8")
     )
     settings = settings_for_e2e(tmp_path / "wiki-eval-uploads")
-    database = DatabaseRuntime(settings.database_url.get_secret_value())
+    assert WIKI_DATABASE_URL is not None
+    database = DatabaseRuntime(WIKI_DATABASE_URL)
     storage = LocalFileStorage(settings.storage_root)
     management = SqlAlchemyKnowledgeManagementService(
         database.session_factory, storage, settings

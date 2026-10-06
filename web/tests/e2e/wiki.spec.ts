@@ -8,7 +8,8 @@ test('Wiki supports generation settings, review, history and source inspection',
     { id: 'version-2', page_id: 'page-1', version_no: 2, title: '操作手册', content: '# 操作手册\n\n自动更新', summary: '', origin: 'pipeline', review_state: 'pending_review', base_published_version_id: 'version-1', created_at: '2026-09-22T00:00:00Z' },
     { id: 'version-1', page_id: 'page-1', version_no: 1, title: '操作手册', content: '# 操作手册\n\n原内容', summary: '', origin: 'user', review_state: 'published', base_published_version_id: null, created_at: '2026-09-21T00:00:00Z' },
   ]
-  const detail = { ...listing[0], version_no: 1, content: versions[1].content, summary: '', origin: 'user', claims: [{ id: 'claim-1', claim_key: 'proof', text: '设备支持离线操作。', trust_state: 'verified', reason: null, sources: [{ document_id: 'doc-1', document_version_id: 'source-version-1', chunk_id: 'chunk-1', document_title: '操作手册原文', heading_path: ['操作'], page_start: 2, page_end: 2, valid: true }] }] }
+  const detail = { ...listing[0], version_no: 1, content: versions[1].content, summary: '', origin: 'user', claims: [{ id: 'claim-1', claim_key: 'proof', text: '设备支持离线操作。', position: 0, claim_type: 'summary_fact', trust_state: 'verified', reason: null, sources: [{ document_id: 'doc-1', document_version_id: 'source-version-1', chunk_id: 'chunk-1', document_title: '操作手册原文', heading_path: ['操作'], page_start: 2, page_end: 2, valid: true }] }] }
+  const searchResult = { pages: [{ ...listing[0], score: 0.92, matched_fields: ['source_chunk'], matched_claims: [{ id: 'claim-1', text: '设备支持离线操作。', position: 0, claim_type: 'summary_fact', score: 0.89, sources: [] }], omitted_claim_count: 0 }], degraded: false, degradation_reason: null, truncation_reason: null }
   await page.route('**/api/v1/knowledge/events/stream', (route) => route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' }))
   await page.route('**/api/v1/knowledge-bases**', async (route) => {
     const path = new URL(route.request().url()).pathname
@@ -19,6 +20,7 @@ test('Wiki supports generation settings, review, history and source inspection',
       if (method === 'PATCH') Object.assign(config, route.request().postDataJSON())
       return route.fulfill({ json: config })
     }
+    if (path.endsWith('/wiki/search')) return route.fulfill({ json: searchResult })
     if (path.endsWith('/wiki/pages')) return route.fulfill({ json: listing })
     if (path.endsWith('/wiki/jobs')) return route.fulfill({ json: [] })
     if (path.endsWith('/wiki/pages/page-1/versions')) return route.fulfill({ json: versions })
@@ -36,7 +38,10 @@ test('Wiki supports generation settings, review, history and source inspection',
   await expect(page.getByText('生成已关闭')).toBeVisible()
   await page.getByRole('button', { name: '开启 Wiki' }).click()
   await expect(page.getByText('生成已开启')).toBeVisible()
-  await page.getByRole('navigation', { name: 'Wiki 页面' }).getByRole('button', { name: /操作手册/ }).click()
+  await page.getByRole('searchbox', { name: '搜索 Wiki' }).fill('离线如何操作')
+  await page.getByRole('button', { name: '搜索', exact: true }).click()
+  await expect(page.getByText('语义来源命中')).toBeVisible()
+  await page.locator('[data-search-page-id="page-1"]').click()
   await expect(page.getByText('设备支持离线操作。')).toBeVisible()
   await page.getByRole('button', { name: /操作手册原文/ }).click()
   await expect(page.getByText(/source-version-1/)).toBeVisible()

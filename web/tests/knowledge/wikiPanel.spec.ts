@@ -142,4 +142,3 @@ it('搜索失败后可清除查询并恢复目录', async () => {
   expect(wrapper.get('input[aria-label="搜索 Wiki"]').element).toHaveProperty('value', '')
   expect(wrapper.text()).toContain('目录中的页面')
 })
-

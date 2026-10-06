@@ -290,4 +290,3 @@ async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
             await cleanup_knowledge_base(database, knowledge_base_id)
         milvus.close()
         await database.close()
-

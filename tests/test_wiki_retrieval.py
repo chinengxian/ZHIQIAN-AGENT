@@ -200,6 +200,27 @@ async def test_source_failure_returns_metadata_candidates_with_reason() -> None:
     assert result.degradation_reason == "source_retrieval_unavailable"
 
 
+async def test_read_page_and_ranking_exclude_presentation_sections() -> None:
+    """可读摘要段落只用于页面展示，不能进入 Agent 或搜索事实。"""
+
+    base_id, page_id = uuid4(), uuid4()
+    source = _source(uuid4(), 1, "唯一身份与 MFA")
+    section = _ClaimRecord(uuid4(), "这是可读概述", 0, "summary_section", (source,))
+    fact = _ClaimRecord(uuid4(), "特权操作必须使用 MFA", 1, "summary_fact", (source,))
+    retrieval = StubWikiRetrieval(
+        {page_id: _page(page_id, base_id, "身份规范", (section, fact))},
+        [page_id],
+        {source.chunk_id: page_id},
+        FakeSourceRetrieval([source]),
+    )
+
+    ranked = retrieval.rank_page_claims("MFA", (section, fact))
+    page = await retrieval.read_page(base_id, page_id)
+
+    assert [claim.claim_type for claim, _ in ranked] == ["summary_fact"]
+    assert [claim.claim_type for claim in page["claims"]] == ["summary_fact"]
+
+
 async def test_reranker_failure_keeps_rrf_order() -> None:
     base_id, first_id, second_id = uuid4(), uuid4(), uuid4()
     source = _source(uuid4(), 1, "事实")

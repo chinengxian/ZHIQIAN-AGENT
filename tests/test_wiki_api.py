@@ -6,7 +6,7 @@ import httpx
 from fastapi import FastAPI
 
 from agent_api.knowledge.application.citations import Source
-from agent_api.knowledge.wiki.api import get_wiki_retrieval, router
+from agent_api.knowledge.wiki.api import WikiPageResponse, get_wiki_retrieval, router
 from agent_api.knowledge.wiki.retrieval import (
     WikiMatchedClaim,
     WikiMatchedPage,
@@ -129,3 +129,38 @@ async def test_wiki_search_api_validates_options() -> None:
         ]
 
     assert [response.status_code for response in responses] == [422, 422, 422]
+
+
+def test_page_response_exposes_sections_and_metadata_separately_from_claims() -> None:
+    """前端页面契约要把阅读段落和 Agent 事实明确分开。"""
+
+    page = WikiPageResponse.model_validate(
+        {
+            "id": uuid4(),
+            "knowledge_base_id": uuid4(),
+            "slug": "summary/doc",
+            "page_type": "summary",
+            "title": "身份与访问控制规范",
+            "current_version_id": uuid4(),
+            "version_no": 1,
+            "content": "本规范覆盖身份与访问控制。",
+            "summary": "本规范覆盖身份与访问控制。",
+            "origin": "pipeline",
+            "summary_sections": [
+                {
+                    "id": uuid4(),
+                    "title": "概述",
+                    "text": "本规范覆盖身份与访问控制。",
+                    "position": 0,
+                    "trust_state": "verified",
+                    "reason": None,
+                    "sources": [],
+                }
+            ],
+            "metadata": [{"key": "version", "label": "版本", "value": "3.0"}],
+            "claims": [],
+        }
+    )
+
+    assert page.summary_sections[0].title == "概述"
+    assert page.metadata[0].value == "3.0"

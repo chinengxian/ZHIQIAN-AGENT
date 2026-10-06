@@ -6,6 +6,7 @@ import pytest
 
 from agent_api.knowledge.infrastructure.database.models import Chunk, WikiPage
 from agent_api.knowledge.wiki.processor import (
+    GroundedSection,
     normalize_wiki_alias,
     parse_generation_checkpoint,
     render_summary_content,
@@ -110,25 +111,19 @@ def test_generation_checkpoint_rejects_stale_source_index() -> None:
         )
 
 
-def test_summary_content_contains_claims_and_locators_not_chunk_prefixes() -> None:
-    """正文由事实和引用定位组成，不再复制每个分块的前 350 字。"""
+def test_summary_content_contains_only_readable_sections() -> None:
+    """新版摘要正文只展示连贯段落，不暴露 Markdown 引用标记。"""
 
-    chunks = [_chunk(0, "只存在于未被引用分块的前缀"), _chunk(1, "被引用的长原文")]
-    _, claims, _ = parse_generation_checkpoint(
-        {
-            "summary_claims": [{"text": "可验证事实", "source_indices": [2]}],
-            "topics": [],
-        },
-        chunks,
-        allow_legacy_sections=True,
+    sections = (
+        GroundedSection("概述", "本规范覆盖身份与访问控制。", (_chunk(0, "来源"),)),
+        GroundedSection("核心要求", "特权操作必须启用多因素认证。", (_chunk(1, "来源"),)),
     )
 
-    content = render_summary_content("安全规范", claims)
+    content = render_summary_content("安全规范", sections)
 
-    assert "可验证事实 [^claim-1-source-1]" in content
-    assert "原文分块 2" in content
-    assert "只存在于未被引用分块的前缀" not in content
-    assert "被引用的长原文" not in content
+    assert content == "## 概述\n\n本规范覆盖身份与访问控制。\n\n## 核心要求\n\n特权操作必须启用多因素认证。"
+    assert "[^" not in content
+    assert "# 安全规范" not in content
 
 
 def test_alias_normalization_handles_width_case_punctuation_and_spaces() -> None:

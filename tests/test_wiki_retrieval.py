@@ -277,6 +277,8 @@ def test_metadata_statement_escapes_slug_wildcards_and_orders_before_limit() -> 
     assert _escape_like_pattern("vpn_%\\") == "vpn\\_\\%\\\\"
     statement = _build_metadata_statement("vpn_2026", (uuid4(),))
     sql = str(statement.compile(dialect=postgresql.dialect())).upper()
+    order_by = sql.split("ORDER BY", 1)[1].split("LIMIT", 1)[0]
 
     assert " ESCAPE " in sql
     assert sql.index("ORDER BY") < sql.index("LIMIT")
+    assert "LIKE" in order_by

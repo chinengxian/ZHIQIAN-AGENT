@@ -1,4 +1,4 @@
-import type { DocumentProgress, KnowledgeBase, KnowledgeDocument, WikiConfig, WikiJob, WikiPage, WikiPageSummary, WikiVersion } from '../types/knowledge'
+import type { DocumentProgress, KnowledgeBase, KnowledgeDocument, WikiConfig, WikiJob, WikiPage, WikiPageSummary, WikiSearchResult, WikiVersion } from '../types/knowledge'
 
 const base = '/api/v1'
 
@@ -23,6 +23,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 const json = (method: string, payload: object): RequestInit => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+const query = (values: Record<string, string | number | null | undefined>) => {
+  const pairs = Object.entries(values)
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
+  return pairs.length ? `?${pairs.join('&')}` : ''
+}
 
 export const knowledgeApi = {
   listBases: () => request<KnowledgeBase[]>('/knowledge-bases'),
@@ -44,6 +50,16 @@ export const knowledgeApi = {
   getWikiPage: (id: string, pageId: string) => request<WikiPage>(`/knowledge-bases/${id}/wiki/pages/${pageId}`),
   listWikiVersions: (id: string, pageId: string) => request<WikiVersion[]>(`/knowledge-bases/${id}/wiki/pages/${pageId}/versions`),
   listWikiJobs: (id: string) => request<WikiJob[]>(`/knowledge-bases/${id}/wiki/jobs`),
+  searchWiki: (
+    id: string,
+    searchQuery: string,
+    options: { mode?: 'hybrid' | 'semantic' | 'keyword'; limit?: number; claimLimit?: number } = {},
+  ) => request<WikiSearchResult>(`/knowledge-bases/${id}/wiki/search${query({
+    q: searchQuery,
+    mode: options.mode ?? 'hybrid',
+    limit: options.limit ?? 5,
+    claim_limit: options.claimLimit ?? 12,
+  })}`),
   editWikiPage: (id: string, pageId: string, baseVersion: string, title: string, content: string) => request<WikiPage>(`/knowledge-bases/${id}/wiki/pages/${pageId}`, json('PUT', { base_version: baseVersion, title, content })),
   revertWikiPage: (id: string, pageId: string, baseVersion: string, targetVersionId: string) => request<WikiPage>(`/knowledge-bases/${id}/wiki/pages/${pageId}/revert`, json('POST', { base_version: baseVersion, target_version_id: targetVersionId })),
   reviewWikiPage: (id: string, pageId: string, candidateVersionId: string, baseVersion: string, decision: 'publish' | 'reject') => request<WikiVersion>(`/knowledge-bases/${id}/wiki/pages/${pageId}/review`, json('POST', { candidate_version_id: candidateVersionId, base_version: baseVersion, decision })),

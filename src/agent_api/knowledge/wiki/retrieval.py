@@ -140,7 +140,11 @@ def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
     slug_matched = func.lower(WikiPage.slug).like(
         f"{_escape_like_pattern(slug_query)}%", escape="\\"
     )
-    exact_match = or_(func.lower(WikiPage.title) == query, alias_exact)
+    exact_match = or_(
+        func.lower(WikiPage.title) == query,
+        alias_exact,
+        func.lower(WikiPage.slug) == slug_query,
+    )
     relevance = func.greatest(title_score, summary_score, alias_score)
     return (
         select(
@@ -181,7 +185,12 @@ def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
             WikiPage.slug,
             WikiPageVersion.summary,
         )
-        .order_by(exact_match.desc(), relevance.desc(), WikiPage.id)
+        .order_by(
+            exact_match.desc(),
+            slug_matched.desc(),
+            relevance.desc(),
+            WikiPage.id,
+        )
         .limit(200)
     )
 

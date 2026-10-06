@@ -5,9 +5,11 @@ from uuid import uuid4
 import pytest
 
 from agent_api.knowledge.infrastructure.database.models import Chunk
+from agent_api.knowledge.infrastructure.database.models import WikiPage
 from agent_api.knowledge.wiki.processor import (
     normalize_wiki_alias,
     parse_generation_checkpoint,
+    retire_stale_topic_pages,
     render_summary_content,
 )
 
@@ -81,3 +83,44 @@ def test_summary_content_contains_claims_and_locators_not_chunk_prefixes() -> No
 
 def test_alias_normalization_handles_width_case_punctuation_and_spaces() -> None:
     assert normalize_wiki_alias("  ＭＦＡ---Control　策略 ") == "mfa control 策略"
+
+
+async def test_rebuild_retires_topics_that_no_longer_have_enough_documents() -> None:
+    knowledge_base_id = uuid4()
+    current = WikiPage(
+        id=uuid4(),
+        knowledge_base_id=knowledge_base_id,
+        slug="topic/current",
+        page_type="topic",
+        title="当前主题",
+    )
+    stale = WikiPage(
+        id=uuid4(),
+        knowledge_base_id=knowledge_base_id,
+        slug="topic/stale",
+        page_type="topic",
+        title="过期主题",
+    )
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.alias_delete_calls = 0
+
+        async def scalars(self, statement: object) -> list[WikiPage]:
+            del statement
+            return [current, stale]
+
+        async def execute(self, statement: object) -> None:
+            del statement
+            self.alias_delete_calls += 1
+
+    session = FakeSession()
+    await retire_stale_topic_pages(
+        session,  # type: ignore[arg-type]
+        knowledge_base_id,
+        {"topic/current"},
+    )
+
+    assert current.deleted_at is None
+    assert stale.deleted_at is not None
+    assert session.alias_delete_calls == 1

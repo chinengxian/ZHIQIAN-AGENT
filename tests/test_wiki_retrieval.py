@@ -3,11 +3,16 @@ from __future__ import annotations
 import logging
 from uuid import UUID, uuid4
 
+import pytest
+from sqlalchemy.dialects import postgresql
+
 from agent_api.knowledge.application.citations import Source
 from agent_api.knowledge.wiki.retrieval import (
     WikiRetrievalService,
     _ClaimRecord,
     _PageRecord,
+    _build_metadata_statement,
+    _escape_like_pattern,
 )
 
 
@@ -259,3 +264,19 @@ async def test_search_logs_fingerprint_without_plain_query(caplog: object) -> No
     rendered = caplog.text  # type: ignore[attr-defined]
     assert "query_fingerprint" in rendered
     assert secret_query not in rendered
+
+
+async def test_search_rejects_punctuation_only_query() -> None:
+    retrieval = StubWikiRetrieval({}, [], {}, FakeSourceRetrieval([]))
+
+    with pytest.raises(ValueError, match="invalid_wiki_query"):
+        await retrieval.search("%_---", (uuid4(),))
+
+
+def test_metadata_statement_escapes_slug_wildcards_and_orders_before_limit() -> None:
+    assert _escape_like_pattern("vpn_%\\") == "vpn\\_\\%\\\\"
+    statement = _build_metadata_statement("vpn_2026", (uuid4(),))
+    sql = str(statement.compile(dialect=postgresql.dialect())).upper()
+
+    assert " ESCAPE " in sql
+    assert sql.index("ORDER BY") < sql.index("LIMIT")

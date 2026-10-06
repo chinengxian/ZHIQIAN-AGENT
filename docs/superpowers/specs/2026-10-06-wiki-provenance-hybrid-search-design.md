@@ -1,7 +1,7 @@
 # Wiki 来源驱动混合检索改造设计
 
 - 日期：2026-10-06
-- 状态：pending review
+- 状态：approved（用户于 2026-10-06 确认）
 - 当前实施路线：B，来源驱动混合检索
 - 下一阶段目标：C，独立 Wiki 语义索引
 - 关联需求：`docs/requirements/REQ-006.md`

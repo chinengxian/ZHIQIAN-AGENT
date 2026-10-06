@@ -17,6 +17,7 @@ from agent_api.knowledge.infrastructure.startup import (
     create_knowledge_startup,
 )
 from agent_api.knowledge.tools.readonly import create_knowledge_tools
+from agent_api.knowledge.wiki.retrieval import WikiRetrievalService
 from agent_api.knowledge.wiki.service import WikiService
 from agent_api.llm.agent import LangChainAgentStream
 from agent_api.llm.protocol import StreamAgent
@@ -48,6 +49,7 @@ def create_lifespan(
         knowledge_milvus = None
         knowledge_retrieval = None
         wiki_service = None
+        wiki_retrieval = None
         try:
             # 知识库关闭时完全跳过 PostgreSQL、Redis、Milvus 和存储目录初始化。
             if settings.knowledge_enabled:
@@ -60,9 +62,6 @@ def create_lifespan(
                     settings,
                 )
                 wiki_service = WikiService(knowledge_database.session_factory)
-            chat_agent = agent_factory(settings)
-            if settings.knowledge_enabled and isinstance(chat_agent, LangChainAgentStream):
-                assert knowledge_database is not None
                 milvus_options = {"uri": settings.milvus_uri}
                 if settings.milvus_token is not None:
                     milvus_options["token"] = settings.milvus_token.get_secret_value()
@@ -82,8 +81,20 @@ def create_lifespan(
                     create_embedding_adapter(settings),
                     reranker,
                 )
+                wiki_retrieval = WikiRetrievalService(
+                    knowledge_database.session_factory,
+                    knowledge_retrieval,
+                    reranker,
+                )
+            chat_agent = agent_factory(settings)
+            if settings.knowledge_enabled and isinstance(chat_agent, LangChainAgentStream):
+                assert knowledge_retrieval is not None
                 chat_agent.enable_knowledge(
-                    create_knowledge_tools(knowledge_retrieval, wiki_service)
+                    create_knowledge_tools(
+                        knowledge_retrieval,
+                        wiki_service,
+                        wiki_retrieval,
+                    )
                 )
             # 所有构造均成功后再一次性发布共享资源。
             app.state.settings = settings
@@ -95,6 +106,8 @@ def create_lifespan(
                 app.state.wiki_service = wiki_service
             if knowledge_retrieval is not None:
                 app.state.knowledge_retrieval = knowledge_retrieval
+            if wiki_retrieval is not None:
+                app.state.wiki_retrieval = wiki_retrieval
             yield
         finally:
             # 先撤销外部可见状态，再关闭底层连接，避免停机期间继续被读取。
@@ -108,6 +121,8 @@ def create_lifespan(
                 del app.state.knowledge_database
             if hasattr(app.state, "knowledge_retrieval"):
                 del app.state.knowledge_retrieval
+            if hasattr(app.state, "wiki_retrieval"):
+                del app.state.wiki_retrieval
             if hasattr(app.state, "chat_agent"):
                 del app.state.chat_agent
             if hasattr(app.state, "settings"):

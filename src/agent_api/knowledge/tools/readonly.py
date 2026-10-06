@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from agent_api.knowledge.application.citations import Source
 from agent_api.knowledge.application.retrieval import KnowledgeRetrievalService
+from agent_api.knowledge.wiki.retrieval import WikiRetrievalService
 from agent_api.knowledge.wiki.service import WikiService
 
 
@@ -90,7 +91,9 @@ def _scope(requested: list[UUID] | None = None) -> tuple[UUID, ...] | None:
 
 
 def create_knowledge_tools(
-    service: KnowledgeRetrievalService, wiki_service: WikiService | None = None
+    service: KnowledgeRetrievalService,
+    wiki_service: WikiService | None = None,
+    wiki_retrieval: WikiRetrievalService | None = None,
 ) -> list[BaseTool]:
     @tool("search_knowledge", args_schema=SearchInput)
     async def search_knowledge(

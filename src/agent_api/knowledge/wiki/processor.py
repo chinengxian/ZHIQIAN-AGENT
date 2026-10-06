@@ -646,7 +646,7 @@ class WikiProcessor:
                     "summary_version_ids": [str(item[1].id) for item in items],
                     "aliases": list(dict.fromkeys(entry["aliases"])),
                     "source_chunk_ids": sorted(
-                        {str(source.id) for item in items for source in item[2]}
+                        {str(source_id) for item in items for source_id in item[2]}
                     ),
                 },
             )

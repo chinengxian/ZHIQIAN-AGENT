@@ -58,7 +58,7 @@ class FailingReranker:
         raise RuntimeError("reranker offline")
 
 
-class TestableWikiRetrieval(WikiRetrievalService):
+class StubWikiRetrieval(WikiRetrievalService):
     def __init__(
         self,
         pages: dict[UUID, _PageRecord],
@@ -132,7 +132,13 @@ async def test_search_ranks_globally_and_returns_relevant_claim_after_eighth() -
             kb_b,
             "身份认证",
             (
-                _ClaimRecord(uuid4(), "排在前面的普通事实", 0, "summary_fact", (irrelevant_source,)),
+                _ClaimRecord(
+                    uuid4(),
+                    "排在前面的普通事实",
+                    0,
+                    "summary_fact",
+                    (irrelevant_source,),
+                ),
                 _ClaimRecord(
                     uuid4(),
                     "第九条但最相关的结论：需要两个独立认证因素",
@@ -143,7 +149,7 @@ async def test_search_ranks_globally_and_returns_relevant_claim_after_eighth() -
             ),
         ),
     }
-    retrieval = TestableWikiRetrieval(
+    retrieval = StubWikiRetrieval(
         pages,
         [page_a],
         {matched_source.chunk_id: page_b},
@@ -168,8 +174,15 @@ async def test_search_ranks_globally_and_returns_relevant_claim_after_eighth() -
 async def test_source_failure_returns_metadata_candidates_with_reason() -> None:
     base_id, page_id = uuid4(), uuid4()
     source = _source(uuid4(), 1, "元数据事实")
-    retrieval = TestableWikiRetrieval(
-        {page_id: _page(page_id, base_id, "身份认证", (_ClaimRecord(uuid4(), "认证事实", 0, "summary_fact", (source,)),))},
+    retrieval = StubWikiRetrieval(
+        {
+            page_id: _page(
+                page_id,
+                base_id,
+                "身份认证",
+                (_ClaimRecord(uuid4(), "认证事实", 0, "summary_fact", (source,)),),
+            )
+        },
         [page_id],
         {},
         FakeSourceRetrieval(RuntimeError("milvus offline")),
@@ -186,10 +199,20 @@ async def test_reranker_failure_keeps_rrf_order() -> None:
     base_id, first_id, second_id = uuid4(), uuid4(), uuid4()
     source = _source(uuid4(), 1, "事实")
     pages = {
-        first_id: _page(first_id, base_id, "第一", (_ClaimRecord(uuid4(), "第一事实", 0, "summary_fact", (source,)),)),
-        second_id: _page(second_id, base_id, "第二", (_ClaimRecord(uuid4(), "第二事实", 0, "summary_fact", (source,)),)),
+        first_id: _page(
+            first_id,
+            base_id,
+            "第一",
+            (_ClaimRecord(uuid4(), "第一事实", 0, "summary_fact", (source,)),),
+        ),
+        second_id: _page(
+            second_id,
+            base_id,
+            "第二",
+            (_ClaimRecord(uuid4(), "第二事实", 0, "summary_fact", (source,)),),
+        ),
     }
-    retrieval = TestableWikiRetrieval(
+    retrieval = StubWikiRetrieval(
         pages,
         [first_id, second_id],
         {},
@@ -211,7 +234,7 @@ async def test_character_budget_reports_omitted_claims() -> None:
         _ClaimRecord(uuid4(), f"事实 {index} " + "长" * 30, index, "summary_fact", (source,))
         for index in range(4)
     )
-    retrieval = TestableWikiRetrieval(
+    retrieval = StubWikiRetrieval(
         {page_id: _page(page_id, base_id, "预算", claims)},
         [page_id],
         {},
@@ -227,7 +250,7 @@ async def test_character_budget_reports_omitted_claims() -> None:
 
 async def test_search_logs_fingerprint_without_plain_query(caplog: object) -> None:
     base_id = uuid4()
-    retrieval = TestableWikiRetrieval({}, [], {}, FakeSourceRetrieval([]))
+    retrieval = StubWikiRetrieval({}, [], {}, FakeSourceRetrieval([]))
     secret_query = "内部机密双因素策略"
 
     with caplog.at_level(logging.INFO, logger="agent_api.knowledge.wiki.retrieval"):  # type: ignore[attr-defined]

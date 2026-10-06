@@ -213,7 +213,7 @@ class WikiService:
             await session.scalars(
                 select(WikiClaim)
                 .where(WikiClaim.page_version_id == page_version_id)
-                .order_by(WikiClaim.claim_key)
+                .order_by(WikiClaim.position, WikiClaim.id)
             )
         )
         output: list[dict[str, Any]] = []
@@ -248,6 +248,8 @@ class WikiService:
                     "id": claim.id,
                     "claim_key": claim.claim_key,
                     "text": claim.text,
+                    "position": claim.position,
+                    "claim_type": claim.claim_type,
                     "trust_state": "verified" if trusted else "needs_review",
                     "reason": claim.reason if trusted else claim.reason or "source_not_current",
                     "sources": rendered_sources,
@@ -342,6 +344,8 @@ class WikiService:
                     text=content,
                     trust_state="needs_review",
                     reason="manual_edit_without_source",
+                    position=0,
+                    claim_type="manual",
                 )
             )
             await session.flush()
@@ -459,6 +463,8 @@ class WikiService:
                 text=source_claim.text,
                 trust_state=source_claim.trust_state,
                 reason=source_claim.reason,
+                position=source_claim.position,
+                claim_type=source_claim.claim_type,
             )
             session.add(claim)
             await session.flush()

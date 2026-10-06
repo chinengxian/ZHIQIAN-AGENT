@@ -6,9 +6,9 @@ import pytest
 
 from agent_api.knowledge.infrastructure.database.models import Chunk
 from agent_api.knowledge.wiki.processor import (
+    normalize_wiki_alias,
     parse_generation_checkpoint,
     render_summary_content,
-    normalize_wiki_alias,
 )
 
 

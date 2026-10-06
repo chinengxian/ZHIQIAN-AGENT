@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import re
+import unicodedata
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_api.knowledge.domain.events import OutboxEventType
@@ -17,10 +21,111 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiConfig,
     WikiJob,
     WikiPage,
+    WikiPageAlias,
     WikiPageVersion,
     WikiTokenUsage,
 )
 from agent_api.knowledge.wiki.generator import WikiGeneration, WikiGenerator
+
+
+@dataclass(frozen=True, slots=True)
+class GroundedClaim:
+    """发布阶段已重新绑定到数据库分块的事实。"""
+
+    text: str
+    chunks: tuple[Chunk, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GroundedTopic:
+    """发布阶段已重新绑定到数据库分块的主题。"""
+
+    name: str
+    aliases: tuple[str, ...]
+    chunks: tuple[Chunk, ...]
+
+
+def normalize_wiki_alias(value: str) -> str:
+    """统一全半角、大小写、标点和连续空白。"""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold().strip()
+    return re.sub(r"[^\w]+", " ", normalized).strip()
+
+
+def _checkpoint_chunks(value: object, chunks: list[Chunk]) -> tuple[Chunk, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("wiki_generation_invalid_source")
+    if any(
+        not isinstance(index, int)
+        or isinstance(index, bool)
+        or index < 1
+        or index > len(chunks)
+        for index in value
+    ):
+        raise ValueError("wiki_generation_invalid_source")
+    return tuple(chunks[index - 1] for index in dict.fromkeys(value))
+
+
+def parse_generation_checkpoint(
+    data: dict[str, Any], chunks: list[Chunk]
+) -> tuple[tuple[GroundedClaim, ...], tuple[GroundedTopic, ...]]:
+    """把持久化模型编号重新校验并映射到当前活动版本分块。"""
+
+    raw_claims = data.get("summary_claims")
+    raw_topics = data.get("topics")
+    if not isinstance(raw_claims, list) or not raw_claims or not isinstance(raw_topics, list):
+        raise ValueError("wiki_generation_invalid_shape")
+    claims: list[GroundedClaim] = []
+    for item in raw_claims:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            raise ValueError("wiki_generation_invalid_shape")
+        text = item["text"].strip()
+        if not text:
+            raise ValueError("wiki_generation_invalid_shape")
+        claims.append(
+            GroundedClaim(text, _checkpoint_chunks(item.get("source_indices"), chunks))
+        )
+    topics: list[GroundedTopic] = []
+    for item in raw_topics:
+        if not isinstance(item, dict):
+            raise ValueError("wiki_generation_invalid_shape")
+        name = item.get("name")
+        aliases = item.get("aliases")
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or not isinstance(aliases, list)
+            or any(not isinstance(alias, str) for alias in aliases)
+        ):
+            raise ValueError("wiki_generation_invalid_shape")
+        topics.append(
+            GroundedTopic(
+                name.strip(),
+                tuple(dict.fromkeys(alias.strip() for alias in aliases if alias.strip())),
+                _checkpoint_chunks(item.get("source_indices"), chunks),
+            )
+        )
+    return tuple(claims), tuple(topics)
+
+
+def render_summary_content(title: str, claims: tuple[GroundedClaim, ...]) -> str:
+    """只渲染有来源的原子事实和定位信息，不复制原文片段。"""
+
+    lines = [f"# {title}", "", "## 摘要"]
+    footnotes: list[str] = []
+    for claim_index, claim in enumerate(claims, 1):
+        markers: list[str] = []
+        for source_index, chunk in enumerate(claim.chunks, 1):
+            marker = f"claim-{claim_index}-source-{source_index}"
+            markers.append(f"[^{marker}]")
+            location = f"原文分块 {chunk.ordinal + 1}"
+            if chunk.heading_path:
+                location += f"（{' / '.join(chunk.heading_path)}）"
+            footnotes.append(f"[^{marker}]: {location}")
+        lines.append(f"- {claim.text} {' '.join(markers)}")
+    if footnotes:
+        lines.extend(["", "## 来源", "", *footnotes])
+    return "\n".join(lines)
 
 
 class WikiProcessor:
@@ -196,7 +301,23 @@ class WikiProcessor:
             job.reserved_tokens = 0
             job.payload = {
                 **job.payload,
-                "generation": {"summary": result.summary, "topics": list(result.topics)},
+                "generation": {
+                    "summary_claims": [
+                        {
+                            "text": claim.text,
+                            "source_indices": list(claim.source_indices),
+                        }
+                        for claim in result.summary_claims
+                    ],
+                    "topics": [
+                        {
+                            "name": topic.name,
+                            "aliases": list(topic.aliases),
+                            "source_indices": list(topic.source_indices),
+                        }
+                        for topic in result.topics
+                    ],
+                },
             }
             job.stage = "publishing"
             job.heartbeat_at = datetime.now(UTC)
@@ -256,8 +377,6 @@ class WikiProcessor:
                 job.status = "failed"
                 job.error_code = "wiki_generation_checkpoint_missing"
                 return
-            summary = str(data.get("summary", ""))
-            topics = [str(item) for item in data.get("topics", []) if isinstance(item, str)]
             chunks = list(
                 await session.scalars(
                     select(Chunk)
@@ -267,9 +386,23 @@ class WikiProcessor:
                     .order_by(Chunk.ordinal)
                 )
             )
-            body = f"# {document.title}\n\n{summary}\n\n## 原文依据\n"
-            for chunk in chunks:
-                body += f"\n- {chunk.content[:350].strip()} [^chunk-{chunk.ordinal}]"
+            try:
+                claims, topics = parse_generation_checkpoint(data, chunks)
+            except ValueError as error:
+                job.status = "failed"
+                job.stage = "failed"
+                job.error_code = str(error)
+                return
+            summary = "\n".join(claim.text for claim in claims)
+            body = render_summary_content(document.title, claims)
+            topic_metadata = [
+                {
+                    "name": topic.name,
+                    "aliases": list(topic.aliases),
+                    "source_chunk_ids": [str(chunk.id) for chunk in topic.chunks],
+                }
+                for topic in topics
+            ]
             _, version, created = await self._upsert_page(
                 session,
                 job.knowledge_base_id,
@@ -281,33 +414,36 @@ class WikiProcessor:
                 metadata={
                     "document_id": str(document.id),
                     "document_version_id": str(job.document_version_id),
-                    "topics": topics,
+                    "topics": topic_metadata,
                 },
             )
-            for chunk in chunks if created else []:
+            for position, grounded_claim in enumerate(claims if created else ()):
                 claim = WikiClaim(
                     page_version_id=version.id,
-                    claim_key=f"chunk-{chunk.ordinal}",
-                    text=chunk.content[:350].strip(),
+                    claim_key=f"summary-{position + 1}",
+                    text=grounded_claim.text,
                     trust_state="verified",
+                    position=position,
+                    claim_type="summary_fact",
                 )
                 session.add(claim)
                 await session.flush()
-                session.add(
-                    WikiClaimSource(
-                        claim_id=claim.id,
-                        document_id=document.id,
-                        document_version_id=job.document_version_id,
-                        chunk_id=chunk.id,
-                        chunk_kind=chunk.kind,
-                        chunk_ordinal=chunk.ordinal,
-                        content_sha256=sha256(chunk.content.encode()).hexdigest(),
-                        document_title=document.title,
-                        heading_path=list(chunk.heading_path),
-                        page_start=chunk.page_start,
-                        page_end=chunk.page_end,
+                for chunk in grounded_claim.chunks:
+                    session.add(
+                        WikiClaimSource(
+                            claim_id=claim.id,
+                            document_id=document.id,
+                            document_version_id=job.document_version_id,
+                            chunk_id=chunk.id,
+                            chunk_kind=chunk.kind,
+                            chunk_ordinal=chunk.ordinal,
+                            content_sha256=sha256(chunk.content.encode()).hexdigest(),
+                            document_title=document.title,
+                            heading_path=list(chunk.heading_path),
+                            page_start=chunk.page_start,
+                            page_end=chunk.page_end,
+                        )
                     )
-                )
             await self._rebuild_topic_pages(session, job.knowledge_base_id)
             await self._rebuild_index(session, job.knowledge_base_id)
             job.status = "succeeded"
@@ -400,52 +536,79 @@ class WikiProcessor:
                 )
             )
         )
-        by_topic: dict[str, list[tuple[WikiPage, WikiPageVersion]]] = {}
+        by_topic: dict[str, dict[str, Any]] = {}
+        identity_by_alias: dict[str, str] = {}
         for page, version in summaries:
             for topic in version.generation_metadata.get("topics", []):
-                if isinstance(topic, str) and topic.strip():
-                    by_topic.setdefault(topic.strip().casefold(), []).append((page, version))
-        for key, items in by_topic.items():
-            if len(items) < 2:
+                if not isinstance(topic, dict):
+                    continue
+                name = topic.get("name")
+                aliases = topic.get("aliases")
+                source_ids = topic.get("source_chunk_ids")
+                if (
+                    not isinstance(name, str)
+                    or not name.strip()
+                    or not isinstance(aliases, list)
+                    or not isinstance(source_ids, list)
+                ):
+                    continue
+                normalized_names = [
+                    normalize_wiki_alias(value)
+                    for value in [name, *aliases]
+                    if isinstance(value, str) and normalize_wiki_alias(value)
+                ]
+                if not normalized_names:
+                    continue
+                key = next(
+                    (
+                        identity_by_alias[normalized]
+                        for normalized in normalized_names
+                        if normalized in identity_by_alias
+                    ),
+                    normalized_names[0],
+                )
+                for normalized in normalized_names:
+                    identity_by_alias[normalized] = key
+                entry = by_topic.setdefault(
+                    key,
+                    {"name": name.strip(), "aliases": [], "items": []},
+                )
+                entry["aliases"].extend(
+                    alias.strip()
+                    for alias in aliases
+                    if isinstance(alias, str) and alias.strip()
+                )
+                valid_source_ids: set[UUID] = set()
+                for source_id in source_ids:
+                    try:
+                        valid_source_ids.add(UUID(str(source_id)))
+                    except ValueError:
+                        continue
+                if valid_source_ids:
+                    entry["items"].append((page, version, valid_source_ids))
+        for key, entry in by_topic.items():
+            items = entry["items"]
+            if len({item[0].id for item in items}) < 2:
                 continue
-            title = key[:80]
+            title = str(entry["name"])[:80]
             slug = f"topic/{sha256(key.encode()).hexdigest()[:16]}"
             lines = [f"# {title}", "", "来自多篇文档的相关内容："]
-            for page, version in items:
-                lines.append(
-                    f"\n## {page.title}\n\n{version.summary}\n\n参见 [[{page.slug}|{page.title}]]"
-                )
-            _, topic_version, created = await WikiProcessor._upsert_page(
-                session,
-                knowledge_base_id,
-                slug=slug,
-                page_type="topic",
-                title=title,
-                content="\n".join(lines),
-                summary=f"{len(items)} 篇文档涉及 {title}",
-                metadata={
-                    "summary_page_ids": [str(item[0].id) for item in items],
-                    "summary_version_ids": [str(item[1].id) for item in items],
-                },
-            )
-            if not created:
-                continue
-            for source_page, source_version in items:
+            selected: list[
+                tuple[WikiPage, WikiClaim, list[WikiClaimSource]]
+            ] = []
+            for page, version, topic_source_ids in items:
                 claims = list(
                     await session.scalars(
-                        select(WikiClaim).where(WikiClaim.page_version_id == source_version.id)
+                        select(WikiClaim)
+                        .where(
+                            WikiClaim.page_version_id == version.id,
+                            WikiClaim.trust_state == "verified",
+                        )
+                        .order_by(WikiClaim.position, WikiClaim.id)
                     )
                 )
+                page_claims: list[str] = []
                 for source_claim in claims:
-                    claim = WikiClaim(
-                        page_version_id=topic_version.id,
-                        claim_key=f"{source_page.id}:{source_claim.claim_key}",
-                        text=source_claim.text,
-                        trust_state=source_claim.trust_state,
-                        reason=source_claim.reason,
-                    )
-                    session.add(claim)
-                    await session.flush()
                     sources = list(
                         await session.scalars(
                             select(WikiClaimSource).where(
@@ -453,22 +616,97 @@ class WikiProcessor:
                             )
                         )
                     )
-                    for source in sources:
-                        session.add(
-                            WikiClaimSource(
-                                claim_id=claim.id,
-                                document_id=source.document_id,
-                                document_version_id=source.document_version_id,
-                                chunk_id=source.chunk_id,
-                                chunk_kind=source.chunk_kind,
-                                chunk_ordinal=source.chunk_ordinal,
-                                content_sha256=source.content_sha256,
-                                document_title=source.document_title,
-                                heading_path=list(source.heading_path),
-                                page_start=source.page_start,
-                                page_end=source.page_end,
-                            )
+                    if not any(source.chunk_id in topic_source_ids for source in sources):
+                        continue
+                    selected.append((page, source_claim, sources))
+                    page_claims.append(f"- {source_claim.text}")
+                if page_claims:
+                    lines.extend(
+                        [
+                            "",
+                            f"## {page.title}",
+                            "",
+                            *page_claims,
+                            "",
+                            f"参见 [[{page.slug}|{page.title}]]",
+                        ]
+                    )
+            if not selected:
+                continue
+            topic_page, topic_version, created = await WikiProcessor._upsert_page(
+                session,
+                knowledge_base_id,
+                slug=slug,
+                page_type="topic",
+                title=title,
+                content="\n".join(lines),
+                summary=f"{len({item[0].id for item in items})} 篇文档涉及 {title}",
+                metadata={
+                    "summary_page_ids": [str(item[0].id) for item in items],
+                    "summary_version_ids": [str(item[1].id) for item in items],
+                    "aliases": list(dict.fromkeys(entry["aliases"])),
+                    "source_chunk_ids": sorted(
+                        {str(source.id) for item in items for source in item[2]}
+                    ),
+                },
+            )
+            await WikiProcessor._replace_aliases(
+                session,
+                topic_page.id,
+                title,
+                list(dict.fromkeys(entry["aliases"])),
+            )
+            if not created:
+                continue
+            for position, (source_page, source_claim, sources) in enumerate(selected):
+                claim = WikiClaim(
+                    page_version_id=topic_version.id,
+                    claim_key=f"{source_page.id}:{source_claim.claim_key}",
+                    text=source_claim.text,
+                    trust_state=source_claim.trust_state,
+                    reason=source_claim.reason,
+                    position=position,
+                    claim_type="topic_fact",
+                )
+                session.add(claim)
+                await session.flush()
+                for source in sources:
+                    session.add(
+                        WikiClaimSource(
+                            claim_id=claim.id,
+                            document_id=source.document_id,
+                            document_version_id=source.document_version_id,
+                            chunk_id=source.chunk_id,
+                            chunk_kind=source.chunk_kind,
+                            chunk_ordinal=source.chunk_ordinal,
+                            content_sha256=source.content_sha256,
+                            document_title=source.document_title,
+                            heading_path=list(source.heading_path),
+                            page_start=source.page_start,
+                            page_end=source.page_end,
                         )
+                    )
+
+    @staticmethod
+    async def _replace_aliases(
+        session: AsyncSession,
+        page_id: UUID,
+        title: str,
+        aliases: list[str],
+    ) -> None:
+        """以一次事务替换页面别名，避免旧模型输出残留。"""
+
+        await session.execute(delete(WikiPageAlias).where(WikiPageAlias.page_id == page_id))
+        title_key = normalize_wiki_alias(title)
+        normalized: set[str] = set()
+        for alias in aliases:
+            key = normalize_wiki_alias(alias)
+            if not key or key == title_key or key in normalized:
+                continue
+            normalized.add(key)
+            session.add(
+                WikiPageAlias(page_id=page_id, alias=alias.strip(), normalized_alias=key)
+            )
 
     @staticmethod
     async def _rebuild_index(session: AsyncSession, knowledge_base_id: UUID) -> None:

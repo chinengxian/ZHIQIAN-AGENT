@@ -15,6 +15,7 @@ from agent_api.knowledge.infrastructure.database.models import (
     DocumentVersion,
     KnowledgeBase,
     WikiJob,
+    WikiPageAlias,
 )
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.wiki.api import router as wiki_router
@@ -33,10 +34,11 @@ class FakeWikiGenerator:
 
     async def generate(self, title: str, excerpts: list[str]) -> WikiGeneration:
         assert excerpts
+        tail_fact = excerpts[-1] if len(excerpts) > 1 else f"{title} 的来源已验证。"
         return WikiGeneration(
             summary_claims=(
                 WikiGeneratedClaim(f"{title} 讨论共同主题。", (1,)),
-                WikiGeneratedClaim(excerpts[-1], (len(excerpts),)),
+                WikiGeneratedClaim(tail_fact, (len(excerpts),)),
             ),
             topics=(
                 WikiGeneratedTopic(
@@ -141,8 +143,24 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
         detail = await service.get_page(knowledge_base_id, topic["id"])
         assert detail["claims"]
         assert all(claim["trust_state"] == "verified" for claim in detail["claims"])
+        assert all(claim["claim_type"] == "topic_fact" for claim in detail["claims"])
+        assert [claim["position"] for claim in detail["claims"]] == list(
+            range(len(detail["claims"]))
+        )
         assert any(claim["text"] == "文档尾部证据 13。" for claim in detail["claims"])
+        async with database.session_factory() as session:
+            aliases = list(
+                await session.scalars(
+                    select(WikiPageAlias.alias).where(WikiPageAlias.page_id == topic["id"])
+                )
+            )
+        assert aliases == ["共享主题"]
         summary = next(page for page in pages if page["slug"] == f"summary/{document_ids[0]}")
+        summary_detail = await service.get_page(knowledge_base_id, summary["id"])
+        assert all(
+            claim["claim_type"] == "summary_fact" for claim in summary_detail["claims"]
+        )
+        assert "文档 1 的共同主题原文证据。" not in summary_detail["content"]
         edited = await service.edit_page(
             knowledge_base_id,
             summary["id"],

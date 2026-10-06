@@ -23,8 +23,8 @@
 
 | 命令或检查 | 结果 |
 | --- | --- |
-| 聚焦后端测试 | 45 passed |
-| `pytest -q` | 186 passed、39 skipped |
+| 聚焦后端测试 | 47 passed |
+| `pytest -q` | 189 passed、39 skipped |
 | `ruff check src tests` | 通过 |
 | `mypy src` | 通过，63 个源文件 |
 | `npm test -- --run` | 34 passed（11 个测试文件） |
@@ -34,7 +34,7 @@
 | 旧生产路径扫描 | `trusted[:8]`、`pages[:8]`、`agent_pages`、`chunk.content[:350]` 无命中 |
 | `git diff --check` | 通过；仅显示现有 CRLF 转换提示 |
 
-全量测试第一次运行暴露生命周期测试未隔离新 Milvus 客户端，表现为尝试解析 `milvus:19530`。补充测试替身后目标测试 1 passed，随后全量 186 passed、39 skipped。
+全量测试第一次运行暴露生命周期测试未隔离新 Milvus 客户端，表现为尝试解析 `milvus:19530`。补充测试替身后目标测试通过。独立代码审查随后发现 slug 通配/排序和过期主题生命周期边界；补充 SQL 转义与排序、主题软删除和回归测试后，最终全量为 189 passed、39 skipped，且 reviewer 未发现剩余 Critical/Important。
 
 ### 未完成与环境边界
 

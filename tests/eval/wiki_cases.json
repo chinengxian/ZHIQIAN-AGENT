@@ -1,0 +1,196 @@
+{
+  "cases": [
+    {
+      "id": "Q01",
+      "queries": [
+        "常规生产变更窗口是什么时间？",
+        "每周允许执行普通生产变更的时间段是什么？",
+        "紧急变更不在维护窗口时要在多久内补交记录？"
+      ],
+      "expected_documents": ["01-it-operations-policy.md"],
+      "expected_terms": ["每周三 22:00", "24 小时内补交"],
+      "forbidden_terms": ["紧急变更无需记录"],
+      "answerable": true
+    },
+    {
+      "id": "Q02",
+      "queries": [
+        "核心生产系统和普通内部系统的 RPO、RTO 分别是多少？",
+        "灾难恢复目标按系统等级如何区分？",
+        "查找核心系统 4 小时恢复点和 8 小时恢复时间的规定"
+      ],
+      "expected_documents": ["05-backup-disaster-recovery.md"],
+      "expected_terms": ["核心生产系统", "4 小时", "8 小时", "24 小时", "48 小时"],
+      "forbidden_terms": ["RPO 与 RTO 可以互换"],
+      "answerable": true
+    },
+    {
+      "id": "Q03",
+      "queries": [
+        "告警静默最长可以持续多久，需要关联什么记录？",
+        "监控静默一次最多多长时间，审批依据是什么？",
+        "查找告警屏蔽四小时和变更单的要求"
+      ],
+      "expected_documents": ["06-monitoring-oncall-policy.md"],
+      "expected_terms": ["单次静默最长 4 小时", "已批准的变更单"],
+      "forbidden_terms": ["维护窗口内静默无需审批"],
+      "answerable": true
+    },
+    {
+      "id": "Q04",
+      "queries": [
+        "MFA、多因素认证和双因素校验是否是同一控制主题？",
+        "双因素校验与 MFA 在这些制度里是什么关系？",
+        "查找要求两个独立认证因素的控制"
+      ],
+      "expected_documents": ["02-identity-access-control.md", "03-remote-access-vpn-guide.md", "08-2026-security-baseline-change.md"],
+      "expected_terms": ["两类相互独立的认证因素", "抗钓鱼"],
+      "forbidden_terms": ["短信验证码永久首选"],
+      "answerable": true
+    },
+    {
+      "id": "Q05",
+      "queries": [
+        "P1、一级事件和严重事件之间是什么关系，何时需要升级？",
+        "最高等级告警需要在几分钟内确认和升级？",
+        "多个关键账号失陷后谁负责协调严重事件？"
+      ],
+      "expected_documents": ["01-it-operations-policy.md", "06-monitoring-oncall-policy.md", "07-security-incident-response.md"],
+      "expected_terms": ["5 分钟内确认", "15 分钟内", "事件指挥官"],
+      "forbidden_terms": ["P1 告警等同于已确认安全事件"],
+      "answerable": true
+    },
+    {
+      "id": "Q06",
+      "queries": [
+        "灾难恢复、DR 和业务恢复是否可以互换，需要注意什么？",
+        "DR 的恢复目标为什么还要按系统等级判断？",
+        "服务恢复后安全事件是否自动关闭？"
+      ],
+      "expected_documents": ["05-backup-disaster-recovery.md", "07-security-incident-response.md"],
+      "expected_terms": ["按系统等级", "业务服务恢复不等于事件立即关闭"],
+      "forbidden_terms": ["恢复备份后事件自动结束"],
+      "answerable": true
+    },
+    {
+      "id": "Q07",
+      "queries": [
+        "2026 年 7 月后，普通员工密码是否仍需每 90 天强制更换？",
+        "新安全基线取消了哪些账号的固定密码轮换？",
+        "普通员工取消九十天换密后，什么情况仍必须换密码？"
+      ],
+      "expected_documents": ["01-it-operations-policy.md", "02-identity-access-control.md", "08-2026-security-baseline-change.md"],
+      "expected_terms": ["2026-07-01", "不再仅因时间到期", "特权账号"],
+      "forbidden_terms": ["所有账号都取消轮换"],
+      "answerable": true
+    },
+    {
+      "id": "Q08",
+      "queries": [
+        "互联网暴露服务器和普通内部服务器发现严重漏洞后，各应在多久内修复？",
+        "新基线对外网资产的严重漏洞时限有什么变化？",
+        "严重漏洞的 24 小时和 72 小时分别适用于哪些资产？"
+      ],
+      "expected_documents": ["04-patch-vulnerability-management.md", "08-2026-security-baseline-change.md"],
+      "expected_terms": ["互联网暴露资产", "24 小时", "72 小时"],
+      "forbidden_terms": ["所有严重漏洞统一为 24 小时"],
+      "answerable": true
+    },
+    {
+      "id": "Q09",
+      "queries": [
+        "2026 年 7 月后，VPN 是否禁止使用短信验证码？",
+        "VPN 暂时无法使用抗钓鱼 MFA 时有什么过渡方案？",
+        "短信验证码作为远程接入过渡措施最长能批准多久？"
+      ],
+      "expected_documents": ["03-remote-access-vpn-guide.md", "08-2026-security-baseline-change.md"],
+      "expected_terms": ["抗钓鱼 MFA", "过渡方案最长有效期为 90 天", "信息安全负责人批准"],
+      "forbidden_terms": ["立即无条件禁用短信验证码"],
+      "answerable": true
+    },
+    {
+      "id": "Q10",
+      "queries": [
+        "员工手机丢失且保存了 VPN 凭据，应执行哪些操作？",
+        "存有远程访问凭据的移动设备遗失后怎样恢复身份？",
+        "设备丢失时除了改密码和远程擦除还要做什么？"
+      ],
+      "expected_documents": ["02-identity-access-control.md", "03-remote-access-vpn-guide.md", "07-security-incident-response.md", "08-2026-security-baseline-change.md"],
+      "expected_terms": ["撤销", "重新绑定认证设备", "登记安全事件", "终端检查"],
+      "forbidden_terms": ["只远程擦除设备即可"],
+      "answerable": true
+    },
+    {
+      "id": "Q11",
+      "queries": [
+        "监控发现多个用户广泛认证失败，值班人员应如何从告警走到身份恢复？",
+        "大范围登录失败触发 P1 后的调查、升级和账号恢复步骤是什么？",
+        "身份平台异常时为什么不能直接批量重置所有密码？"
+      ],
+      "expected_documents": ["01-it-operations-policy.md", "02-identity-access-control.md", "06-monitoring-oncall-policy.md", "07-security-incident-response.md"],
+      "expected_terms": ["5 分钟内确认", "身份日志", "撤销活动会话", "确认终端可信"],
+      "forbidden_terms": ["关闭告警后事件结束"],
+      "answerable": true
+    },
+    {
+      "id": "Q12",
+      "queries": [
+        "勒索软件影响核心生产系统时，从发现到恢复服务需要满足哪些条件？",
+        "核心系统遭勒索后何时可以从备份恢复，RPO 和 RTO 是多少？",
+        "勒索软件事件的隔离、证据保全、清除和恢复流程是什么？"
+      ],
+      "expected_documents": ["04-patch-vulnerability-management.md", "05-backup-disaster-recovery.md", "06-monitoring-oncall-policy.md", "07-security-incident-response.md"],
+      "expected_terms": ["隔离", "证据", "恢复点", "4 小时", "8 小时"],
+      "forbidden_terms": ["立即从最近备份覆盖"],
+      "answerable": true
+    },
+    {
+      "id": "Q13",
+      "queries": [
+        "互联网暴露服务器出现正在被利用的严重漏洞，且无法在 24 小时内完成补丁，应怎么办？",
+        "外网资产零日漏洞来不及修复时怎样申请例外并处置 P1？",
+        "被主动利用的严重漏洞可以只依赖延期审批吗？"
+      ],
+      "expected_documents": ["04-patch-vulnerability-management.md", "06-monitoring-oncall-policy.md", "07-security-incident-response.md", "08-2026-security-baseline-change.md"],
+      "expected_terms": ["P1", "隔离", "例外", "补偿控制", "重新验证"],
+      "forbidden_terms": ["获得例外后无需事件响应"],
+      "answerable": true
+    },
+    {
+      "id": "Q14",
+      "queries": [
+        "VPN 连续认证失败的锁定阈值能否直接用于普通业务系统？",
+        "远程接入失败几次会锁定多久，这个规则适用于所有登录吗？",
+        "查找 VPN 防爆破的五次失败和二十分钟限制"
+      ],
+      "expected_documents": ["03-remote-access-vpn-guide.md"],
+      "expected_terms": ["连续认证失败 5 次", "锁定 20 分钟", "不能推断普通业务系统"],
+      "forbidden_terms": ["所有登录系统都使用相同阈值"],
+      "answerable": true
+    },
+    {
+      "id": "Q15",
+      "queries": [
+        "所有事件工单是否都需要双人签字？",
+        "证据移交和应急账号启封的双人控制有什么区别？",
+        "双人签字要求适用于哪些安全记录？"
+      ],
+      "expected_documents": ["02-identity-access-control.md", "07-security-incident-response.md"],
+      "expected_terms": ["证据移交", "双人签字", "应急账号", "不能推断所有事件工单"],
+      "forbidden_terms": ["所有事件工单都需要两人签字"],
+      "answerable": true
+    },
+    {
+      "id": "Q16",
+      "queries": [
+        "企业购买的网络安全保险年度保费是多少？",
+        "公司的网络安全险供应商和每年费用是什么？",
+        "查找网络安全保险合同中的年度保费"
+      ],
+      "expected_documents": [],
+      "expected_terms": [],
+      "forbidden_terms": ["年度保费为", "保险供应商是"],
+      "answerable": false
+    }
+  ]
+}

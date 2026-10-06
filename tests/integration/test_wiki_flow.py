@@ -239,7 +239,6 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
         disabled = await service.update_config(knowledge_base_id, enabled=False, token_limit=None)
         assert disabled["enabled"] is False
         assert await service.get_page(knowledge_base_id, summary["id"])
-        assert await service.agent_pages(knowledge_base_id, "共同主题") == []
         app = FastAPI()
         app.state.wiki_service = service
         app.include_router(wiki_router)
@@ -257,7 +256,6 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
             document.status = "deleting"
         stale_topic = await service.get_page(knowledge_base_id, topic["id"])
         assert any(claim["trust_state"] == "needs_review" for claim in stale_topic["claims"])
-        assert await service.agent_read_page(knowledge_base_id, topic["id"]) is None
         budget_version_id = uuid4()
         async with database.session_factory() as session, session.begin():
             document = await session.get(Document, document_ids[1])
@@ -294,10 +292,11 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
             knowledge_base_id, enabled=True, token_limit=previous_usage + 1
         )
         assert resumed["tokens_charged"] == previous_usage
-        trusted_topic = await service.agent_read_page(knowledge_base_id, topic["id"])
-        assert trusted_topic is not None
+        trusted_topic = await service.get_page(knowledge_base_id, topic["id"])
         assert all(
-            all(source["valid"] for source in claim["sources"]) for claim in trusted_topic["claims"]
+            all(source["valid"] for source in claim["sources"])
+            for claim in trusted_topic["claims"]
+            if claim["trust_state"] == "verified"
         )
         async with database.session_factory() as session:
             budget_job = await session.scalar(

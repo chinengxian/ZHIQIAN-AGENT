@@ -70,6 +70,7 @@ async def test_generator_rejects_unknown_json_shape() -> None:
         [],
         [{"title": "概述", "text": "无来源", "source_indices": []}],
         [{"title": "概述", "text": "越界来源", "source_indices": [0]}],
+        [{"title": "概述", "text": "越界来源", "source_indices": [99]}],
         [
             {"title": "概述", "text": "第一段", "source_indices": [1]},
             {"title": "概述", "text": "第二段", "source_indices": [1]},

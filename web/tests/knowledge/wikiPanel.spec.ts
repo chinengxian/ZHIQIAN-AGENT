@@ -13,6 +13,13 @@ const api = vi.hoisted(() => ({
 
 vi.mock('../../src/services/knowledgeApi', () => ({ knowledgeApi: api }))
 
+function mountPanel() {
+  return mount(WikiPanel, {
+    props: { knowledgeBaseId: 'base' },
+    global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+  })
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   api.getWikiConfig.mockResolvedValue({
@@ -73,7 +80,7 @@ beforeEach(() => {
 })
 
 it('按主题与来源语义搜索 Wiki，并显示命中的结论', async () => {
-  const wrapper = mount(WikiPanel, { props: { knowledgeBaseId: 'base' } })
+  const wrapper = mountPanel()
   await flushPromises()
 
   await wrapper.get('input[aria-label="搜索 Wiki"]').setValue('登录安全要求')
@@ -102,7 +109,7 @@ it('明确显示语义检索降级状态', async () => {
     degradation_reason: 'embedding_unavailable',
     truncation_reason: null,
   })
-  const wrapper = mount(WikiPanel, { props: { knowledgeBaseId: 'base' } })
+  const wrapper = mountPanel()
   await flushPromises()
 
   await wrapper.get('input[aria-label="搜索 Wiki"]').setValue('认证')
@@ -123,7 +130,7 @@ it('搜索失败后可清除查询并恢复目录', async () => {
     current_version_id: 'version-directory',
   }])
   api.searchWiki.mockRejectedValueOnce(new Error('network'))
-  const wrapper = mount(WikiPanel, { props: { knowledgeBaseId: 'base' } })
+  const wrapper = mountPanel()
   await flushPromises()
 
   await wrapper.get('input[aria-label="搜索 Wiki"]').setValue('认证')

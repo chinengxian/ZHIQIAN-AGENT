@@ -28,7 +28,7 @@ def test_generation_checkpoint_maps_claims_and_topics_to_exact_chunks() -> None:
     """发布前必须把模型编号重新映射到当前加载的真实分块。"""
 
     chunks = [_chunk(0, "首段"), _chunk(1, "中段"), _chunk(2, "尾部证据")]
-    claims, topics = parse_generation_checkpoint(
+    _, claims, topics = parse_generation_checkpoint(
         {
             "summary_claims": [{"text": "尾部事实", "source_indices": [3]}],
             "topics": [
@@ -114,7 +114,7 @@ def test_summary_content_contains_claims_and_locators_not_chunk_prefixes() -> No
     """正文由事实和引用定位组成，不再复制每个分块的前 350 字。"""
 
     chunks = [_chunk(0, "只存在于未被引用分块的前缀"), _chunk(1, "被引用的长原文")]
-    claims, _ = parse_generation_checkpoint(
+    _, claims, _ = parse_generation_checkpoint(
         {
             "summary_claims": [{"text": "可验证事实", "source_indices": [2]}],
             "topics": [],

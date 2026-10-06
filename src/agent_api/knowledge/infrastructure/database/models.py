@@ -636,7 +636,7 @@ class WikiClaim(Base):
     __table_args__ = (
         UniqueConstraint("page_version_id", "claim_key", name="uq_wiki_claim_version_key"),
         CheckConstraint(
-            "claim_type IN ('summary_fact', 'topic_fact', 'source_excerpt', 'manual')",
+            "claim_type IN ('summary_section', 'summary_fact', 'topic_fact', 'source_excerpt', 'manual')",
             name="ck_wiki_claim_type",
         ),
     )

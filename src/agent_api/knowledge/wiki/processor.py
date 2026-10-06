@@ -37,6 +37,15 @@ class GroundedClaim:
 
 
 @dataclass(frozen=True, slots=True)
+class GroundedSection:
+    """发布阶段已重新绑定到数据库分块的可读摘要段落。"""
+
+    title: str
+    text: str
+    chunks: tuple[Chunk, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class GroundedTopic:
     """发布阶段已重新绑定到数据库分块的主题。"""
 
@@ -96,14 +105,56 @@ def _checkpoint_chunks(value: object, chunks: list[Chunk]) -> tuple[Chunk, ...]:
 
 
 def parse_generation_checkpoint(
-    data: dict[str, Any], chunks: list[Chunk]
-) -> tuple[tuple[GroundedClaim, ...], tuple[GroundedTopic, ...]]:
+    data: dict[str, Any],
+    chunks: list[Chunk],
+    *,
+    allow_legacy_sections: bool = False,
+) -> tuple[
+    tuple[GroundedSection, ...], tuple[GroundedClaim, ...], tuple[GroundedTopic, ...]
+]:
     """把持久化模型编号重新校验并映射到当前活动版本分块。"""
 
+    raw_sections = data.get("summary_sections")
     raw_claims = data.get("summary_claims")
     raw_topics = data.get("topics")
-    if not isinstance(raw_claims, list) or not raw_claims or not isinstance(raw_topics, list):
+    if raw_sections is None and allow_legacy_sections:
+        raw_sections = []
+    if (
+        not isinstance(raw_sections, list)
+        or (not allow_legacy_sections and not raw_sections)
+        or len(raw_sections) > 3
+        or not isinstance(raw_claims, list)
+        or not raw_claims
+        or not isinstance(raw_topics, list)
+    ):
         raise ValueError("wiki_generation_invalid_shape")
+    allowed_section_titles = {"概述", "核心要求", "例外与版本变化"}
+    section_titles: set[str] = set()
+    sections: list[GroundedSection] = []
+    for item in raw_sections:
+        if not isinstance(item, dict):
+            raise ValueError("wiki_generation_invalid_shape")
+        title = item.get("title")
+        text = item.get("text")
+        if not isinstance(title, str) or not isinstance(text, str):
+            raise ValueError("wiki_generation_invalid_shape")
+        normalized_title = title.strip()
+        normalized_text = text.strip()
+        if (
+            normalized_title not in allowed_section_titles
+            or normalized_title in section_titles
+            or not normalized_text
+            or len(normalized_text) > 2000
+        ):
+            raise ValueError("wiki_generation_invalid_shape")
+        section_titles.add(normalized_title)
+        sections.append(
+            GroundedSection(
+                normalized_title,
+                normalized_text,
+                _checkpoint_chunks(item.get("source_indices"), chunks),
+            )
+        )
     claims: list[GroundedClaim] = []
     for item in raw_claims:
         if not isinstance(item, dict) or not isinstance(item.get("text"), str):
@@ -134,7 +185,7 @@ def parse_generation_checkpoint(
                 _checkpoint_chunks(item.get("source_indices"), chunks),
             )
         )
-    return tuple(claims), tuple(topics)
+    return tuple(sections), tuple(claims), tuple(topics)
 
 
 def render_summary_content(title: str, claims: tuple[GroundedClaim, ...]) -> str:
@@ -416,7 +467,11 @@ class WikiProcessor:
                 )
             )
             try:
-                claims, topics = parse_generation_checkpoint(data, chunks)
+                _, claims, topics = parse_generation_checkpoint(
+                    data,
+                    chunks,
+                    allow_legacy_sections=job.idempotency_key.endswith(":wiki-v1"),
+                )
             except ValueError as error:
                 job.status = "failed"
                 job.stage = "failed"

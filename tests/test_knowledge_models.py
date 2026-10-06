@@ -150,7 +150,7 @@ def test_alembic_head_matches_startup_revision() -> None:
     config = Config(str(Path.cwd() / "alembic.ini"))
     scripts = ScriptDirectory.from_config(config)
 
-    assert EXPECTED_DATABASE_REVISION == "20261006_0003"
+    assert EXPECTED_DATABASE_REVISION == "20261007_0004"
     assert scripts.get_current_head() == EXPECTED_DATABASE_REVISION
 
 

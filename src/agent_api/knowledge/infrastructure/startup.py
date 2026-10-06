@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from agent_api.core.config import Settings
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
 
-EXPECTED_DATABASE_REVISION = "20261006_0003"
+EXPECTED_DATABASE_REVISION = "20261007_0004"
 _EXPECTED_MILVUS_FIELDS = {
     "chunk_id",
     "document_version_id",

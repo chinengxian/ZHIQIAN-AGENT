@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { knowledgeApi } from '../../services/knowledgeApi'
-import type { WikiConfig, WikiJob, WikiPage, WikiPageSummary, WikiSearchResult, WikiVersion } from '../../types/knowledge'
+import type { WikiConfig, WikiJob, WikiPage, WikiPageSummary, WikiPresentationSource, WikiSearchResult, WikiVersion } from '../../types/knowledge'
 
 const props = defineProps<{ knowledgeBaseId: string }>()
 const config = ref<WikiConfig | null>(null)
@@ -23,6 +23,7 @@ const searching = ref(false)
 const searchResult = ref<WikiSearchResult | null>(null)
 const searchError = ref('')
 const highlightClaimId = ref<string | null>(null)
+const expandedSectionSources = ref<Set<string>>(new Set())
 let searchRequestToken = 0
 let highlightTimer: number | null = null
 const candidate = computed(() => versions.value.find((item) => item.id === selectedVersion.value) ?? null)
@@ -175,6 +176,35 @@ function startEdit() {
   draftTitle.value = page.value.title
   draftContent.value = page.value.content
   editing.value = true
+}
+
+function toggleSectionSources(sectionId: string) {
+  const next = new Set(expandedSectionSources.value)
+  if (next.has(sectionId)) next.delete(sectionId)
+  else next.add(sectionId)
+  expandedSectionSources.value = next
+}
+
+function legacyDisplayContent(content: string) {
+  return content
+    .split('\n')
+    .filter((line) => !/^\s*\[\^[^\]]+\]:/.test(line))
+    .map((line) => line
+      .replace(/^\s*#{1,6}\s*/, '')
+      .replace(/^\s*[-*]\s+/, '• ')
+      .replace(/\s*\[\^[^\]]+\]/g, ''))
+    .join('\n')
+    .trim()
+}
+
+function summarySourceRoute(source: WikiPresentationSource) {
+  return {
+    path: `/knowledge/${props.knowledgeBaseId}/documents/${source.document_id}`,
+    query: {
+      version: source.document_version_id,
+      ...(source.chunk_id ? { chunk: source.chunk_id } : {}),
+    },
+  }
 }
 
 watch(() => props.knowledgeBaseId, () => {
@@ -388,11 +418,58 @@ onBeforeUnmount(() => {
           </div>
         </template>
         <template v-else>
-          <pre class="page-body">{{ page.content }}</pre><section
+          <template v-if="page.origin === 'pipeline' && page.summary_sections.length">
+            <dl
+              v-if="page.metadata.length"
+              class="wiki-metadata"
+            >
+              <div
+                v-for="item in page.metadata"
+                :key="item.key"
+              >
+                <dt>{{ item.label }}</dt><dd>{{ item.value }}</dd>
+              </div>
+            </dl>
+            <section
+              v-for="section in page.summary_sections"
+              :key="section.id"
+              class="summary-section"
+              :data-summary-section-id="section.id"
+            >
+              <h4>{{ section.title }}</h4><p>{{ section.text }}</p><span
+                :class="section.trust_state"
+              >{{ section.trust_state === 'verified' ? '已核实' : '待核实' }}</span><button
+                type="button"
+                class="quiet section-sources-toggle"
+                @click="toggleSectionSources(section.id)"
+              >
+                {{ expandedSectionSources.has(section.id) ? '收起来源' : `查看 ${section.sources.length} 个来源` }}
+              </button><div
+                v-if="expandedSectionSources.has(section.id)"
+                class="section-sources"
+              >
+                <div
+                  v-for="source in section.sources"
+                  :key="source.document_version_id + source.chunk_id"
+                >
+                  <RouterLink
+                    class="source-link"
+                    :to="summarySourceRoute(source)"
+                  >
+                    {{ source.document_title }} · {{ source.valid ? '查看来源' : '来源失效' }}
+                  </RouterLink><small>文档版本 {{ source.document_version_id }} · 分块 {{ source.chunk_id || '无' }} · {{ source.heading_path.join(' / ') || '正文' }}<template v-if="source.page_start"> · 第 {{ source.page_start }} 页</template> · {{ source.valid ? '来源有效' : '来源失效' }}</small>
+                </div>
+              </div>
+            </section>
+          </template>
+          <pre
+            v-else
+            class="page-body"
+          >{{ legacyDisplayContent(page.content) }}</pre><section
             v-if="page.claims.length"
             class="claims"
           >
-            <h4>来源与核实状态</h4><div
+            <h4>关键事实</h4><div
               v-for="claim in page.claims"
               :key="claim.id"
               class="claim"
@@ -472,5 +549,6 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .wiki-panel{padding-top:18px;color:var(--agent-ink);min-width:0}.wiki-toolbar,.setting-line,.article-actions,.button-row,.version-row{display:flex;align-items:center;justify-content:space-between;gap:12px}.wiki-toolbar p,.wiki-settings p{font-size:12px;color:var(--agent-muted);margin:5px 0}.wiki-toolbar h3,.wiki-article h3{margin:0;font-size:18px}.wiki-settings{border:1px solid #e1e1e8;border-radius:8px;padding:15px;margin:17px 0}.setting-line{justify-content:flex-start;flex-wrap:wrap;margin-bottom:10px;font-size:13px}.setting-line strong{margin-right:auto}.setting-line input{width:140px;padding:7px;border:1px solid #d5d5dd;border-radius:5px}.wiki-panel button{cursor:pointer;border:1px solid #d8d8e0;background:#fff;color:#454299;padding:7px 10px;border-radius:6px;font-size:12px}.wiki-panel button:disabled{opacity:.5;cursor:default}.wiki-error{color:#a22920!important;font-size:12px}.wiki-message{color:#227052;font-size:12px}.wiki-jobs{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;font-size:11px;color:#666}.wiki-jobs span{background:#f2f2f7;padding:4px 7px;border-radius:4px}.wiki-search{display:flex;align-items:center;gap:8px;margin:14px 0;max-width:720px}.wiki-search input{min-width:0;flex:1;border:1px solid #cfcfda;border-radius:7px;padding:9px 11px;font:inherit}.wiki-layout{display:grid;grid-template-columns:minmax(210px,280px) minmax(0,1fr);gap:22px;border-top:1px solid #e3e3e8;padding-top:18px}.wiki-layout nav{display:flex;min-width:0;flex-direction:column;align-items:stretch;gap:5px}.wiki-layout nav h4,.wiki-article h4{margin:0 0 10px;font-size:13px}.wiki-layout nav button{text-align:left;color:#333;overflow-wrap:anywhere}.wiki-layout nav button.active{background:#eeeef8;border-color:#9995d9}.wiki-layout nav small{display:block;color:#6863a1;margin-bottom:3px}.search-warning{margin:0 0 7px;padding:7px 9px;border-radius:6px;background:#fff4dc;color:#815200;font-size:12px}.search-result{display:flex;flex-direction:column;align-items:stretch;gap:5px}.search-result-heading{display:flex;align-items:baseline;gap:7px}.search-result-heading small{display:inline;margin:0}.match-fields{color:#655fa4;font-size:11px}.matched-claim,.omitted-claims{color:#555;font-size:12px;line-height:1.45}.omitted-claims{color:#777}.wiki-article{min-width:0}.wiki-article label{display:block;font-size:12px;margin:10px 0}.wiki-article input,.wiki-article textarea{display:block;width:100%;margin-top:5px;border:1px solid #d5d5dd;border-radius:5px;padding:9px;font:inherit}.page-body,.compare pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.7 inherit;background:#fafafd;border:1px solid #e6e6eb;border-radius:6px;padding:14px}.claims,.history,.compare{margin-top:22px;border-top:1px solid #e7e7ec;padding-top:15px}.claim{margin:12px 0;padding:3px 5px;border-radius:5px;font-size:12px;transition:background-color .2s ease}.claim-highlight{background:#fff1b8}.claim p{margin:5px 0}.claim small{display:block;color:#777}.verified{color:#267356}.needs_review{color:#b05b20}.version-row{margin:5px 0}.version-row button:first-child{flex:1;text-align:left}.compare-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.compare-grid pre{max-height:300px;overflow:auto}.button-row{justify-content:flex-end}.empty{color:#777;font-size:13px}@media(max-width:650px){.wiki-search{flex-wrap:wrap}.wiki-search input{flex-basis:100%}.wiki-layout,.compare-grid{grid-template-columns:1fr}.wiki-layout nav{max-height:320px;overflow:auto}}
+.wiki-metadata{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px}.wiki-metadata div{display:flex;gap:5px;padding:6px 8px;background:#f6f6fb;border:1px solid #e1e1eb;border-radius:5px;font-size:12px}.wiki-metadata dt{color:#666}.wiki-metadata dd{margin:0;color:#333}.summary-section{margin:16px 0;padding:14px;border:1px solid #e7e7ec;border-radius:7px;background:#fff}.summary-section h4{margin-bottom:6px}.summary-section p{margin:0 0 9px;white-space:pre-wrap;line-height:1.7}.section-sources-toggle{margin-left:10px}.section-sources{margin-top:9px;font-size:12px}.section-sources small{display:block;color:#777}@media(max-width:650px){.wiki-metadata{display:grid;grid-template-columns:1fr}.wiki-metadata div{overflow-wrap:anywhere}.section-sources-toggle{margin-left:6px}}
 .source-link{border:0!important;padding:3px 0!important;text-decoration:underline;background:transparent!important}
 </style>

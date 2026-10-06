@@ -63,16 +63,34 @@ export interface WikiClaim {
   claim_type: 'summary_fact' | 'topic_fact' | 'source_excerpt' | 'manual'
   trust_state: 'verified' | 'needs_review'
   reason: string | null
-  sources: Array<{
-    document_id: string
-    document_version_id: string
-    chunk_id: string | null
-    document_title: string
-    heading_path: string[]
-    page_start: number | null
-    page_end: number | null
-    valid: boolean
-  }>
+  sources: WikiPresentationSource[]
+}
+
+export interface WikiPresentationSource {
+  document_id: string
+  document_version_id: string
+  chunk_id: string | null
+  document_title: string
+  heading_path: string[]
+  page_start: number | null
+  page_end: number | null
+  valid: boolean
+}
+
+export interface WikiSummarySection {
+  id: string
+  title: string
+  text: string
+  position: number
+  trust_state: 'verified' | 'needs_review'
+  reason: string | null
+  sources: WikiPresentationSource[]
+}
+
+export interface WikiMetadataItem {
+  key: string
+  label: string
+  value: string
 }
 
 export interface WikiPage extends WikiPageSummary {
@@ -80,6 +98,8 @@ export interface WikiPage extends WikiPageSummary {
   content: string
   summary: string
   origin: 'pipeline' | 'user' | 'revert'
+  summary_sections: WikiSummarySection[]
+  metadata: WikiMetadataItem[]
   claims: WikiClaim[]
 }
 

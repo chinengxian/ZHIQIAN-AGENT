@@ -4,14 +4,18 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
+from pymilvus import MilvusException  # type: ignore[import-untyped]
 
 from agent_api.core.config import EmbeddingProvider, ModelProvider, Settings
 from agent_api.core.lifespan import create_lifespan
+from agent_api.knowledge.infrastructure.milvus.wiki_index import build_wiki_milvus_schema
 from agent_api.knowledge.infrastructure.startup import (
     KnowledgeStartup,
     StartupCheck,
     StartupCheckError,
+    WikiMilvusStartupCheck,
     build_milvus_schema,
+    create_knowledge_startup,
     validate_milvus_description,
 )
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
@@ -49,6 +53,7 @@ def enabled_settings(tmp_path: Path) -> Settings:
         embedding_api_key=SecretStr("embedding-secret"),
         embedding_model="embedding-model",
         embedding_dimension=1024,
+        wiki_index_enabled=True,
         _env_file=None,  # type: ignore[call-arg]
     )
 
@@ -166,3 +171,151 @@ def test_milvus_validation_rejects_dimension_mismatch() -> None:
 
     with pytest.raises(RuntimeError, match="dimension"):
         validate_milvus_description(description, expected_dimension=1024)
+
+
+class FakeStartupMilvusClient:
+    def __init__(
+        self,
+        *,
+        collections: dict[str, dict[str, object]] | None = None,
+        aliases: dict[str, str] | None = None,
+    ) -> None:
+        self.collections = dict(collections or {})
+        self.aliases = dict(aliases or {})
+        self.created_collections: list[str] = []
+        self.created_aliases: list[tuple[str, str]] = []
+        self.altered_aliases: list[tuple[str, str]] = []
+        self.dropped_collections: list[str] = []
+        self.close_calls = 0
+
+    def has_collection(self, collection_name: str) -> bool:
+        return collection_name in self.collections
+
+    def create_collection(
+        self,
+        collection_name: str,
+        schema: object,
+        index_params: object,
+    ) -> None:
+        del index_params
+        self.collections[collection_name] = schema.to_dict()  # type: ignore[attr-defined]
+        self.created_collections.append(collection_name)
+
+    def describe_collection(self, collection_name: str) -> dict[str, object]:
+        return self.collections[collection_name]
+
+    def describe_alias(self, alias: str) -> dict[str, str]:
+        if alias not in self.aliases:
+            raise MilvusException(message="alias not found")
+        return {"alias": alias, "collection_name": self.aliases[alias]}
+
+    def create_alias(self, collection_name: str, alias: str) -> None:
+        self.aliases[alias] = collection_name
+        self.created_aliases.append((alias, collection_name))
+
+    def alter_alias(self, collection_name: str, alias: str) -> None:
+        self.aliases[alias] = collection_name
+        self.altered_aliases.append((alias, collection_name))
+
+    def drop_collection(self, collection_name: str) -> None:
+        self.dropped_collections.append(collection_name)
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+async def test_wiki_startup_creates_physical_collection_and_first_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeStartupMilvusClient()
+    monkeypatch.setattr(
+        "agent_api.knowledge.infrastructure.startup.MilvusClient",
+        lambda **_: client,
+    )
+    manager = create_knowledge_startup(enabled_settings(tmp_path))
+    wiki_check = next(check for check in manager.checks if check.name == "wiki_milvus")
+
+    assert isinstance(wiki_check, WikiMilvusStartupCheck)
+    await wiki_check.check()
+
+    assert client.created_collections == ["wiki_units_v1"]
+    assert client.created_aliases == [("wiki_units", "wiki_units_v1")]
+    assert client.altered_aliases == []
+    assert client.dropped_collections == []
+
+
+async def test_wiki_startup_keeps_existing_alias_and_collections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema = build_wiki_milvus_schema(1024).to_dict()
+    client = FakeStartupMilvusClient(
+        collections={"wiki_units_v1": schema, "wiki_units_previous": schema},
+        aliases={"wiki_units": "wiki_units_previous"},
+    )
+    monkeypatch.setattr(
+        "agent_api.knowledge.infrastructure.startup.MilvusClient",
+        lambda **_: client,
+    )
+    manager = create_knowledge_startup(enabled_settings(tmp_path))
+    wiki_check = next(check for check in manager.checks if check.name == "wiki_milvus")
+
+    await wiki_check.check()
+
+    assert client.aliases == {"wiki_units": "wiki_units_previous"}
+    assert client.created_collections == []
+    assert client.created_aliases == []
+    assert client.altered_aliases == []
+    assert client.dropped_collections == []
+
+
+async def test_wiki_startup_rejects_missing_existing_alias_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema = build_wiki_milvus_schema(1024).to_dict()
+    client = FakeStartupMilvusClient(
+        collections={"wiki_units_v1": schema},
+        aliases={"wiki_units": "wiki_units_missing"},
+    )
+    monkeypatch.setattr(
+        "agent_api.knowledge.infrastructure.startup.MilvusClient",
+        lambda **_: client,
+    )
+    manager = create_knowledge_startup(enabled_settings(tmp_path))
+    wiki_check = next(check for check in manager.checks if check.name == "wiki_milvus")
+
+    with pytest.raises(RuntimeError, match="target collection"):
+        await wiki_check.check()
+
+    assert client.created_aliases == []
+    assert client.altered_aliases == []
+    assert client.dropped_collections == []
+
+
+async def test_wiki_startup_rejects_existing_alias_dimension_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured_schema = build_wiki_milvus_schema(1024).to_dict()
+    incompatible_schema = build_wiki_milvus_schema(768).to_dict()
+    client = FakeStartupMilvusClient(
+        collections={
+            "wiki_units_v1": configured_schema,
+            "wiki_units_previous": incompatible_schema,
+        },
+        aliases={"wiki_units": "wiki_units_previous"},
+    )
+    monkeypatch.setattr(
+        "agent_api.knowledge.infrastructure.startup.MilvusClient",
+        lambda **_: client,
+    )
+    manager = create_knowledge_startup(enabled_settings(tmp_path))
+    wiki_check = next(check for check in manager.checks if check.name == "wiki_milvus")
+
+    with pytest.raises(RuntimeError, match="dimension"):
+        await wiki_check.check()
+
+    assert client.altered_aliases == []
+    assert client.dropped_collections == []

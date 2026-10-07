@@ -10,7 +10,7 @@ def embedding_fingerprint(settings: Settings) -> str:
     payload = {
         "dimension": settings.embedding_dimension,
         "index_protocol": settings.wiki_index_protocol_version,
-        "model": settings.embedding_model or "",
+        "model": settings.embedding_model,
         "provider": settings.embedding_provider.value,
     }
     encoded = json.dumps(
@@ -29,7 +29,7 @@ def relevance_fingerprint(settings: Settings) -> str:
         "embedding_fingerprint": embedding_fingerprint(settings),
         "keyword_coverage_threshold": settings.wiki_keyword_coverage_threshold,
         "profile": settings.wiki_relevance_profile,
-        "rerank_model": settings.rerank_model or "",
+        "rerank_model": settings.rerank_model,
         "rerank_provider": settings.rerank_provider.value,
         "rerank_threshold": settings.wiki_rerank_threshold,
         "dense_threshold": settings.wiki_dense_threshold,

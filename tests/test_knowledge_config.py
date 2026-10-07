@@ -122,6 +122,30 @@ def test_legacy_wiki_backend_allows_disabled_index(tmp_path: Path) -> None:
     assert settings.wiki_search_backend is WikiSearchBackend.LEGACY
 
 
+@pytest.mark.parametrize("backend", ["shadow", "independent"])
+def test_disabled_knowledge_rejects_non_legacy_backend_without_index(
+    backend: str,
+) -> None:
+    secret = "pure-chat-secret"
+
+    with pytest.raises(ValidationError) as captured:
+        Settings(
+            model_provider=ModelProvider.OPENAI,
+            openai_base_url="https://chat.example.test/v1",
+            openai_api_key=secret,
+            openai_model="chat-model",
+            knowledge_enabled=False,
+            wiki_search_backend=backend,
+            wiki_index_enabled=False,
+            _env_file=None,  # type: ignore[call-arg]
+        )
+
+    error = captured.value
+    assert any(detail["loc"] == ("wiki_index_enabled",) for detail in error.errors())
+    assert secret not in str(error)
+    assert secret not in repr(error)
+
+
 def test_embedding_provider_defaults_to_dashscope() -> None:
     settings = Settings(
         model_provider=ModelProvider.OPENAI,
@@ -187,3 +211,5 @@ def test_disabled_knowledge_preserves_minimal_chat_configuration() -> None:
     )
 
     assert settings.knowledge_enabled is False
+    assert settings.wiki_search_backend is WikiSearchBackend.LEGACY
+    assert settings.wiki_index_enabled is False

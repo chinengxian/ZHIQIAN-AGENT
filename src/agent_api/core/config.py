@@ -226,12 +226,30 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_knowledge_configuration(self) -> Self:
-        """启用知识库时一次性校验所有必需配置，尽量在启动前失败。"""
-
-        if not self.knowledge_enabled:
-            return self
+        """校验全局 Wiki 后端依赖，并在启用知识库时校验基础设施。"""
 
         errors: list[InitErrorDetails] = []
+        # 检索后端与索引开关必须始终一致，即使当前只启用纯聊天模式。
+        if (
+            self.wiki_search_backend is not WikiSearchBackend.LEGACY
+            and not self.wiki_index_enabled
+        ):
+            errors.append(
+                _configuration_error(
+                    "wiki_index_enabled",
+                    "Wiki index must be enabled for the selected search backend",
+                )
+            )
+
+        if not self.knowledge_enabled:
+            if errors:
+                raise ValidationError.from_exception_data(
+                    self.__class__.__name__,
+                    errors,
+                    hide_input=True,
+                )
+            return self
+
         database_url = self.database_url.get_secret_value()
         if not database_url.startswith("postgresql+asyncpg://"):
             errors.append(
@@ -270,14 +288,6 @@ class Settings(BaseSettings):
                     errors.append(
                         _configuration_error(field, "Wiki index configuration must not be blank")
                     )
-        elif self.wiki_search_backend is not WikiSearchBackend.LEGACY:
-            errors.append(
-                _configuration_error(
-                    "wiki_index_enabled",
-                    "Wiki index must be enabled for the selected search backend",
-                )
-            )
-
         if self.embedding_provider is EmbeddingProvider.OPENAI:
             if self.embedding_base_url is None:
                 errors.append(

@@ -17,6 +17,14 @@ def test_embedding_fingerprint_is_stable_for_same_configuration(tmp_path: Path) 
     assert len(embedding_fingerprint(first)) == 64
 
 
+def test_embedding_fingerprint_distinguishes_none_from_empty_model(tmp_path: Path) -> None:
+    settings = knowledge_settings(tmp_path)
+    missing_model = settings.model_copy(update={"embedding_model": None})
+    empty_model = settings.model_copy(update={"embedding_model": ""})
+
+    assert embedding_fingerprint(missing_model) != embedding_fingerprint(empty_model)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -46,6 +54,16 @@ def test_relevance_fingerprint_is_stable_for_same_configuration(tmp_path: Path) 
 
     assert relevance_fingerprint(first) == relevance_fingerprint(second)
     assert len(relevance_fingerprint(first)) == 64
+
+
+def test_relevance_fingerprint_distinguishes_none_from_empty_rerank_model(
+    tmp_path: Path,
+) -> None:
+    settings = knowledge_settings(tmp_path)
+    missing_model = settings.model_copy(update={"rerank_model": None})
+    empty_model = settings.model_copy(update={"rerank_model": ""})
+
+    assert relevance_fingerprint(missing_model) != relevance_fingerprint(empty_model)
 
 
 @pytest.mark.parametrize(

@@ -33,6 +33,12 @@ class WikiPageSummary(BaseModel):
     current_version_id: UUID | None
 
 
+class WikiAggregationRebuildResponse(BaseModel):
+    knowledge_base_id: UUID
+    topic_pages: int
+    summary_pages: int
+
+
 class WikiSourceResponse(BaseModel):
     document_id: UUID
     document_version_id: UUID
@@ -236,6 +242,16 @@ async def list_pages(
         return await service.list_pages(
             knowledge_base_id, page_type=page_type, cursor=cursor, limit=limit
         )
+    except WikiError as error:
+        _raise_http_error(error)
+
+
+@router.post("/rebuild-aggregation", response_model=WikiAggregationRebuildResponse)
+async def rebuild_aggregation(
+    knowledge_base_id: UUID, service: WikiServiceDependency
+) -> Any:
+    try:
+        return await service.rebuild_aggregation_pages(knowledge_base_id)
     except WikiError as error:
         _raise_http_error(error)
 

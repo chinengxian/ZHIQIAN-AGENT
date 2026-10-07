@@ -259,6 +259,16 @@ class WikiProcessor:
                 )
             return len(jobs)
 
+    @staticmethod
+    async def rebuild_aggregation_pages(
+        sessions: async_sessionmaker[AsyncSession], knowledge_base_id: UUID
+    ) -> None:
+        """只用已发布摘要重建主题与目录页，不创建模型生成任务。"""
+
+        async with sessions() as session, session.begin():
+            await WikiProcessor._rebuild_topic_pages(session, knowledge_base_id)
+            await WikiProcessor._rebuild_index(session, knowledge_base_id)
+
     async def run(self, job_id: UUID) -> None:
         context = await self._claim(job_id)
         if context is None:
@@ -742,7 +752,55 @@ class WikiProcessor:
             selected: list[
                 tuple[WikiPage, WikiClaim, list[WikiClaimSource]]
             ] = []
+            selected_claim_ids: set[UUID] = set()
+            selected_sections: list[
+                tuple[WikiPage, WikiClaim, str, list[WikiClaimSource]]
+            ] = []
+            selected_section_ids: set[UUID] = set()
             for page, version, topic_source_ids in items:
+                raw_sections = version.generation_metadata.get("summary_sections", [])
+                section_titles = {
+                    item["claim_key"]: item["title"]
+                    for item in raw_sections
+                    if isinstance(item, dict)
+                    and isinstance(item.get("claim_key"), str)
+                    and isinstance(item.get("title"), str)
+                } if isinstance(raw_sections, list) else {}
+                section_claims = list(
+                    await session.scalars(
+                        select(WikiClaim)
+                        .where(
+                            WikiClaim.page_version_id == version.id,
+                            WikiClaim.trust_state == "verified",
+                            WikiClaim.claim_type == "summary_section",
+                        )
+                        .order_by(WikiClaim.position, WikiClaim.id)
+                    )
+                )
+                for source_section in section_claims:
+                    section_sources = list(
+                        await session.scalars(
+                            select(WikiClaimSource).where(
+                                WikiClaimSource.claim_id == source_section.id
+                            )
+                        )
+                    )
+                    if not any(
+                        source.chunk_id in topic_source_ids for source in section_sources
+                    ):
+                        continue
+                    # 同一摘要段落可能被多个等价主题别名命中，只保留一个可读段落。
+                    if source_section.id in selected_section_ids:
+                        continue
+                    selected_section_ids.add(source_section.id)
+                    selected_sections.append(
+                        (
+                            page,
+                            source_section,
+                            section_titles.get(source_section.claim_key, "概述"),
+                            section_sources,
+                        )
+                    )
                 claims = list(
                     await session.scalars(
                         select(WikiClaim)
@@ -765,15 +823,27 @@ class WikiProcessor:
                     )
                     if not any(source.chunk_id in topic_source_ids for source in sources):
                         continue
+                    # 同一摘要可能以多个等价别名归入本主题，结论仅保留一次。
+                    if source_claim.id in selected_claim_ids:
+                        continue
+                    selected_claim_ids.add(source_claim.id)
                     selected.append((page, source_claim, sources))
                     page_claims.append(f"- {source_claim.text}")
-                if page_claims:
+                page_sections = [
+                    item for item in selected_sections if item[0].id == page.id
+                ]
+                if page_claims or page_sections:
+                    readable_blocks = [
+                        value
+                        for _, section, section_title, _ in page_sections
+                        for value in (f"### {section_title}", "", section.text)
+                    ]
                     lines.extend(
                         [
                             "",
                             f"## {page.title}",
                             "",
-                            *page_claims,
+                            *(readable_blocks or page_claims),
                             "",
                             f"参见 [[{page.slug}|{page.title}]]",
                         ]
@@ -790,6 +860,27 @@ class WikiProcessor:
                 content="\n".join(lines),
                 summary=f"{len({item[0].id for item in items})} 篇文档涉及 {title}",
                 metadata={
+                    "summary_sections": [
+                        {
+                            "claim_key": f"section-{position + 1}",
+                            "title": f"{source_page.title} · {section_title}",
+                        }
+                        for position, (source_page, _, section_title, _) in enumerate(
+                            selected_sections
+                        )
+                    ],
+                    "presentation_metadata": [
+                        {
+                            "key": "document_count",
+                            "label": "涉及文档",
+                            "value": str(len({item[0].id for item in items})),
+                        },
+                        {
+                            "key": "verified_fact_count",
+                            "label": "已核实事实",
+                            "value": str(len(selected)),
+                        },
+                    ],
                     "summary_page_ids": [str(item[0].id) for item in items],
                     "summary_version_ids": [str(item[1].id) for item in items],
                     "aliases": list(dict.fromkeys(entry["aliases"])),
@@ -806,6 +897,34 @@ class WikiProcessor:
             )
             if not created:
                 continue
+            for position, (_, source_section, _, sources) in enumerate(selected_sections):
+                claim = WikiClaim(
+                    page_version_id=topic_version.id,
+                    claim_key=f"section-{position + 1}",
+                    text=source_section.text,
+                    trust_state=source_section.trust_state,
+                    reason=source_section.reason,
+                    position=position,
+                    claim_type="summary_section",
+                )
+                session.add(claim)
+                await session.flush()
+                for source in sources:
+                    session.add(
+                        WikiClaimSource(
+                            claim_id=claim.id,
+                            document_id=source.document_id,
+                            document_version_id=source.document_version_id,
+                            chunk_id=source.chunk_id,
+                            chunk_kind=source.chunk_kind,
+                            chunk_ordinal=source.chunk_ordinal,
+                            content_sha256=source.content_sha256,
+                            document_title=source.document_title,
+                            heading_path=list(source.heading_path),
+                            page_start=source.page_start,
+                            page_end=source.page_end,
+                        )
+                    )
             for position, (source_page, source_claim, sources) in enumerate(selected):
                 claim = WikiClaim(
                     page_version_id=topic_version.id,

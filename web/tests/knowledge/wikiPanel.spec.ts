@@ -7,6 +7,7 @@ const api = vi.hoisted(() => ({
   listWikiPages: vi.fn(),
   listWikiJobs: vi.fn(),
   searchWiki: vi.fn(),
+  rebuildWikiAggregation: vi.fn(),
   getWikiPage: vi.fn(),
   listWikiVersions: vi.fn(),
 }))
@@ -31,6 +32,7 @@ beforeEach(() => {
   })
   api.listWikiPages.mockResolvedValue([])
   api.listWikiJobs.mockResolvedValue([])
+  api.rebuildWikiAggregation.mockResolvedValue({ topic_pages: 1, summary_pages: 1 })
   api.searchWiki.mockResolvedValue({
     pages: [{
       id: 'page-auth',
@@ -228,4 +230,65 @@ it('为旧页面清理 Markdown 展示符号', async () => {
   expect(wrapper.text()).toContain('旧标题')
   expect(wrapper.text()).toContain('• 旧事实')
   expect(wrapper.text()).not.toContain('[^claim-1-source-1]')
+})
+
+it('首页显示主题和文档摘要导航卡而不是 Markdown 目录', async () => {
+  api.listWikiPages.mockResolvedValueOnce([
+    { id: 'page-index', knowledge_base_id: 'base', slug: 'index/home', page_type: 'index', title: 'Wiki 目录', current_version_id: 'version-index' },
+    { id: 'page-topic', knowledge_base_id: 'base', slug: 'topic/authentication', page_type: 'topic', title: '身份认证', current_version_id: 'version-topic' },
+    { id: 'page-summary', knowledge_base_id: 'base', slug: 'summary/doc1', page_type: 'summary', title: '身份规范', current_version_id: 'version-summary' },
+  ])
+  api.getWikiPage.mockResolvedValueOnce({
+    id: 'page-index', knowledge_base_id: 'base', slug: 'index/home', page_type: 'index', current_version_id: 'version-index', version_no: 1,
+    title: 'Wiki 目录', content: '# Wiki 目录\n- [[topic/authentication|身份认证]]', summary: '知识库 Wiki 目录', origin: 'pipeline', summary_sections: [], metadata: [], claims: [],
+  })
+
+  const wrapper = mountPanel()
+  await flushPromises()
+  await wrapper.get('[data-page-id="page-index"]').trigger('click')
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('主题入口')
+  expect(wrapper.text()).toContain('文档摘要入口')
+  expect(wrapper.text()).toContain('身份认证')
+  expect(wrapper.text()).not.toContain('[[topic/authentication|身份认证]]')
+})
+
+it('主题页默认显示摘要段落并把原子事实收进折叠区', async () => {
+  api.listWikiPages.mockResolvedValueOnce([
+    { id: 'page-summary', knowledge_base_id: 'base', slug: 'summary/doc1', page_type: 'summary', title: '身份规范', current_version_id: 'version-summary' },
+  ])
+  api.getWikiPage.mockResolvedValueOnce({
+    id: 'page-auth', knowledge_base_id: 'base', slug: 'topic/authentication', page_type: 'topic', current_version_id: 'version-auth', version_no: 2,
+    title: '身份认证', content: '旧事实清单', summary: '身份认证主题', origin: 'pipeline',
+    metadata: [{ key: 'document_count', label: '涉及文档', value: '1' }],
+    summary_sections: [{ id: 'section-topic', title: '身份规范 · 概述', text: '组织要求使用唯一身份。', position: 0, trust_state: 'verified', reason: null, sources: [] }],
+    claims: [{ id: 'claim-topic', claim_key: 'doc:summary-1', text: '每名使用者必须使用唯一身份。', position: 0, claim_type: 'topic_fact', trust_state: 'verified', reason: null, sources: [] }],
+  })
+  const wrapper = mountPanel()
+  await flushPromises()
+  await wrapper.get('input[aria-label="搜索 Wiki"]').setValue('身份认证')
+  await wrapper.get('form[aria-label="Wiki 搜索"]').trigger('submit')
+  await flushPromises()
+  await wrapper.get('[data-search-page-id="page-auth"]').trigger('click')
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('组织要求使用唯一身份。')
+  const details = wrapper.get('details')
+  expect(details.attributes('open')).toBeUndefined()
+  await details.get('summary').trigger('click')
+  expect(details.text()).toContain('每名使用者必须使用唯一身份。')
+})
+
+it('可从面板触发不调用模型的聚合页重建', async () => {
+  const wrapper = mountPanel()
+  await flushPromises()
+
+  const rebuildButton = wrapper.findAll('button').find((item) => item.text() === '重建聚合页')
+  expect(rebuildButton).toBeDefined()
+  await rebuildButton!.trigger('click')
+  await flushPromises()
+
+  expect(api.rebuildWikiAggregation).toHaveBeenCalledWith('base')
+  expect(wrapper.text()).toContain('聚合页已重建：1 个主题、1 个文档摘要')
 })

@@ -17,7 +17,6 @@ const draftContent = ref('')
 const busy = ref(false)
 const error = ref('')
 const message = ref('')
-const expandedSource = ref<string | null>(null)
 const searchQuery = ref('')
 const searching = ref(false)
 const searchResult = ref<WikiSearchResult | null>(null)
@@ -31,6 +30,8 @@ const pending = computed(() => versions.value.find((item) => item.review_state =
 const estimate = computed(() => Math.max(0, (config.value?.token_limit ?? 0) - (config.value?.tokens_charged ?? 0) - (config.value?.tokens_reserved ?? 0)))
 const paused = computed(() => jobs.value.filter((item) => item.status === 'paused_budget').length)
 const searchActive = computed(() => searching.value || searchResult.value !== null || Boolean(searchError.value))
+const topicPages = computed(() => pages.value.filter((item) => item.page_type === 'topic'))
+const summaryPages = computed(() => pages.value.filter((item) => item.page_type === 'summary'))
 
 const matchedFieldLabels: Record<string, string> = {
   title: '标题命中',
@@ -138,6 +139,17 @@ async function saveConfig(changes: Partial<Pick<WikiConfig, 'enabled' | 'token_l
   finally { busy.value = false }
 }
 
+// 只重建已发布聚合页，不触发文档模型任务。
+async function rebuildAggregation() {
+  busy.value = true; error.value = ''; message.value = ''
+  try {
+    const result = await knowledgeApi.rebuildWikiAggregation(props.knowledgeBaseId)
+    message.value = `聚合页已重建：${result.topic_pages} 个主题、${result.summary_pages} 个文档摘要`
+    await load()
+  } catch { error.value = '聚合页重建失败，请检查服务状态后重试' }
+  finally { busy.value = false }
+}
+
 async function saveEdit() {
   if (!page.value || !draftTitle.value.trim() || !draftContent.value.trim()) return
   busy.value = true; error.value = ''
@@ -178,6 +190,16 @@ function startEdit() {
   editing.value = true
 }
 
+function sourceRoute(source: WikiPresentationSource) {
+  return {
+    path: `/knowledge/${props.knowledgeBaseId}/documents/${source.document_id}`,
+    query: {
+      version: source.document_version_id,
+      ...(source.chunk_id ? { chunk: source.chunk_id } : {}),
+    },
+  }
+}
+
 function toggleSectionSources(sectionId: string) {
   const next = new Set(expandedSectionSources.value)
   if (next.has(sectionId)) next.delete(sectionId)
@@ -207,6 +229,15 @@ function summarySourceRoute(source: WikiPresentationSource) {
   }
 }
 
+function summaryPageIdForSource(source: WikiPresentationSource) {
+  return summaryPages.value.find((item) => item.slug === `summary/${source.document_id}`)?.id ?? null
+}
+
+async function openSummaryPage(source: WikiPresentationSource) {
+  const pageId = summaryPageIdForSource(source)
+  if (pageId) await openPage(pageId)
+}
+
 watch(() => props.knowledgeBaseId, () => {
   page.value = null
   clearSearch()
@@ -226,13 +257,22 @@ onBeforeUnmount(() => {
   >
     <div class="wiki-toolbar">
       <div><h3>Wiki</h3><p>文档摘要、跨文档主题与目录</p></div>
-      <button
-        type="button"
-        class="quiet"
-        @click="load"
-      >
-        刷新
-      </button>
+      <div class="button-row">
+        <button
+          type="button"
+          class="quiet"
+          :disabled="busy"
+          @click="rebuildAggregation"
+        >
+          重建聚合页
+        </button><button
+          type="button"
+          class="quiet"
+          @click="load"
+        >
+          刷新
+        </button>
+      </div>
     </div>
     <p
       v-if="error"
@@ -375,6 +415,7 @@ onBeforeUnmount(() => {
           </p><button
             v-for="item in pages"
             :key="item.id"
+            :data-page-id="item.id"
             type="button"
             :class="{ active: page?.id === item.id }"
             @click="openPage(item.id)"
@@ -418,7 +459,39 @@ onBeforeUnmount(() => {
           </div>
         </template>
         <template v-else>
-          <template v-if="page.origin === 'pipeline' && page.summary_sections.length">
+          <template v-if="page.page_type === 'index'">
+            <div class="wiki-index">
+              <section>
+                <h4>主题入口</h4>
+                <div class="wiki-index-grid">
+                  <button
+                    v-for="item in topicPages"
+                    :key="item.id"
+                    type="button"
+                    class="wiki-index-card"
+                    @click="openPage(item.id)"
+                  >
+                    <strong>{{ item.title }}</strong><small>打开主题页</small>
+                  </button>
+                </div>
+              </section>
+              <section>
+                <h4>文档摘要入口</h4>
+                <div class="wiki-index-grid">
+                  <button
+                    v-for="item in summaryPages"
+                    :key="item.id"
+                    type="button"
+                    class="wiki-index-card"
+                    @click="openPage(item.id)"
+                  >
+                    <strong>{{ item.title }}</strong><small>打开文档摘要</small>
+                  </button>
+                </div>
+              </section>
+            </div>
+          </template>
+          <template v-else-if="page.origin === 'pipeline' && page.summary_sections.length">
             <dl
               v-if="page.metadata.length"
               class="wiki-metadata"
@@ -457,7 +530,14 @@ onBeforeUnmount(() => {
                     :to="summarySourceRoute(source)"
                   >
                     {{ source.document_title }} · {{ source.valid ? '查看来源' : '来源失效' }}
-                  </RouterLink><small>文档版本 {{ source.document_version_id }} · 分块 {{ source.chunk_id || '无' }} · {{ source.heading_path.join(' / ') || '正文' }}<template v-if="source.page_start"> · 第 {{ source.page_start }} 页</template> · {{ source.valid ? '来源有效' : '来源失效' }}</small>
+                  </RouterLink><button
+                    v-if="summaryPageIdForSource(source)"
+                    type="button"
+                    class="quiet"
+                    @click="openSummaryPage(source)"
+                  >
+                    打开文档摘要
+                  </button><small>文档版本 {{ source.document_version_id }} · 分块 {{ source.chunk_id || '无' }} · {{ source.heading_path.join(' / ') || '正文' }}<template v-if="source.page_start"> · 第 {{ source.page_start }} 页</template> · {{ source.valid ? '来源有效' : '来源失效' }}</small>
                 </div>
               </div>
             </section>
@@ -465,11 +545,12 @@ onBeforeUnmount(() => {
           <pre
             v-else
             class="page-body"
-          >{{ legacyDisplayContent(page.content) }}</pre><section
+          >{{ legacyDisplayContent(page.content) }}</pre><component
             v-if="page.claims.length"
+            :is="page.page_type === 'topic' ? 'details' : 'section'"
             class="claims"
           >
-            <h4>关键事实</h4><div
+            <summary v-if="page.page_type === 'topic'">全部已核实事实（{{ page.claims.length }}）</summary><h4 v-else>关键事实</h4><div
               v-for="claim in page.claims"
               :key="claim.id"
               class="claim"
@@ -480,16 +561,15 @@ onBeforeUnmount(() => {
                 v-for="source in claim.sources"
                 :key="source.document_version_id + source.chunk_id"
               >
-                <button
-                  type="button"
+                <RouterLink
                   class="source-link"
-                  @click="expandedSource = expandedSource === claim.id + source.document_version_id ? null : claim.id + source.document_version_id"
+                  :to="sourceRoute(source)"
                 >
                   {{ source.document_title }} · {{ source.valid ? '查看来源' : '来源失效' }}
-                </button><small v-if="expandedSource === claim.id + source.document_version_id">文档版本 {{ source.document_version_id }} · 分块 {{ source.chunk_id || '无' }} · {{ source.heading_path.join(' / ') || '正文' }}<template v-if="source.page_start"> · 第 {{ source.page_start }} 页</template> · {{ source.valid ? '来源有效' : '来源失效' }}</small>
+                </RouterLink><small>文档版本 {{ source.document_version_id }} · 分块 {{ source.chunk_id || '无' }} · {{ source.heading_path.join(' / ') || '正文' }}<template v-if="source.page_start"> · 第 {{ source.page_start }} 页</template> · {{ source.valid ? '来源有效' : '来源失效' }}</small>
               </div>
             </div>
-          </section>
+          </component>
         </template>
         <section class="history">
           <h4>版本历史</h4><div
@@ -551,4 +631,5 @@ onBeforeUnmount(() => {
 .wiki-panel{padding-top:18px;color:var(--agent-ink);min-width:0}.wiki-toolbar,.setting-line,.article-actions,.button-row,.version-row{display:flex;align-items:center;justify-content:space-between;gap:12px}.wiki-toolbar p,.wiki-settings p{font-size:12px;color:var(--agent-muted);margin:5px 0}.wiki-toolbar h3,.wiki-article h3{margin:0;font-size:18px}.wiki-settings{border:1px solid #e1e1e8;border-radius:8px;padding:15px;margin:17px 0}.setting-line{justify-content:flex-start;flex-wrap:wrap;margin-bottom:10px;font-size:13px}.setting-line strong{margin-right:auto}.setting-line input{width:140px;padding:7px;border:1px solid #d5d5dd;border-radius:5px}.wiki-panel button{cursor:pointer;border:1px solid #d8d8e0;background:#fff;color:#454299;padding:7px 10px;border-radius:6px;font-size:12px}.wiki-panel button:disabled{opacity:.5;cursor:default}.wiki-error{color:#a22920!important;font-size:12px}.wiki-message{color:#227052;font-size:12px}.wiki-jobs{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;font-size:11px;color:#666}.wiki-jobs span{background:#f2f2f7;padding:4px 7px;border-radius:4px}.wiki-search{display:flex;align-items:center;gap:8px;margin:14px 0;max-width:720px}.wiki-search input{min-width:0;flex:1;border:1px solid #cfcfda;border-radius:7px;padding:9px 11px;font:inherit}.wiki-layout{display:grid;grid-template-columns:minmax(210px,280px) minmax(0,1fr);gap:22px;border-top:1px solid #e3e3e8;padding-top:18px}.wiki-layout nav{display:flex;min-width:0;flex-direction:column;align-items:stretch;gap:5px}.wiki-layout nav h4,.wiki-article h4{margin:0 0 10px;font-size:13px}.wiki-layout nav button{text-align:left;color:#333;overflow-wrap:anywhere}.wiki-layout nav button.active{background:#eeeef8;border-color:#9995d9}.wiki-layout nav small{display:block;color:#6863a1;margin-bottom:3px}.search-warning{margin:0 0 7px;padding:7px 9px;border-radius:6px;background:#fff4dc;color:#815200;font-size:12px}.search-result{display:flex;flex-direction:column;align-items:stretch;gap:5px}.search-result-heading{display:flex;align-items:baseline;gap:7px}.search-result-heading small{display:inline;margin:0}.match-fields{color:#655fa4;font-size:11px}.matched-claim,.omitted-claims{color:#555;font-size:12px;line-height:1.45}.omitted-claims{color:#777}.wiki-article{min-width:0}.wiki-article label{display:block;font-size:12px;margin:10px 0}.wiki-article input,.wiki-article textarea{display:block;width:100%;margin-top:5px;border:1px solid #d5d5dd;border-radius:5px;padding:9px;font:inherit}.page-body,.compare pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.7 inherit;background:#fafafd;border:1px solid #e6e6eb;border-radius:6px;padding:14px}.claims,.history,.compare{margin-top:22px;border-top:1px solid #e7e7ec;padding-top:15px}.claim{margin:12px 0;padding:3px 5px;border-radius:5px;font-size:12px;transition:background-color .2s ease}.claim-highlight{background:#fff1b8}.claim p{margin:5px 0}.claim small{display:block;color:#777}.verified{color:#267356}.needs_review{color:#b05b20}.version-row{margin:5px 0}.version-row button:first-child{flex:1;text-align:left}.compare-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.compare-grid pre{max-height:300px;overflow:auto}.button-row{justify-content:flex-end}.empty{color:#777;font-size:13px}@media(max-width:650px){.wiki-search{flex-wrap:wrap}.wiki-search input{flex-basis:100%}.wiki-layout,.compare-grid{grid-template-columns:1fr}.wiki-layout nav{max-height:320px;overflow:auto}}
 .wiki-metadata{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px}.wiki-metadata div{display:flex;gap:5px;padding:6px 8px;background:#f6f6fb;border:1px solid #e1e1eb;border-radius:5px;font-size:12px}.wiki-metadata dt{color:#666}.wiki-metadata dd{margin:0;color:#333}.summary-section{margin:16px 0;padding:14px;border:1px solid #e7e7ec;border-radius:7px;background:#fff}.summary-section h4{margin-bottom:6px}.summary-section p{margin:0 0 9px;white-space:pre-wrap;line-height:1.7}.section-sources-toggle{margin-left:10px}.section-sources{margin-top:9px;font-size:12px}.section-sources small{display:block;color:#777}@media(max-width:650px){.wiki-metadata{display:grid;grid-template-columns:1fr}.wiki-metadata div{overflow-wrap:anywhere}.section-sources-toggle{margin-left:6px}}
 .source-link{border:0!important;padding:3px 0!important;text-decoration:underline;background:transparent!important}
+.wiki-index{display:grid;gap:18px}.wiki-index-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}.wiki-index-card{display:flex!important;flex-direction:column;align-items:flex-start;text-align:left;gap:5px;background:#fafafd!important}.wiki-index-card small{color:#666}.claims summary{cursor:pointer;font-weight:600;padding:4px 0}.section-sources button{margin-left:8px}
 </style>

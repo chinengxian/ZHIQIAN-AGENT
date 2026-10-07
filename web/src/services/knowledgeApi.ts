@@ -1,4 +1,4 @@
-import type { DocumentProgress, KnowledgeBase, KnowledgeDocument, WikiConfig, WikiJob, WikiPage, WikiPageSummary, WikiSearchResult, WikiVersion } from '../types/knowledge'
+import type { DocumentDetail, DocumentPreview, DocumentProgress, DocumentVersionPage, KnowledgeBase, KnowledgeDocument, WikiConfig, WikiJob, WikiPage, WikiPageSummary, WikiSearchResult, WikiVersion } from '../types/knowledge'
 
 const base = '/api/v1'
 
@@ -36,6 +36,11 @@ export const knowledgeApi = {
   updateBase: (id: string, changes: Partial<Pick<KnowledgeBase, 'name' | 'description' | 'enabled'>>) => request<KnowledgeBase>(`/knowledge-bases/${id}`, json('PATCH', changes)),
   deleteBase: (id: string, confirm: boolean) => request<void>(`/knowledge-bases/${id}?confirm=${confirm}`, { method: 'DELETE' }),
   listDocuments: (id: string) => request<KnowledgeDocument[]>(`/knowledge-bases/${id}/documents`),
+  getDocument: (id: string) => request<DocumentDetail>(`/documents/${id}`),
+  listDocumentVersions: (id: string, options: { cursor?: string | null; limit?: number } = {}) =>
+    request<DocumentVersionPage>(`/documents/${id}/versions${query({ cursor: options.cursor, limit: options.limit })}`),
+  previewDocument: (id: string, options: { versionId?: string | null; cursor?: string | null; limit?: number; anchorChunkId?: string | null } = {}) =>
+    request<DocumentPreview>(`/documents/${id}/preview${query({ version_id: options.versionId, cursor: options.cursor, limit: options.limit, anchor_chunk_id: options.anchorChunkId })}`),
   upload: (id: string, file: File, newVersion = false) => {
     const body = new FormData()
     body.append('file', file)
@@ -47,6 +52,7 @@ export const knowledgeApi = {
   getWikiConfig: (id: string) => request<WikiConfig>(`/knowledge-bases/${id}/wiki/config`),
   updateWikiConfig: (id: string, changes: Partial<Pick<WikiConfig, 'enabled' | 'token_limit'>>) => request<WikiConfig>(`/knowledge-bases/${id}/wiki/config`, json('PATCH', changes)),
   listWikiPages: (id: string, cursor?: string) => request<WikiPageSummary[]>(`/knowledge-bases/${id}/wiki/pages?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`),
+  rebuildWikiAggregation: (id: string) => request<{ knowledge_base_id: string; topic_pages: number; summary_pages: number }>(`/knowledge-bases/${id}/wiki/rebuild-aggregation`, { method: 'POST' }),
   getWikiPage: (id: string, pageId: string) => request<WikiPage>(`/knowledge-bases/${id}/wiki/pages/${pageId}`),
   listWikiVersions: (id: string, pageId: string) => request<WikiVersion[]>(`/knowledge-bases/${id}/wiki/pages/${pageId}/versions`),
   listWikiJobs: (id: string) => request<WikiJob[]>(`/knowledge-bases/${id}/wiki/jobs`),

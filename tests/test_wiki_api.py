@@ -72,6 +72,15 @@ class FakeWikiRetrieval:
         return WikiSearchResult((page,), False, None, None)
 
 
+class FakeWikiService:
+    async def rebuild_aggregation_pages(self, knowledge_base_id):
+        return {
+            "knowledge_base_id": knowledge_base_id,
+            "topic_pages": 2,
+            "summary_pages": 3,
+        }
+
+
 def _app(service: FakeWikiRetrieval) -> FastAPI:
     app = FastAPI()
     app.include_router(router)
@@ -129,6 +138,26 @@ async def test_wiki_search_api_validates_options() -> None:
         ]
 
     assert [response.status_code for response in responses] == [422, 422, 422]
+
+
+async def test_wiki_rebuild_aggregation_api_is_model_free() -> None:
+    """聚合页重建接口只返回页面计数，不应进入文档生成任务。"""
+
+    base_id = uuid4()
+    app = _app(FakeWikiRetrieval())
+    app.state.wiki_service = FakeWikiService()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/knowledge-bases/{base_id}/wiki/rebuild-aggregation"
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "knowledge_base_id": str(base_id),
+        "topic_pages": 2,
+        "summary_pages": 3,
+    }
 
 
 def test_page_response_exposes_sections_and_metadata_separately_from_claims() -> None:

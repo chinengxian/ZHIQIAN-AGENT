@@ -47,6 +47,11 @@ class FakeWikiGenerator:
                     f"{title} 的身份与访问控制要求。",
                     (1,),
                 ),
+                WikiGeneratedSection(
+                    "核心要求",
+                    f"{title} 要求以来源证据支撑访问控制。",
+                    (1,),
+                ),
             ),
             summary_claims=(
                 WikiGeneratedClaim(f"{title} 讨论共同主题。", (1,)),
@@ -63,8 +68,25 @@ class FakeWikiGenerator:
         )
 
 
+class DuplicateTopicWikiGenerator(FakeWikiGenerator):
+    """模拟模型用不同别名重复标记同一主题。"""
+
+    async def generate(self, title: str, excerpts: list[str]) -> WikiGeneration:
+        generation = await super().generate(title, excerpts)
+        topic = generation.topics[0]
+        return WikiGeneration(
+            summary_sections=generation.summary_sections,
+            summary_claims=generation.summary_claims,
+            topics=(
+                topic,
+                WikiGeneratedTopic("共享主题", ("共同主题",), topic.source_indices),
+            ),
+            measured_tokens=generation.measured_tokens,
+        )
+
+
 @pytest.mark.knowledge_integration
-async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() -> None:
+async def test_wiki_deduplicates_repeated_topic_membership_and_keeps_review_boundary() -> None:
     url = os.environ.get("AGENT_WIKI_TEST_DATABASE_URL")
     if not url:
         pytest.skip("需要独立 Wiki 测试数据库 URL")
@@ -144,7 +166,7 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
                 )
             )
         assert len(jobs) == 2
-        processor = WikiProcessor(database.session_factory, FakeWikiGenerator())
+        processor = WikiProcessor(database.session_factory, DuplicateTopicWikiGenerator())
         for job in jobs:
             await processor.run(job.id)
         pages = await service.list_pages(knowledge_base_id)
@@ -153,12 +175,15 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
         assert [page["page_type"] for page in pages].count("index") == 1
         topic = next(page for page in pages if page["page_type"] == "topic")
         detail = await service.get_page(knowledge_base_id, topic["id"])
+        assert detail["summary_sections"]
+        assert all(section["sources"] for section in detail["summary_sections"])
         assert detail["claims"]
         assert all(claim["trust_state"] == "verified" for claim in detail["claims"])
         assert all(claim["claim_type"] == "topic_fact" for claim in detail["claims"])
         assert [claim["position"] for claim in detail["claims"]] == list(
             range(len(detail["claims"]))
         )
+        assert len({claim["id"] for claim in detail["claims"]}) == len(detail["claims"])
         assert any(claim["text"] == "文档尾部证据 13。" for claim in detail["claims"])
         async with database.session_factory() as session:
             aliases = list(
@@ -247,6 +272,16 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
             source["document_version_id"] == next_version_id
             for claim in refreshed_topic["claims"]
             for source in claim["sources"]
+        )
+        jobs_before_rebuild = await service.list_jobs(knowledge_base_id)
+        tokens_before_rebuild = (await service.get_config(knowledge_base_id))["tokens_charged"]
+        rebuild_result = await service.rebuild_aggregation_pages(knowledge_base_id)
+        assert rebuild_result["knowledge_base_id"] == knowledge_base_id
+        assert [job["id"] for job in await service.list_jobs(knowledge_base_id)] == [
+            job["id"] for job in jobs_before_rebuild
+        ]
+        assert (await service.get_config(knowledge_base_id))["tokens_charged"] == (
+            tokens_before_rebuild
         )
         disabled = await service.update_config(knowledge_base_id, enabled=False, token_limit=None)
         assert disabled["enabled"] is False

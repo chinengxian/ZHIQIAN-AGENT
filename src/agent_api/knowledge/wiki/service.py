@@ -176,6 +176,19 @@ class WikiService:
                 for page in pages
             ]
 
+    async def rebuild_aggregation_pages(self, knowledge_base_id: UUID) -> dict[str, Any]:
+        """基于现有摘要重建聚合页，不触发文档 Wiki 生成或模型计费。"""
+
+        async with self._sessions() as session:
+            await self._base(session, knowledge_base_id)
+        await WikiProcessor.rebuild_aggregation_pages(self._sessions, knowledge_base_id)
+        pages = await self.list_pages(knowledge_base_id)
+        return {
+            "knowledge_base_id": knowledge_base_id,
+            "topic_pages": sum(page["page_type"] == "topic" for page in pages),
+            "summary_pages": sum(page["page_type"] == "summary" for page in pages),
+        }
+
     async def get_page(self, knowledge_base_id: UUID, page_id: UUID) -> dict[str, Any]:
         async with self._sessions() as session:
             await self._base(session, knowledge_base_id)

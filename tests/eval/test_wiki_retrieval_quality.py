@@ -25,6 +25,7 @@ from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.infrastructure.docling.parser import DoclingParser
 from agent_api.knowledge.infrastructure.jobs.repository import SqlAlchemyIngestionRepository
 from agent_api.knowledge.infrastructure.milvus.index import MilvusChunkIndex
+from agent_api.knowledge.infrastructure.startup import MilvusStartupCheck
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
 from agent_api.knowledge.wiki.generator import (
     WikiGeneratedClaim,
@@ -157,13 +158,23 @@ async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
     payload: dict[str, list[dict[str, Any]]] = json.loads(
         CASES_PATH.read_text(encoding="utf-8")
     )
-    settings = settings_for_e2e(tmp_path / "wiki-eval-uploads")
+    collection = f"wiki_eval_{uuid4().hex}"
+    settings = settings_for_e2e(tmp_path / "wiki-eval-uploads").model_copy(
+        update={"milvus_collection": collection}
+    )
     assert WIKI_DATABASE_URL is not None
     database = DatabaseRuntime(WIKI_DATABASE_URL)
     storage = LocalFileStorage(settings.storage_root)
     management = SqlAlchemyKnowledgeManagementService(
         database.session_factory, storage, settings
     )
+    startup_check = MilvusStartupCheck(
+        uri=settings.milvus_uri,
+        token=None,
+        collection=collection,
+        embedding_dimension=settings.embedding_dimension,
+    )
+    await startup_check.check()
     milvus = MilvusClient(uri=settings.milvus_uri)
     index = MilvusChunkIndex(milvus, settings.milvus_collection)
     embedder = DeterministicEmbedding()
@@ -299,5 +310,8 @@ async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
             await index.delete_version(version_id)
         if knowledge_base_id is not None:
             await cleanup_knowledge_base(database, knowledge_base_id)
+        if milvus.has_collection(collection_name=collection):
+            milvus.drop_collection(collection_name=collection)
         milvus.close()
+        await startup_check.close()
         await database.close()

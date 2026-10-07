@@ -2,8 +2,8 @@
 
 - 范围：REQ-006、TASK-027～TASK-031，以及 2026-10-06 Wiki 来源驱动混合检索路线 B
 - 日期：2026-09-22；路线 B 复验于 2026-10-06
-- 环境：Windows、Python 3.11、本地 PostgreSQL/Milvus、Node.js 18.12.0
-- 状态：**路线 B 代码与本地非浏览器质量门通过；独立数据库迁移、真实固定集指标、浏览器回归和真实付费模型质量未完成**
+- 环境：Windows、Python 3.11、本地 Docker PostgreSQL/Redis/Milvus、Node.js 21.1.0
+- 状态：**真实数据库、Worker 与浏览器闭环已复验；固定检索集未达质量门，路线 C 触发；真实付费模型质量未完成**
 
 ## 2026-10-06 路线 B 增量验证
 
@@ -13,6 +13,29 @@
 - 页面标题优先取受限 Front Matter，信息卡仅展示白名单字段；旧页面安全清理 Markdown 标记后兼容展示。
 - 本轮实际结果：后端聚焦 31 passed、前端 36 passed、`npm run lint` 和 `npm run build` 通过。
 - `pytest -q` 在本轮 30 秒执行窗口内未返回可记录的完成结果；独立数据库集成、浏览器与真实模型质量仍为 not_run。
+
+## 2026-10-07 真实闭环复验
+
+- 仅新建并使用 `agent_wiki_test_20261007` 独立 PostgreSQL 测试库；执行 Alembic `upgrade → downgrade(20261006_0003) → upgrade`，最终版本为 `20261007_0004`。既有 `agent` 业务库未迁移。
+- `tests/integration/test_wiki_flow.py` 通过，覆盖可读摘要的页面生成、来源追溯、主题、审核/回滚、额度和停用恢复。
+- `tests/integration/test_wiki_celery.py` 通过：失败 outbox 重试、Docker Redis 投递、真实 Celery Worker 消费与 v2 两阶段摘要生成。模型 stub 每次调用 60 token，实际累计结算为 120 token。
+- 评测和集成测试均清理自己的 Wiki outbox/config；固定评测为每次运行创建并删除唯一 Milvus collection，避免触碰共享 `knowledge_chunks`。
+- `web/tests/e2e/wiki.spec.ts` 桌面/移动 2 passed，验证信息卡、可读摘要分段、按分段展开的来源、版本审核及关闭后的浏览。
+
+### 固定检索集结果（失败，作为路线 C 触发证据）
+
+`tests/eval/test_wiki_retrieval_quality.py -q -s` 使用确定性 grounded generator、真实 PostgreSQL/Milvus 和 16 道题的 3 个查询变体，输出：
+
+```text
+WIKI_EVAL {"page_recall_at_5": 0.3537, "claim_recall_at_8": 0.5196,
+"citation_precision": 0.8395, "synonym_result_consistency": 0.6333,
+"no_answer_false_match_rate": 1.0, "needs_review_leaks": 0,
+"invalid_source_leaks": 0}
+```
+
+- `Page Recall@5` 未达到 0.90，`Claim Recall@8` 未达到 0.85，引用精度、同义查询一致性和无答案抑制也均未达标。
+- 失效来源与待核实结论均未泄漏，可信过滤仍然通过。
+- 因此路线 B 不能作为“真正可用”的检索闭环结论；按既定门槛，路线 C（独立 Wiki 向量索引与评测）现为下一步目标。该路线尚未实施。
 
 ### 已验证能力
 
@@ -45,9 +68,8 @@
 
 ### 未完成与环境边界
 
-- 未设置 `AGENT_WIKI_TEST_DATABASE_URL`，因此没有对独立数据库执行 `upgrade → downgrade → upgrade`，也没有产出真实 `WIKI_EVAL` 指标。一次显式评测尝试发现当前共享数据库仍为旧 schema（缺少 `wiki_claims.position`）；测试已清理数据，未迁移共享库。评测现强制要求独立数据库 URL。
-- 固定评测使用确定性 grounded generator，只隔离验证检索链路；即使后续指标通过，也不能代替真实付费模型的摘要生成质量验收。
-- Wiki 浏览器用例已加入混合搜索路径，但当前 Node.js 18.12.0 不满足 Playwright 1.55 的 Node 20+ 要求，未获得本轮桌面/移动浏览器结果。
+- 固定评测使用确定性 grounded generator，只隔离验证检索链路；本次结果失败，且无论是否通过都不能代替真实付费模型的摘要生成质量验收。
+- 真实付费模型、供应商 token 账单和生产/共享环境迁移均未运行。
 - `npm audit` 因配置的 npm 镜像不实现 audit API 而返回 404；当前虚拟环境未安装 `pip-audit`。这两项不得记为安全扫描通过。
 
 ### 路线 C 状态

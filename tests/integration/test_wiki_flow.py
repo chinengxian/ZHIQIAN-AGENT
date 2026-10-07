@@ -14,6 +14,8 @@ from agent_api.knowledge.infrastructure.database.models import (
     Document,
     DocumentVersion,
     KnowledgeBase,
+    OutboxEvent,
+    WikiConfig,
     WikiJob,
     WikiPage,
     WikiPageAlias,
@@ -363,6 +365,13 @@ async def test_wiki_generates_source_backed_pages_and_keeps_review_boundary() ->
             await service.get_page(knowledge_base_id, topic["id"])
     finally:
         async with database.session_factory() as session, session.begin():
+            job_ids = select(WikiJob.id).where(WikiJob.knowledge_base_id == knowledge_base_id)
+            await session.execute(
+                delete(OutboxEvent).where(OutboxEvent.aggregate_id.in_(job_ids))
+            )
+            await session.execute(
+                delete(WikiConfig).where(WikiConfig.knowledge_base_id == knowledge_base_id)
+            )
             await session.execute(
                 delete(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
             )

@@ -8,7 +8,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import delete, select
@@ -19,6 +19,8 @@ from agent_api.knowledge.infrastructure.database.models import (
     Document,
     DocumentVersion,
     KnowledgeBase,
+    OutboxEvent,
+    WikiConfig,
     WikiJob,
 )
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
@@ -49,6 +51,13 @@ class WikiModelStub(BaseHTTPRequestHandler):
                         "role": "assistant",
                         "content": json.dumps(
                             {
+                                "summary_sections": [
+                                    {
+                                        "title": "概述",
+                                        "text": "这篇文档介绍离线运行。",
+                                        "source_indices": [1],
+                                    }
+                                ],
                                 "summary_claims": [
                                     {
                                         "text": "这篇文档介绍离线运行。",
@@ -97,6 +106,7 @@ async def test_wiki_outbox_event_survives_worker_absence_and_is_consumed() -> No
     thread.start()
     database = DatabaseRuntime(url)
     base_id, document_id, version_id = uuid4(), uuid4(), uuid4()
+    job_id: UUID | None = None
     worker: asyncio.subprocess.Process | None = None
     try:
         async with database.session_factory() as session, session.begin():
@@ -148,7 +158,15 @@ async def test_wiki_outbox_event_survives_worker_absence_and_is_consumed() -> No
             )
         service = WikiService(database.session_factory)
         await service.update_config(base_id, enabled=True, token_limit=10_000)
-        redis_url = "redis://127.0.0.1:6379/15"
+        redis_url = os.environ.get(
+            "AGENT_WIKI_TEST_REDIS_URL", "redis://127.0.0.1:6379/15"
+        )
+        async with database.session_factory() as session:
+            job = await session.scalar(
+                select(WikiJob).where(WikiJob.document_version_id == version_id)
+            )
+            assert job is not None and job.status == "pending"
+            job_id = job.id
         repository = SqlAlchemyOutboxRepository(database.session_factory)
         failed_dispatch = OutboxDispatcher(repository, FailingPublisher())
         assert await failed_dispatch.dispatch_once() == 0
@@ -157,13 +175,13 @@ async def test_wiki_outbox_event_survives_worker_absence_and_is_consumed() -> No
             repository,
             CeleryEventPublisher(redis_url),
         )
-        assert await dispatcher.dispatch_once() >= 1
-        async with database.session_factory() as session:
-            job = await session.scalar(
-                select(WikiJob).where(WikiJob.document_version_id == version_id)
-            )
-            assert job is not None and job.status == "pending"
-            job_id = job.id
+        published = 0
+        for _ in range(10):
+            published = await dispatcher.dispatch_once()
+            if published:
+                break
+            await asyncio.sleep(0.5)
+        assert published >= 1
         environment = os.environ.copy()
         environment.update(
             {
@@ -207,12 +225,19 @@ async def test_wiki_outbox_event_survives_worker_absence_and_is_consumed() -> No
             raise AssertionError("Wiki Worker did not complete queued event")
         pages = await service.list_pages(base_id)
         assert {page["page_type"] for page in pages} == {"summary", "index"}
-        assert (await service.get_config(base_id))["tokens_charged"] == 60
+        assert (await service.get_config(base_id))["tokens_charged"] == 120
     finally:
         if worker is not None:
             worker.terminate()
             await asyncio.wait_for(worker.wait(), timeout=10)
         async with database.session_factory() as session, session.begin():
+            if job_id is not None:
+                await session.execute(
+                    delete(OutboxEvent).where(OutboxEvent.aggregate_id == job_id)
+                )
+            await session.execute(
+                delete(WikiConfig).where(WikiConfig.knowledge_base_id == base_id)
+            )
             await session.execute(delete(KnowledgeBase).where(KnowledgeBase.id == base_id))
         await database.close()
         server.shutdown()

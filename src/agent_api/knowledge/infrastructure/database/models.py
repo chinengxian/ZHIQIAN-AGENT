@@ -737,7 +737,11 @@ class WikiJob(TimestampMixin, Base):
     document_version_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     page_version_id: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True),
-        ForeignKey("wiki_page_versions.id", ondelete="SET NULL"),
+        ForeignKey(
+            "wiki_page_versions.id",
+            name="fk_wiki_jobs_page_version_id",
+            ondelete="SET NULL",
+        ),
         nullable=True,
         comment="独立索引任务关联的 Wiki 页面版本；版本删除时保留任务记录。",
     )

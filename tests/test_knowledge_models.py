@@ -1,4 +1,5 @@
 import importlib.util
+import re
 from pathlib import Path
 from types import ModuleType
 from uuid import UUID
@@ -88,14 +89,31 @@ def test_wiki_independent_index_schema_declares_version_and_job_lifecycle() -> N
     } <= set(versions.c.keys())
     assert versions.c.index_state.default is not None
     assert versions.c.index_state.default.arg == "not_required"
+    assert versions.c.index_state.server_default is not None
+    server_default_sql = str(versions.c.index_state.server_default.arg).strip()
+    assert server_default_sql in {"not_required", "'not_required'"}
     assert {"page_version_id", "embedding_fingerprint", "error_reference"} <= set(
         jobs.c.keys()
     )
-    assert any(
-        isinstance(constraint, CheckConstraint)
-        and constraint.name == "ck_wiki_page_version_index_state"
+    page_version_foreign_keys = list(jobs.c.page_version_id.foreign_keys)
+    assert len(page_version_foreign_keys) == 1
+    assert page_version_foreign_keys[0].target_fullname == "wiki_page_versions.id"
+    assert page_version_foreign_keys[0].ondelete == "SET NULL"
+    index_state_constraint = next(
+        constraint
         for constraint in versions.constraints
+        if isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_wiki_page_version_index_state"
     )
+    index_state_sql = str(index_state_constraint.sqltext)
+    assert "index_state" in index_state_sql
+    assert set(re.findall(r"'([^']+)'", index_state_sql)) == {
+        "not_required",
+        "pending",
+        "indexing",
+        "ready",
+        "failed",
+    }
     assert any(
         index.name == "ix_wiki_jobs_page_version_status"
         and tuple(index.columns.keys()) == ("page_version_id", "status")

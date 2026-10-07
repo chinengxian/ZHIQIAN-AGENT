@@ -9,6 +9,7 @@ export interface KnowledgeBase {
 
 export interface IngestionJob {
   id: string
+  document_version_id?: string | null
   stage: string
   status: string
   progress: number
@@ -25,6 +26,51 @@ export interface KnowledgeDocument {
   status: string
   active_version_id: string | null
   job: IngestionJob | null
+}
+
+export interface DocumentVersion {
+  id: string
+  version_no: number
+  file_size: number
+  status: string
+  parser_name: string | null
+  created_at: string
+  ready_at: string | null
+  error_code: string | null
+  error_reference: string | null
+}
+
+export interface DocumentDetail extends KnowledgeDocument {
+  created_at: string
+  updated_at: string
+  active_version: DocumentVersion | null
+  latest_job: IngestionJob | null
+}
+
+export interface DocumentVersionPage {
+  items: DocumentVersion[]
+  next_cursor: string | null
+}
+
+export interface DocumentPreviewChunk {
+  chunk_id: string
+  ordinal: number
+  display_ordinal: number
+  content: string
+  heading_path: string[]
+  page_start: number | null
+  page_end: number | null
+  anchor_chunk_id: string | null
+  focus_start: number | null
+  focus_end: number | null
+}
+
+export interface DocumentPreview {
+  document_id: string
+  version_id: string | null
+  items: DocumentPreviewChunk[]
+  next_cursor: string | null
+  preview_unavailable_reason: 'processing' | 'failed' | 'content_removed' | null
 }
 
 export interface DocumentProgress {

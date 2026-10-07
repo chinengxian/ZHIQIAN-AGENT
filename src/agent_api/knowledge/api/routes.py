@@ -32,6 +32,24 @@ class ManagementService(Protocol):
 
     async def get_document(self, document_id: UUID) -> Any: ...
 
+    async def list_document_versions(
+        self,
+        document_id: UUID,
+        *,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> Any: ...
+
+    async def preview_document(
+        self,
+        document_id: UUID,
+        *,
+        version_id: UUID | None = None,
+        cursor: str | None = None,
+        limit: int = 10,
+        anchor_chunk_id: UUID | None = None,
+    ) -> Any: ...
+
     async def request_document_action(self, document_id: UUID, action: str) -> Any: ...
 
     async def delete_document(self, document_id: UUID) -> Any: ...
@@ -126,6 +144,62 @@ class DocumentResponse(BaseModel):
     status: str
     active_version_id: UUID | None
     job: IngestionJobResponse | None
+
+
+class DocumentVersionResponse(BaseModel):
+    # 面向浏览器的版本元数据；不包含文件路径、哈希和 Embedding 配置。
+    id: UUID
+    version_no: int
+    file_size: int
+    status: str
+    parser_name: str | None = None
+    created_at: Any
+    ready_at: Any | None = None
+    error_code: str | None = None
+    error_reference: str | None = None
+
+
+class DocumentJobResponse(IngestionJobResponse):
+    # 详情页需要知道最近任务关联的版本，便于解释重试或删除状态。
+    document_version_id: UUID | None = None
+
+
+class DocumentDetailResponse(DocumentResponse):
+    # 单文档详情在列表字段基础上追加安全元数据，保持旧消费者向后兼容。
+    created_at: Any
+    updated_at: Any
+    active_version: DocumentVersionResponse | None = None
+    latest_job: DocumentJobResponse | None = None
+    job: DocumentJobResponse | None = None
+
+
+class DocumentVersionPageResponse(BaseModel):
+    # 版本列表分页响应，cursor 对调用方保持不透明。
+    items: list[DocumentVersionResponse]
+    next_cursor: str | None = None
+
+
+class DocumentPreviewChunkResponse(BaseModel):
+    # 解析正文预览块；正文由前端按纯文本渲染，不能当 HTML 使用。
+    chunk_id: UUID
+    ordinal: int
+    display_ordinal: int
+    content: str
+    heading_path: list[str]
+    page_start: int | None = None
+    page_end: int | None = None
+    anchor_chunk_id: UUID | None = None
+    focus_start: int | None = None
+    focus_end: int | None = None
+
+
+class DocumentPreviewResponse(BaseModel):
+    # 文档正文分页结果；没有正文时用 reason 区分处理中、失败或已清理。
+    document_id: UUID
+    version_id: UUID | None
+    items: list[DocumentPreviewChunkResponse]
+    next_cursor: str | None = None
+    preview_unavailable_reason: str | None = None
 
 
 def get_management_service(request: Request) -> ManagementService:
@@ -269,11 +343,47 @@ async def list_documents(knowledge_base_id: UUID, service: ServiceDependency) ->
         _raise_http_error(error)
 
 
-@router.get("/documents/{document_id}", response_model=DocumentResponse)
+@router.get("/documents/{document_id}", response_model=DocumentDetailResponse)
 async def get_document(document_id: UUID, service: ServiceDependency) -> Any:
     """查询单个文档详情，通常用于查看上传、解析或索引状态。"""
     try:
         return await service.get_document(document_id)
+    except KnowledgeManagementError as error:
+        _raise_http_error(error)
+
+
+@router.get("/documents/{document_id}/versions", response_model=DocumentVersionPageResponse)
+async def list_document_versions(
+    document_id: UUID,
+    service: ServiceDependency,
+    cursor: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+) -> Any:
+    """分页查询文档版本，供详情页切换历史解析结果。"""
+    try:
+        return await service.list_document_versions(document_id, cursor=cursor, limit=limit)
+    except KnowledgeManagementError as error:
+        _raise_http_error(error)
+
+
+@router.get("/documents/{document_id}/preview", response_model=DocumentPreviewResponse)
+async def preview_document(
+    document_id: UUID,
+    service: ServiceDependency,
+    version_id: Annotated[UUID | None, Query()] = None,
+    cursor: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=30)] = 10,
+    anchor_chunk_id: Annotated[UUID | None, Query()] = None,
+) -> Any:
+    """分页读取已解析正文，并可从 Wiki 来源 chunk 定位到上下文块。"""
+    try:
+        return await service.preview_document(
+            document_id,
+            version_id=version_id,
+            cursor=cursor,
+            limit=limit,
+            anchor_chunk_id=anchor_chunk_id,
+        )
     except KnowledgeManagementError as error:
         _raise_http_error(error)
 
@@ -320,6 +430,7 @@ async def delete_document(document_id: UUID, service: ServiceDependency) -> Any:
 @router.get("/knowledge/events/stream")
 async def stream_knowledge_events(service: ServiceDependency) -> StreamingResponse:
     """订阅知识库后台任务事件流，前端用它实时刷新处理进度。"""
+
     async def encode_events() -> AsyncIterator[str]:
         # 按 Server-Sent Events 格式编码，event 字段用于区分进度、完成或失败事件。
         async for event in service.stream_events():

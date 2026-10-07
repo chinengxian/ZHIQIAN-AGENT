@@ -35,3 +35,7 @@
 | TASK-029 | 实现 Wiki 浏览、编辑与审核工作台 | [TASK-029](TASK-029.md) |
 | TASK-030 | 接入 Agent 只读 Wiki 与可信引用过滤 | [TASK-030](TASK-030.md) |
 | TASK-031 | 验证 Wiki 全栈业务闭环 | [TASK-031](TASK-031.md) |
+| TASK-032 | 规划文档详情与 Wiki 来源定位功能 | [TASK-032](TASK-032.md) |
+| TASK-033 | 实现文档详情、版本与正文预览 API | [TASK-033](TASK-033.md) |
+| TASK-034 | 实现前端文档详情与 Wiki 来源跳转 | [TASK-034](TASK-034.md) |
+| TASK-035 | 验证文档查看与 Wiki 来源定位全栈闭环 | [TASK-035](TASK-035.md) |

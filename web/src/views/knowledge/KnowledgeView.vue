@@ -4,11 +4,13 @@ import { useRoute, useRouter } from 'vue-router'
 import { KnowledgeApiError, knowledgeApi } from '../../services/knowledgeApi'
 import { useKnowledge } from '../../composables/useKnowledge'
 import type { KnowledgeBase, KnowledgeDocument } from '../../types/knowledge'
+import DocumentDetailPanel from '../../components/knowledge/DocumentDetailPanel.vue'
 import WikiPanel from './WikiPanel.vue'
 
 const route = useRoute()
 const router = useRouter()
 const selectedId = computed(() => typeof route.params.id === 'string' ? route.params.id : null)
+const selectedDocumentId = computed(() => typeof route.params.documentId === 'string' ? route.params.documentId : null)
 const { bases, documents, loading, error, refreshBases, refreshDocuments } = useKnowledge(selectedId)
 const current = computed(() => bases.value.find((base) => base.id === selectedId.value))
 const baseSearch = ref('')
@@ -33,6 +35,7 @@ const dragging = ref(false)
 const detailTab = ref<'documents' | 'wiki'>('documents')
 
 watch(selectedId, () => { docSearch.value = ''; statusFilter.value = 'all'; detailTab.value = 'documents' })
+watch(selectedDocumentId, (id) => { if (id) detailTab.value = 'documents' }, { immediate: true })
 
 function openBaseDialog(mode: 'create' | 'edit') {
   name.value = mode === 'edit' ? current.value?.name ?? '' : ''
@@ -301,6 +304,11 @@ const stageLabel: Record<string, string> = {
             v-if="detailTab === 'wiki'"
             :knowledge-base-id="current.id"
           />
+          <DocumentDetailPanel
+            v-else-if="selectedDocumentId"
+            :knowledge-base-id="current.id"
+            :document-id="selectedDocumentId"
+          />
           <template v-else>
             <div class="document-toolbar">
               <h3>文档 <span>{{ current.document_count }}</span></h3>
@@ -383,7 +391,12 @@ const stageLabel: Record<string, string> = {
                   aria-hidden="true"
                 ></span>
                 <div class="document-info">
-                  <strong>{{ document.title }}</strong><small>{{ document.filename }}</small>
+                  <RouterLink
+                    class="document-title-link"
+                    :to="`/knowledge/${current.id}/documents/${document.id}`"
+                  >
+                    {{ document.title }}
+                  </RouterLink><small>{{ document.filename }}</small>
                   <div
                     v-if="document.job && ['pending', 'processing'].includes(document.status)"
                     class="progress-wrap"
@@ -405,6 +418,17 @@ const stageLabel: Record<string, string> = {
                   :class="document.status"
                 >{{ stageLabel[document.status] || document.status }}</span>
                 <div class="document-actions">
+                  <RouterLink
+                    class="document-open-link"
+                    :to="`/knowledge/${current.id}/documents/${document.id}`"
+                    title="查看详情"
+                    :aria-label="`查看 ${document.title} 详情`"
+                  >
+                    <span
+                      class="mdi mdi-eye-outline"
+                      aria-hidden="true"
+                    ></span>
+                  </RouterLink>
                   <button
                     v-if="document.status === 'failed'"
                     type="button"
@@ -535,14 +559,14 @@ button { cursor:pointer; } button:disabled { opacity:.5; cursor:default; }
 .base-meta, .base-status { font-size:12px; color:var(--agent-muted); }
 .base-status { color:#247054; }.base-status.disabled { color:#888; }
 .detail { padding:23px 0 0 28px; min-width:0; }.detail-header { align-items:flex-start; padding-bottom:22px; border-bottom:1px solid #e5e5e9; }
-.detail-header p { overflow-wrap:anywhere; }.detail-actions button, .document-actions button { border:0; background:transparent; color:#5c5c66; width:34px; height:34px; border-radius:6px; font-size:19px; }
+.detail-header p { overflow-wrap:anywhere; }.detail-actions button, .document-actions button, .document-open-link { border:0; background:transparent; color:#5c5c66; width:34px; height:34px; border-radius:6px; font-size:19px; }
 .detail-tabs { display:flex; gap:18px; border-bottom:1px solid #e4e4eb; margin-top:14px; }.detail-tabs button { border:0; background:none; color:#666; padding:12px 5px; font-size:13px; }.detail-tabs button[aria-selected="true"] { color:#5552bf; border-bottom:2px solid #5552bf; font-weight:600; }
-.detail-actions button:hover, .document-actions button:hover { background:#e9e9ee; }
+.detail-actions button:hover, .document-actions button:hover, .document-open-link:hover { background:#e9e9ee; }
 .document-toolbar { margin:22px 0 15px; flex-wrap:wrap; }.document-toolbar h3 span { color:var(--agent-muted); font-weight:400; }
 .toolbar-fields { flex-wrap:wrap; }.toolbar-fields .search-field { width:170px; }.filter-label { display:flex; align-items:center; gap:6px; color:#666; font-size:12px; }.filter-label select { padding:7px; border:1px solid #dfdfe4; border-radius:6px; background:#fff; font:inherit; }
 .upload-zone { display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:6px; min-height:78px; padding:14px; border:1px dashed #b9b9c5; border-radius:6px; background:#fafafd; font-size:13px; color:#62626c; }
 .upload-zone.dragging { border-color:#5552bf; background:#f0f0ff; }.upload-zone .mdi { font-size:21px; color:#5552bf; }.upload-zone button { border:0; background:none; color:#4340ae; font-weight:600; }.upload-zone small { width:100%; text-align:center; font-size:11px; }.file-input { position:absolute; width:1px; height:1px; opacity:0; }
-.document-list { margin-top:15px; }.document-row { display:flex; align-items:center; gap:12px; min-width:0; padding:14px 4px; border-bottom:1px solid #e9e9ed; }.file-icon { font-size:23px; color:#6665a7; }.document-info { min-width:0; flex:1; }.document-info strong, .document-info small { display:block; overflow-wrap:anywhere; }.document-info strong { font-size:13px; }.document-info small { font-size:11px; color:var(--agent-muted); margin-top:4px; }.document-status { font-size:11px; white-space:nowrap; color:#60606a; }.document-status.ready { color:#217154; }.document-status.failed, .failure { color:#a22920 !important; }.document-actions { gap:0; }
+.document-list { margin-top:15px; }.document-row { display:flex; align-items:center; gap:12px; min-width:0; padding:14px 4px; border-bottom:1px solid #e9e9ed; }.file-icon { font-size:23px; color:#6665a7; }.document-info { min-width:0; flex:1; }.document-info strong, .document-info small, .document-title-link { display:block; overflow-wrap:anywhere; }.document-title-link { color:inherit; text-decoration:none; font-size:13px; font-weight:700; }.document-title-link:hover { color:#5552bf; }.document-info small { font-size:11px; color:var(--agent-muted); margin-top:4px; }.document-status { font-size:11px; white-space:nowrap; color:#60606a; }.document-status.ready { color:#217154; }.document-status.failed, .failure { color:#a22920 !important; }.document-actions { gap:0; }.document-open-link { display:grid; place-items:center; text-decoration:none; }
 .progress-wrap { margin-top:7px; color:#5552bf; font-size:11px; }.progress-wrap progress { display:block; width:100%; height:4px; margin-top:4px; accent-color:#5552bf; }.notice { padding:10px 12px; background:#eef6f0; color:#226344; margin-bottom:15px; font-size:13px; }.notice.error { background:#fff1ef; color:#a22920; }.notice button { border:0; background:transparent; color:inherit; text-decoration:underline; }.empty { color:#777; font-size:13px; padding:22px 12px; }.detail-empty { text-align:center; padding:70px 15px; }
 .dialog-backdrop { position:fixed; inset:0; z-index:20; display:grid; place-items:center; background:#0006; padding:15px; }.dialog { width:min(420px,100%); padding:24px; background:#fff; border-radius:8px; box-shadow:0 20px 65px #0003; }.dialog h2 { font-size:18px; margin-bottom:18px; }.dialog p { font-size:13px; line-height:1.6; }.dialog label { display:block; font-size:12px; color:#555; margin:12px 0; }.dialog input,.dialog textarea { display:block; width:100%; margin-top:6px; padding:9px; border:1px solid #cfcfd6; border-radius:5px; font:inherit; color:#222; }.dialog-actions { justify-content:flex-end; margin-top:23px; }.dialog-actions button:not(.primary-button) { padding:8px 14px; border:1px solid #d7d7dc; background:#fff; border-radius:6px; }
 @media (max-width:850px) { .knowledge-page { padding:64px 20px 50px; }.knowledge-grid { grid-template-columns:1fr; }.base-list { border-right:0; border-bottom:1px solid #e2e2e7; padding:15px 0; }.detail { padding:22px 0; }.base-row { display:flex; align-items:center; }.base-title { flex:1; } }

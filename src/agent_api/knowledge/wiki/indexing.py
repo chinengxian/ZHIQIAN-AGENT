@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Protocol
+from math import isfinite
+from typing import Protocol, TypeVar
 from uuid import UUID
 
 from agent_api.core.config import Settings
@@ -13,6 +15,7 @@ from agent_api.knowledge.infrastructure.milvus import WikiIndexedUnit
 
 _INDEXABLE_CLAIM_TYPES = frozenset({"summary_section", "summary_fact", "topic_fact"})
 _EXECUTABLE_JOB_STATUSES = frozenset({"pending", "retry_wait"})
+_ResultT = TypeVar("_ResultT")
 
 
 class WikiPageLike(Protocol):
@@ -107,6 +110,11 @@ class WikiIndexRepository(Protocol):
         version: WikiPageVersionLike,
     ) -> None: ...
 
+    async def touch_heartbeat(self, job_id: UUID, at: datetime) -> None:
+        """使用独立轻量事务更新时间，不得复用状态机持有的 ORM Session。"""
+
+        ...
+
     async def load_aliases_claims_and_sources(
         self,
         *,
@@ -158,10 +166,20 @@ class _EmbeddingCountMismatch(RuntimeError):
     """Embedding 返回数量与输入文本不一致。"""
 
 
+class _EmbeddingVectorInvalid(RuntimeError):
+    """Embedding 向量为空、维度不符或包含非有限数。"""
+
+
 def _clean(value: str) -> str:
     """清理首尾与换行空白，同时保持正文内部文字不变。"""
 
     return value.strip()
+
+
+def _canonical_text_values(values: Sequence[str]) -> tuple[str, ...]:
+    """清理、去重并排序无层级语义的文本集合。"""
+
+    return tuple(sorted({_clean(value) for value in values if _clean(value)}))
 
 
 def build_unit_content(
@@ -175,8 +193,8 @@ def build_unit_content(
 ) -> str:
     """按固定字段顺序生成可复现的 Wiki 知识单元正文。"""
 
-    clean_aliases = tuple(cleaned for value in aliases if (cleaned := _clean(value)))
-    clean_paths = tuple(cleaned for value in source_paths if (cleaned := _clean(value)))
+    clean_aliases = _canonical_text_values(aliases)
+    clean_paths = _canonical_text_values(source_paths)
     clean_section = _clean(section_title) if section_title else ""
     parts = (
         _clean(page_title),
@@ -231,8 +249,7 @@ def _trusted_claims(claims: Sequence[WikiClaimLike]) -> list[WikiClaimLike]:
         (
             claim
             for claim in claims
-            if claim.trust_state == "verified"
-            and claim.claim_type in _INDEXABLE_CLAIM_TYPES
+            if claim.trust_state == "verified" and claim.claim_type in _INDEXABLE_CLAIM_TYPES
         ),
         key=lambda claim: (claim.position, str(claim.id)),
     )
@@ -263,7 +280,7 @@ def _projection_signature(
         ),
     )
     payload = {
-        "aliases": [_clean(alias) for alias in projection.aliases if _clean(alias)],
+        "aliases": list(_canonical_text_values(projection.aliases)),
         "claims": [
             {
                 "id": str(claim.id),
@@ -272,11 +289,9 @@ def _projection_signature(
                 "position": claim.position,
                 "text_sha256": sha256(_clean(claim.text).encode("utf-8")).hexdigest(),
                 "section_title": _clean(projection.section_titles.get(claim.id, "")),
-                "source_paths": [
-                    _clean(path)
-                    for path in projection.source_paths.get(claim.id, ())
-                    if _clean(path)
-                ],
+                "source_paths": list(
+                    _canonical_text_values(projection.source_paths.get(claim.id, ()))
+                ),
             }
             for claim in claims
         ],
@@ -330,11 +345,19 @@ class WikiIndexService:
         repository: WikiIndexRepository,
         embedder: WikiDocumentEmbedder,
         index: WikiVectorIndex,
+        embedding_dimension: int,
+        heartbeat_interval: float = 30.0,
         now: Callable[[], datetime] | None = None,
     ) -> None:
+        if embedding_dimension <= 0:
+            raise ValueError("wiki_embedding_dimension_invalid")
+        if heartbeat_interval <= 0:
+            raise ValueError("wiki_heartbeat_interval_invalid")
         self._repository = repository
         self._embedder = embedder
         self._index = index
+        self._embedding_dimension = embedding_dimension
+        self._heartbeat_interval = heartbeat_interval
         self._now = now or (lambda: datetime.now(UTC))
 
     async def run(self, job_id: UUID) -> None:
@@ -353,6 +376,10 @@ class WikiIndexService:
             await self._mark_not_required(job, version)
             return
 
+        target_version = version
+        target_version_id = version.id
+        target_page_id = page.id
+        original_fingerprint = job.embedding_fingerprint
         job.status = "running"
         job.stage = "loading"
         job.progress = 10
@@ -364,6 +391,8 @@ class WikiIndexService:
         version.index_error_code = None
         await self._repository.save_state(job, version)
 
+        cleanup_required = False
+        finalizing = False
         try:
             projection = await self._repository.load_aliases_claims_and_sources(
                 page_id=page.id,
@@ -382,29 +411,60 @@ class WikiIndexService:
                 return
 
             await self._advance(job, version, stage="embedding", progress=35)
-            vectors = await self._embedder.embed_documents([unit.content for unit in units])
+            vectors = await self._await_with_heartbeat(
+                job.id,
+                self._embedder.embed_documents([unit.content for unit in units]),
+            )
             if len(vectors) != len(units):
                 raise _EmbeddingCountMismatch
+            self._validate_vectors(vectors)
             indexed_units = [
                 replace(unit, dense_vector=tuple(float(value) for value in vector))
                 for unit, vector in zip(units, vectors, strict=True)
             ]
 
             await self._advance(job, version, stage="writing", progress=70)
-            await self._index.replace_page_version(version.id, indexed_units)
+            cleanup_required = True
+            await self._await_with_heartbeat(
+                job.id,
+                self._index.replace_page_version(target_version_id, indexed_units),
+            )
 
             await self._advance(job, version, stage="verifying", progress=90)
-            written_count = await self._index.count_page_version(version.id)
+            written_count = await self._await_with_heartbeat(
+                job.id,
+                self._index.count_page_version(target_version_id),
+            )
             if written_count != len(indexed_units):
                 raise _IndexCountMismatch
 
             original_signature = _projection_signature(projection, units)
-            job, page, version, fresh_projection = (
-                await self._repository.relock_and_reload_projection(
-                    job_id=job_id,
-                    page_version_id=version.id,
-                )
+            finalizing = True
+            (
+                job,
+                page,
+                version,
+                fresh_projection,
+            ) = await self._repository.relock_and_reload_projection(
+                job_id=job_id,
+                page_version_id=target_version_id,
             )
+            hard_conflict = not self._relocked_state_matches(
+                job=job,
+                page=page,
+                version=version,
+                job_id=job_id,
+                page_id=target_page_id,
+                page_version_id=target_version_id,
+                embedding_fingerprint=original_fingerprint,
+            )
+            if hard_conflict:
+                await self._best_effort_delete(target_version_id)
+                cleanup_required = False
+                conflict_version = version if version.id == target_version_id else target_version
+                await self._mark_state_conflict(job, conflict_version)
+                return
+            target_version = version
             fresh_units = build_index_units(
                 page=page,
                 version=version,
@@ -416,37 +476,114 @@ class WikiIndexService:
             projection_changed = (
                 _projection_signature(fresh_projection, fresh_units) != original_signature
             )
-            target_changed = (
-                page.current_version_id != version.id
-                or job.page_version_id != version.id
-            )
+            target_changed = page.current_version_id != target_version_id
             if target_changed or projection_changed:
-                await self._index.delete_page_version(version.id)
-                await self._mark_superseded(job, version)
+                await self._best_effort_delete(target_version_id)
+                cleanup_required = False
+                await self._mark_superseded(job, target_version)
                 return
 
-            version.index_state = "ready"
-            version.embedding_fingerprint = job.embedding_fingerprint
-            version.indexed_at = self._now()
-            version.index_error_code = None
+            target_version.index_state = "ready"
+            target_version.embedding_fingerprint = original_fingerprint
+            target_version.indexed_at = self._now()
+            target_version.index_error_code = None
             job.status = "succeeded"
             job.stage = "completed"
             job.progress = 100
             job.heartbeat_at = self._now()
             job.error_code = None
             job.error_reference = None
-            await self._repository.save_state(job, version)
+            await self._repository.save_state(job, target_version)
         except Exception as error:
-            await self._mark_failed(job, version, error)
+            if cleanup_required:
+                await self._best_effort_delete(target_version_id)
+            if finalizing and job.status not in {"running", "succeeded"}:
+                return
+            await self._mark_failed(
+                job,
+                target_version,
+                error,
+                failure_stage="finalizing" if finalizing else job.stage,
+            )
 
     @staticmethod
     def _is_executable(job: WikiIndexJobLike, version: WikiPageVersionLike) -> bool:
-        return (
+        normal_start = (
             job.job_type == "page_index"
             and job.page_version_id == version.id
             and job.status in _EXECUTABLE_JOB_STATUSES
             and version.index_state in {"pending", "failed"}
         )
+        recovered_start = (
+            job.job_type == "page_index"
+            and job.page_version_id == version.id
+            and job.status == "retry_wait"
+            and version.index_state == "indexing"
+        )
+        return normal_start or recovered_start
+
+    async def _await_with_heartbeat(
+        self,
+        job_id: UUID,
+        operation: Awaitable[_ResultT],
+    ) -> _ResultT:
+        """等待外部慢操作，并用独立轻量事务维持任务租约。"""
+
+        task = asyncio.ensure_future(operation)
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=self._heartbeat_interval)
+            if task in done:
+                return task.result()
+            try:
+                await self._repository.touch_heartbeat(job_id, self._now())
+            except Exception:
+                # 心跳失败不能取消可能已在远端执行的 Embedding 或 Milvus 写入。
+                continue
+
+    def _validate_vectors(self, vectors: Sequence[Sequence[float]]) -> None:
+        """在 Milvus replace 删除旧数据前完成全部向量校验。"""
+
+        if any(
+            not vector
+            or len(vector) != self._embedding_dimension
+            or any(not isfinite(float(value)) for value in vector)
+            for vector in vectors
+        ):
+            raise _EmbeddingVectorInvalid
+
+    @staticmethod
+    def _relocked_state_matches(
+        *,
+        job: WikiIndexJobLike,
+        page: WikiPageLike,
+        version: WikiPageVersionLike,
+        job_id: UUID,
+        page_id: UUID,
+        page_version_id: UUID,
+        embedding_fingerprint: str | None,
+    ) -> bool:
+        """验证重锁结果仍是启动时的同一索引任务与可信目标。"""
+
+        return (
+            job.id == job_id
+            and job.job_type == "page_index"
+            and job.status == "running"
+            and job.page_version_id == page_version_id
+            and job.embedding_fingerprint == embedding_fingerprint
+            and page.id == page_id
+            and version.id == page_version_id
+            and version.index_state == "indexing"
+            and version.origin != "user"
+            and version.review_state == "published"
+        )
+
+    async def _best_effort_delete(self, page_version_id: UUID) -> None:
+        """尽力清理已 flush 投影，清理异常不得覆盖原始失败。"""
+
+        try:
+            await self._index.delete_page_version(page_version_id)
+        except Exception:
+            return
 
     async def _advance(
         self,
@@ -512,14 +649,39 @@ class WikiIndexService:
         job.error_reference = None
         await self._repository.save_state(job, version)
 
+    async def _mark_state_conflict(
+        self,
+        job: WikiIndexJobLike,
+        version: WikiPageVersionLike,
+    ) -> None:
+        """不覆盖外部终态；仅由仍运行的本任务收敛为可重试失败。"""
+
+        version.index_state = "failed"
+        version.embedding_fingerprint = None
+        version.indexed_at = None
+        version.index_error_code = "index_state_conflict"
+        if job.status == "running":
+            job.status = "retry_wait" if job.attempt_count < job.max_attempts else "failed"
+            job.stage = "failed"
+            job.error_code = "index_state_conflict"
+            job.error_reference = _stable_error_reference(
+                job.id,
+                "finalizing",
+                RuntimeError("index_state_conflict"),
+            )
+        job.heartbeat_at = self._now()
+        await self._repository.save_state(job, version)
+
     async def _mark_failed(
         self,
         job: WikiIndexJobLike,
         version: WikiPageVersionLike,
         error: BaseException,
+        *,
+        failure_stage: str | None = None,
     ) -> None:
-        failure_stage = job.stage
-        error_code = self._error_code(failure_stage, error)
+        failed_at = failure_stage or job.stage
+        error_code = self._error_code(failed_at, error)
         version.index_state = "failed"
         version.embedding_fingerprint = None
         version.indexed_at = None
@@ -528,7 +690,7 @@ class WikiIndexService:
         job.stage = "failed"
         job.heartbeat_at = self._now()
         job.error_code = error_code
-        job.error_reference = _stable_error_reference(job.id, failure_stage, error)
+        job.error_reference = _stable_error_reference(job.id, failed_at, error)
         await self._repository.save_state(job, version)
 
     @staticmethod
@@ -537,11 +699,15 @@ class WikiIndexService:
             return "index_count_mismatch"
         if isinstance(error, _EmbeddingCountMismatch):
             return "embedding_count_mismatch"
+        if isinstance(error, _EmbeddingVectorInvalid):
+            return "embedding_vector_invalid"
         return {
             "loading": "index_loading_failed",
             "embedding": "embedding_failed",
             "writing": "index_write_failed",
             "verifying": "index_verify_failed",
+            "finalizing": "index_finalize_failed",
+            "completed": "index_finalize_failed",
         }.get(stage, "index_failed")
 
 

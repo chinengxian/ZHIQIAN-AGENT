@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -115,10 +116,10 @@ def test_build_unit_content_cleans_whitespace_and_has_stable_field_order() -> No
     content = build_unit_content(
         page_title="  身份认证  ",
         page_type=" summary ",
-        aliases=(" MFA ", "", "  双因素校验\n "),
+        aliases=(" 双因素校验\n ", " MFA ", "", "MFA"),
         section_title=" 登录要求 ",
         claim_text="  必须启用 MFA。\n ",
-        source_paths=(" 身份规范 / 认证 ", "  "),
+        source_paths=(" 身份规范 / 认证 ", "  ", " 安全制度 / 登录 ", " 身份规范 / 认证 "),
     )
 
     assert content == (
@@ -127,7 +128,7 @@ def test_build_unit_content_cleans_whitespace_and_has_stable_field_order() -> No
         "主题别名：MFA、双因素校验\n"
         "段落标题：登录要求\n"
         "必须启用 MFA。\n"
-        "来源路径：身份规范 / 认证"
+        "来源路径：安全制度 / 登录；身份规范 / 认证"
     )
 
 
@@ -232,7 +233,47 @@ async def test_index_service_fails_when_written_count_does_not_match() -> None:
     assert fixture.job.error_code == "index_count_mismatch"
     assert fixture.job.error_reference
     assert "必须启用 MFA" not in fixture.job.error_reference
+    assert fixture.index.deleted == [fixture.version.id]
     assert fixture.calls[-1] == "save:failed"
+
+
+@pytest.mark.asyncio
+async def test_index_service_cleans_write_when_relock_raises() -> None:
+    fixture = _service_fixture(relock_error=RuntimeError("内部数据库地址与正文"))
+
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.index.deleted == [fixture.version.id]
+    assert fixture.job.status == "retry_wait"
+    assert fixture.job.error_code == "index_finalize_failed"
+    assert "内部数据库地址" not in fixture.job.error_reference
+
+
+@pytest.mark.asyncio
+async def test_index_service_cleans_write_when_final_save_fails() -> None:
+    fixture = _service_fixture(fail_save_stage_once="completed")
+
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.index.deleted == [fixture.version.id]
+    assert fixture.version.index_state == "failed"
+    assert fixture.job.status == "retry_wait"
+    assert fixture.job.error_code == "index_finalize_failed"
+
+
+@pytest.mark.asyncio
+async def test_index_service_preserves_original_failure_when_cleanup_fails() -> None:
+    cleanup_message = "清理失败：内部 Milvus 地址"
+    fixture = _service_fixture(
+        index_count=0,
+        delete_error=RuntimeError(cleanup_message),
+    )
+
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.job.error_code == "index_count_mismatch"
+    assert fixture.version.index_error_code == "index_count_mismatch"
+    assert cleanup_message not in fixture.job.error_reference
 
 
 @pytest.mark.asyncio
@@ -256,6 +297,31 @@ async def test_index_service_does_not_expose_write_error_text() -> None:
     assert fixture.job.error_code == "index_write_failed"
     assert fixture.version.index_error_code == "index_write_failed"
     assert sensitive_message not in fixture.job.error_reference
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "vectors",
+    [
+        [[]],
+        [[0.1]],
+        [[0.1, 0.2, 0.3]],
+        [[float("nan"), 0.2]],
+        [[float("inf"), 0.2]],
+        [[float("-inf"), 0.2]],
+    ],
+)
+async def test_index_service_rejects_invalid_vectors_before_index_write(
+    vectors: list[list[float]],
+) -> None:
+    fixture = _service_fixture(vectors=vectors)
+
+    await fixture.service.run(fixture.job.id)
+
+    assert "replace" not in fixture.calls
+    assert fixture.index.units == []
+    assert fixture.job.error_code == "embedding_vector_invalid"
+    assert fixture.version.index_state == "failed"
 
 
 @pytest.mark.asyncio
@@ -372,6 +438,105 @@ async def test_index_service_source_snapshot_order_does_not_change_signature() -
 
     assert fixture.index.deleted == []
     assert fixture.version.index_state == "ready"
+
+
+@pytest.mark.asyncio
+async def test_index_service_alias_and_source_path_order_do_not_change_signature() -> None:
+    fixture = _service_fixture()
+    projection = fixture.repository.projection
+    claim_id = projection.claims[0].id
+    fixture.repository.projection = WikiIndexProjection(
+        aliases=("MFA", "双因素认证", "MFA"),
+        claims=projection.claims,
+        source_paths={claim_id: ("规范 / 登录", "安全制度 / 登录", "规范 / 登录")},
+        section_titles=projection.section_titles,
+        sources=projection.sources,
+    )
+    fixture.repository.fresh_projection = WikiIndexProjection(
+        aliases=("双因素认证", "MFA"),
+        claims=projection.claims,
+        source_paths={claim_id: ("安全制度 / 登录", "规范 / 登录")},
+        section_titles=projection.section_titles,
+        sources=tuple(reversed(projection.sources)),
+    )
+
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.index.deleted == []
+    assert fixture.version.index_state == "ready"
+
+
+@pytest.mark.asyncio
+async def test_index_service_recovers_retry_wait_with_indexing_version() -> None:
+    fixture = _service_fixture()
+    fixture.job.status = "retry_wait"
+    fixture.version.index_state = "indexing"
+
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.version.index_state == "ready"
+    assert fixture.calls.count("replace") == 1
+
+
+@pytest.mark.asyncio
+async def test_index_service_does_not_reenter_running_indexing_job() -> None:
+    fixture = _service_fixture()
+    fixture.job.status = "running"
+    fixture.version.index_state = "indexing"
+
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.calls == ["lock"]
+    assert "replace" not in fixture.calls
+
+
+@pytest.mark.asyncio
+async def test_index_service_touches_heartbeat_during_blocking_embedding() -> None:
+    fixture = _service_fixture(block_embedding=True, heartbeat_interval=0.01)
+    task = asyncio.create_task(fixture.service.run(fixture.job.id))
+    await asyncio.wait_for(fixture.embedder.started.wait(), timeout=1)
+    await asyncio.wait_for(fixture.repository.heartbeat_touched.wait(), timeout=1)
+    fixture.embedder.release.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert fixture.repository.heartbeat_updates
+    assert all(job_id == fixture.job.id for job_id, _ in fixture.repository.heartbeat_updates)
+    assert fixture.version.index_state == "ready"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("conflict_field", "conflict_value"),
+    [
+        ("status", "failed"),
+        ("job_type", "wiki_generate"),
+        ("embedding_fingerprint", "changed"),
+    ],
+)
+async def test_index_service_cleans_write_and_does_not_succeed_on_relock_conflict(
+    conflict_field: str,
+    conflict_value: str,
+) -> None:
+    fixture = _service_fixture()
+    fixture.repository.job_change_before_relock = (conflict_field, conflict_value)
+
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.index.deleted == [fixture.version.id]
+    assert fixture.job.status != "succeeded"
+    assert fixture.version.index_state != "ready"
+
+
+@pytest.mark.asyncio
+async def test_index_service_rejects_different_target_version_returned_after_relock() -> None:
+    fixture = _service_fixture()
+    fixture.repository.returned_version = _version(page_id=fixture.page.id)
+
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.index.deleted == [fixture.version.id]
+    assert fixture.version.index_state == "failed"
+    assert fixture.job.error_code == "index_state_conflict"
 
 
 @pytest.mark.asyncio
@@ -494,6 +659,12 @@ class _FakeRepository:
         self.fresh_projection = projection
         self.saved_states: list[tuple[str, str, int, str]] = []
         self.change_current_version_before_relock = False
+        self.job_change_before_relock: tuple[str, str] | None = None
+        self.relock_error: Exception | None = None
+        self.returned_version: Any = version
+        self.fail_save_stage_once: str | None = None
+        self.heartbeat_updates: list[tuple[UUID, datetime]] = []
+        self.heartbeat_touched = asyncio.Event()
 
     async def lock_job_and_version(self, job_id: UUID) -> tuple[Any, Any, Any] | None:
         self.calls.append("lock")
@@ -503,7 +674,14 @@ class _FakeRepository:
 
     async def save_state(self, job: Any, version: Any) -> None:
         self.calls.append(f"save:{job.stage}")
+        if self.fail_save_stage_once == job.stage:
+            self.fail_save_stage_once = None
+            raise RuntimeError("保存失败，含内部上下文")
         self.saved_states.append((job.status, job.stage, job.progress, version.index_state))
+
+    async def touch_heartbeat(self, job_id: UUID, at: datetime) -> None:
+        self.heartbeat_updates.append((job_id, at))
+        self.heartbeat_touched.set()
 
     async def load_aliases_claims_and_sources(
         self,
@@ -525,18 +703,38 @@ class _FakeRepository:
         self.calls.append("relock_reload")
         assert job_id == self.job.id
         assert page_version_id == self.version.id
+        if self.relock_error is not None:
+            raise self.relock_error
         if self.change_current_version_before_relock:
             self.page.current_version_id = uuid4()
-        return self.job, self.page, self.version, self.fresh_projection
+        if self.job_change_before_relock is not None:
+            field, value = self.job_change_before_relock
+            setattr(self.job, field, value)
+        return self.job, self.page, self.returned_version, self.fresh_projection
 
 
 class _FakeEmbedder:
-    def __init__(self, calls: list[str]) -> None:
+    def __init__(
+        self,
+        calls: list[str],
+        *,
+        vectors: list[list[float]] | None = None,
+        block: bool = False,
+    ) -> None:
         self.calls = calls
+        self.vectors = vectors
+        self.block = block
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         self.calls.append("embed")
         assert texts
+        if self.block:
+            self.started.set()
+            await self.release.wait()
+        if self.vectors is not None:
+            return self.vectors
         return [[0.1, 0.2] for _ in texts]
 
 
@@ -547,10 +745,12 @@ class _FakeIndex:
         *,
         count: int,
         replace_error: Exception | None = None,
+        delete_error: Exception | None = None,
     ) -> None:
         self.calls = calls
         self.count = count
         self.replace_error = replace_error
+        self.delete_error = delete_error
         self.units: list[Any] = []
         self.deleted: list[UUID] = []
 
@@ -571,6 +771,8 @@ class _FakeIndex:
 
     async def delete_page_version(self, page_version_id: UUID) -> None:
         self.calls.append("delete")
+        if self.delete_error is not None:
+            raise self.delete_error
         self.deleted.append(page_version_id)
         self.units = []
 
@@ -579,6 +781,7 @@ class _FakeIndex:
 class _ServiceFixture:
     service: WikiIndexService
     repository: _FakeRepository
+    embedder: _FakeEmbedder
     index: _FakeIndex
     calls: list[str]
     job: SimpleNamespace
@@ -597,6 +800,12 @@ def _service_fixture(
     claims: tuple[SimpleNamespace, ...] | None = None,
     source_paths: dict[UUID, tuple[str, ...]] | None = None,
     replace_error: Exception | None = None,
+    delete_error: Exception | None = None,
+    vectors: list[list[float]] | None = None,
+    block_embedding: bool = False,
+    heartbeat_interval: float = 30.0,
+    relock_error: Exception | None = None,
+    fail_save_stage_once: str | None = None,
 ) -> _ServiceFixture:
     calls: list[str] = []
     version = _version(origin=origin, review_state=review_state)
@@ -647,16 +856,22 @@ def _service_fixture(
         version=version,
         projection=projection,
     )
+    repository.relock_error = relock_error
+    repository.fail_save_stage_once = fail_save_stage_once
+    embedder = _FakeEmbedder(calls, vectors=vectors, block=block_embedding)
     index = _FakeIndex(
         calls,
         count=len(actual_claims) if index_count is None else index_count,
         replace_error=replace_error,
+        delete_error=delete_error,
     )
     now = datetime(2026, 10, 8, 9, 30, tzinfo=UTC)
     service = WikiIndexService(
         repository=repository,
-        embedder=_FakeEmbedder(calls),
+        embedder=embedder,
         index=index,
+        embedding_dimension=2,
+        heartbeat_interval=heartbeat_interval,
         now=lambda: now,
     )
-    return _ServiceFixture(service, repository, index, calls, job, page, version, now)
+    return _ServiceFixture(service, repository, embedder, index, calls, job, page, version, now)

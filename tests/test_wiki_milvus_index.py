@@ -12,6 +12,7 @@ from agent_api.knowledge.infrastructure.milvus.wiki_index import (
     WikiIndexHit,
     build_wiki_milvus_indexes,
     build_wiki_milvus_schema,
+    describe_alias_target,
 )
 
 UNIT_ID = UUID("80000000-0000-0000-0000-000000000001")
@@ -91,6 +92,10 @@ class FakeMilvusClient:
         if alias not in self.aliases:
             raise MilvusException(message="alias not found")
         return {"alias": alias, "collection_name": self.aliases[alias]}
+
+    def list_aliases(self, collection_name: str = "") -> dict[str, list[str]]:
+        assert collection_name == ""
+        return {"aliases": list(self.aliases)}
 
     def create_alias(self, collection_name: str, alias: str) -> None:
         self.aliases[alias] = collection_name
@@ -302,3 +307,63 @@ async def test_switch_alias_alters_existing_alias_after_describe() -> None:
         ("describe", "wiki_units", ""),
         ("alter", "wiki_units", "wiki_units_v2"),
     ]
+
+
+class AliasProbeClient:
+    def __init__(
+        self,
+        *,
+        aliases_response: object,
+        description: dict[str, str] | None = None,
+        error_message: str = "alias lookup failed",
+    ) -> None:
+        self.aliases_response = aliases_response
+        self.description = description
+        self.error_message = error_message
+        self.describe_calls = 0
+        self.list_calls = 0
+
+    def describe_alias(self, alias: str) -> dict[str, str]:
+        self.describe_calls += 1
+        if self.description is not None:
+            return self.description
+        raise MilvusException(message=self.error_message)
+
+    def list_aliases(self, collection_name: str = "") -> object:
+        assert collection_name == ""
+        self.list_calls += 1
+        return self.aliases_response
+
+
+@pytest.mark.parametrize("aliases_response", [{"aliases": []}, []])
+def test_describe_alias_uses_global_alias_listing_for_missing_alias(
+    aliases_response: object,
+) -> None:
+    client = AliasProbeClient(
+        aliases_response=aliases_response,
+        error_message="unexpected server wording without a known marker",
+    )
+
+    assert describe_alias_target(client, "wiki_units") is None  # type: ignore[arg-type]
+    assert client.describe_calls == 1
+    assert client.list_calls == 1
+
+
+def test_describe_alias_accepts_collection_key_from_compatible_response() -> None:
+    client = AliasProbeClient(
+        aliases_response=["wiki_units"],
+        description={"alias": "wiki_units", "collection": "wiki_units_v1"},
+    )
+
+    assert describe_alias_target(client, "wiki_units") == "wiki_units_v1"  # type: ignore[arg-type]
+    assert client.describe_calls == 1
+    assert client.list_calls == 0
+
+
+def test_describe_alias_handles_disappearing_alias_with_different_wording() -> None:
+    client = AliasProbeClient(
+        aliases_response={"aliases": ["wiki_units"]},
+        error_message="cannot find alias by the requested name",
+    )
+
+    assert describe_alias_target(client, "wiki_units") is None  # type: ignore[arg-type]

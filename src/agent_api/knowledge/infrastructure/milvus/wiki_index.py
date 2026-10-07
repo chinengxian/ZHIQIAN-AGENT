@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -37,9 +38,14 @@ _OUTPUT_FIELDS = [
 _MISSING_ALIAS_MARKERS = (
     "alias not found",
     "can't find alias",
+    "cannot find alias",
     "alias does not exist",
     "alias doesn't exist",
 )
+_EXPECTED_INDEXES = {
+    "dense_vector": ("HNSW", "COSINE"),
+    "sparse_vector": ("SPARSE_INVERTED_INDEX", "BM25"),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,13 +169,90 @@ def validate_wiki_milvus_description(
         raise RuntimeError("Wiki Milvus BM25 function is missing")
 
 
+def _nested_index_mapping(value: object) -> Mapping[str, object] | None:
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _index_value(description: Mapping[str, object], key: str) -> object | None:
+    if description.get(key) is not None:
+        return description[key]
+    for nested_key in ("params", "index_params"):
+        nested = _nested_index_mapping(description.get(nested_key))
+        if nested is not None and nested.get(key) is not None:
+            return nested[key]
+    return None
+
+
+def validate_wiki_milvus_indexes(client: MilvusClient, collection_name: str) -> None:
+    """校验已有 collection 的 Dense/BM25 索引协议，不做隐式重建。"""
+
+    try:
+        index_names = client.list_indexes(collection_name=collection_name)
+        if not isinstance(index_names, list):
+            raise RuntimeError("Wiki Milvus index definition is incompatible")
+        descriptions: dict[str, Mapping[str, object]] = {}
+        for index_name in index_names:
+            if not isinstance(index_name, str):
+                raise RuntimeError("Wiki Milvus index definition is incompatible")
+            description = client.describe_index(
+                collection_name=collection_name,
+                index_name=index_name,
+            )
+            if not isinstance(description, Mapping):
+                raise RuntimeError("Wiki Milvus index definition is incompatible")
+            field_name = _index_value(description, "field_name")
+            if isinstance(field_name, str):
+                descriptions[field_name] = description
+    except MilvusException:
+        # 不传播服务端文本，避免连接信息或内部名称进入启动错误。
+        raise RuntimeError("Wiki Milvus index validation failed") from None
+
+    for field_name, (expected_type, expected_metric) in _EXPECTED_INDEXES.items():
+        description = descriptions.get(field_name)
+        if description is None:
+            raise RuntimeError("Wiki Milvus index definition is incompatible")
+        index_type = _index_value(description, "index_type")
+        metric_type = _index_value(description, "metric_type")
+        if str(index_type).upper() != expected_type or str(metric_type).upper() != expected_metric:
+            raise RuntimeError("Wiki Milvus index definition is incompatible")
+
+
+def _listed_aliases(client: MilvusClient) -> set[str]:
+    """兼容 PyMilvus 标注的 list 与 2.6 实际返回的字典形状。"""
+
+    response = client.list_aliases(collection_name="")
+    raw_aliases = response.get("aliases") if isinstance(response, Mapping) else response
+    if not isinstance(raw_aliases, Sequence) or isinstance(raw_aliases, (str, bytes)):
+        raise RuntimeError("Milvus alias listing is incompatible")
+    if not all(isinstance(value, str) for value in raw_aliases):
+        raise RuntimeError("Milvus alias listing is incompatible")
+    return set(raw_aliases)
+
+
 def describe_alias_target(client: MilvusClient, alias: str) -> str | None:
-    """读取 alias 目标；仅把 Milvus 明确报告的“不存在”转换为空值。"""
+    """先读取 alias；失败时用全局 alias 列表稳定判定是否不存在。"""
 
     try:
         description = client.describe_alias(alias=alias)
     except MilvusException as error:
         message = str(error.message).lower()
+        try:
+            if alias not in _listed_aliases(client):
+                return None
+        except MilvusException:
+            # 旧服务无法列举 alias 时，才退回兼容性的错误文本判断。
+            if any(marker in message for marker in _MISSING_ALIAS_MARKERS):
+                return None
+            raise error from None
         if any(marker in message for marker in _MISSING_ALIAS_MARKERS):
             return None
         raise

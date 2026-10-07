@@ -66,6 +66,23 @@ class WikiIndexJobLike(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class WikiSourceSnapshot:
+    """用于写后复核的 Claim 来源与 Chunk 不可变身份快照。"""
+
+    source_id: UUID
+    claim_id: UUID
+    document_id: UUID
+    document_version_id: UUID
+    chunk_id: UUID | None
+    chunk_kind: str
+    chunk_ordinal: int
+    content_sha256: str
+    heading_path: Sequence[str]
+    page_start: int | None
+    page_end: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class WikiIndexProjection:
     """数据库批量读取后的索引投影；来源路径由 Claim 来源与 Chunk 共同解析。"""
 
@@ -73,6 +90,7 @@ class WikiIndexProjection:
     claims: Sequence[WikiClaimLike]
     source_paths: Mapping[UUID, Sequence[str]]
     section_titles: Mapping[UUID, str]
+    sources: Sequence[WikiSourceSnapshot]
 
 
 class WikiIndexRepository(Protocol):
@@ -96,13 +114,20 @@ class WikiIndexRepository(Protocol):
         page_version_id: UUID,
     ) -> WikiIndexProjection: ...
 
-    async def relock_and_validate_projection(
+    async def relock_and_reload_projection(
         self,
         *,
         job_id: UUID,
         page_version_id: UUID,
-        projection_signature: str,
-    ) -> tuple[WikiIndexJobLike, WikiPageLike, WikiPageVersionLike, bool]: ...
+    ) -> tuple[
+        WikiIndexJobLike,
+        WikiPageLike,
+        WikiPageVersionLike,
+        WikiIndexProjection,
+    ]:
+        """在重新锁定的同一事务中批量读取 fresh Claim、来源与 Chunk。"""
+
+        ...
 
 
 class WikiDocumentEmbedder(Protocol):
@@ -176,15 +201,7 @@ def build_index_units(
     """只把已验证的受支持 Claim 投影为确定性索引单元。"""
 
     titles = section_titles or {}
-    trusted_claims = sorted(
-        (
-            claim
-            for claim in claims
-            if claim.trust_state == "verified"
-            and claim.claim_type in _INDEXABLE_CLAIM_TYPES
-        ),
-        key=lambda claim: (claim.position, str(claim.id)),
-    )
+    trusted_claims = _trusted_claims(claims)
     return [
         WikiIndexedUnit(
             unit_id=claim.id,
@@ -207,18 +224,93 @@ def build_index_units(
     ]
 
 
-def _projection_signature(units: Sequence[WikiIndexedUnit]) -> str:
-    """仅持久化投影哈希，避免 Claim 正文进入任务错误或日志。"""
+def _trusted_claims(claims: Sequence[WikiClaimLike]) -> list[WikiClaimLike]:
+    """按位置和主键返回实际参与索引的可信 Claim。"""
 
-    payload = [
-        {
-            "content_sha256": sha256(unit.content.encode("utf-8")).hexdigest(),
-            "unit_id": str(unit.unit_id),
-            "unit_type": unit.unit_type,
-        }
-        for unit in units
-    ]
-    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return sorted(
+        (
+            claim
+            for claim in claims
+            if claim.trust_state == "verified"
+            and claim.claim_type in _INDEXABLE_CLAIM_TYPES
+        ),
+        key=lambda claim: (claim.position, str(claim.id)),
+    )
+
+
+def _projection_signature(
+    projection: WikiIndexProjection,
+    units: Sequence[WikiIndexedUnit],
+) -> str:
+    """哈希完整可信投影，不把 Claim 正文写入任务、日志或签名载荷。"""
+
+    claims = _trusted_claims(projection.claims)
+    trusted_ids = {claim.id for claim in claims}
+    sources = sorted(
+        (source for source in projection.sources if source.claim_id in trusted_ids),
+        key=lambda source: (
+            str(source.claim_id),
+            str(source.source_id),
+            str(source.document_id),
+            str(source.document_version_id),
+            str(source.chunk_id or ""),
+            source.chunk_kind,
+            source.chunk_ordinal,
+            source.content_sha256,
+            tuple(source.heading_path),
+            source.page_start if source.page_start is not None else -1,
+            source.page_end if source.page_end is not None else -1,
+        ),
+    )
+    payload = {
+        "aliases": [_clean(alias) for alias in projection.aliases if _clean(alias)],
+        "claims": [
+            {
+                "id": str(claim.id),
+                "type": claim.claim_type,
+                "trust": claim.trust_state,
+                "position": claim.position,
+                "text_sha256": sha256(_clean(claim.text).encode("utf-8")).hexdigest(),
+                "section_title": _clean(projection.section_titles.get(claim.id, "")),
+                "source_paths": [
+                    _clean(path)
+                    for path in projection.source_paths.get(claim.id, ())
+                    if _clean(path)
+                ],
+            }
+            for claim in claims
+        ],
+        "sources": [
+            {
+                "source_id": str(source.source_id),
+                "claim_id": str(source.claim_id),
+                "document_id": str(source.document_id),
+                "document_version_id": str(source.document_version_id),
+                "chunk_id": str(source.chunk_id) if source.chunk_id is not None else None,
+                "chunk_kind": source.chunk_kind,
+                "chunk_ordinal": source.chunk_ordinal,
+                "content_sha256": source.content_sha256,
+                "heading_path": [_clean(value) for value in source.heading_path],
+                "page_start": source.page_start,
+                "page_end": source.page_end,
+            }
+            for source in sources
+        ],
+        "units": [
+            {
+                "content_sha256": sha256(unit.content.encode("utf-8")).hexdigest(),
+                "unit_id": str(unit.unit_id),
+                "unit_type": unit.unit_type,
+            }
+            for unit in units
+        ],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
     return sha256(encoded).hexdigest()
 
 
@@ -306,15 +398,29 @@ class WikiIndexService:
             if written_count != len(indexed_units):
                 raise _IndexCountMismatch
 
-            signature = _projection_signature(units)
-            job, page, version, projection_valid = (
-                await self._repository.relock_and_validate_projection(
+            original_signature = _projection_signature(projection, units)
+            job, page, version, fresh_projection = (
+                await self._repository.relock_and_reload_projection(
                     job_id=job_id,
                     page_version_id=version.id,
-                    projection_signature=signature,
                 )
             )
-            if page.current_version_id != version.id or not projection_valid:
+            fresh_units = build_index_units(
+                page=page,
+                version=version,
+                aliases=fresh_projection.aliases,
+                claims=fresh_projection.claims,
+                source_paths=fresh_projection.source_paths,
+                section_titles=fresh_projection.section_titles,
+            )
+            projection_changed = (
+                _projection_signature(fresh_projection, fresh_units) != original_signature
+            )
+            target_changed = (
+                page.current_version_id != version.id
+                or job.page_version_id != version.id
+            )
+            if target_changed or projection_changed:
                 await self._index.delete_page_version(version.id)
                 await self._mark_superseded(job, version)
                 return

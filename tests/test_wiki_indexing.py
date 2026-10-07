@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -13,6 +13,7 @@ import pytest
 from agent_api.knowledge.wiki.indexing import (
     WikiIndexProjection,
     WikiIndexService,
+    WikiSourceSnapshot,
     build_index_units,
     build_unit_content,
     embedding_fingerprint,
@@ -210,7 +211,7 @@ async def test_index_service_moves_pending_to_ready_in_strict_stage_order() -> N
         "replace",
         "save:verifying",
         "count",
-        "relock_validate",
+        "relock_reload",
         "save:completed",
     ]
     assert fixture.version.embedding_fingerprint == fixture.job.embedding_fingerprint
@@ -273,9 +274,42 @@ async def test_index_service_deletes_write_when_version_changes_during_run() -> 
 
 
 @pytest.mark.asyncio
-async def test_index_service_deletes_write_when_claim_sources_become_stale() -> None:
+@pytest.mark.parametrize(
+    "changed_source",
+    [
+        {"content_sha256": "b" * 64},
+        {"chunk_id": UUID("00000000-0000-0000-0000-000000000099")},
+        {"document_version_id": UUID("00000000-0000-0000-0000-000000000098")},
+    ],
+)
+async def test_index_service_deletes_write_when_source_identity_becomes_stale(
+    changed_source: dict[str, object],
+) -> None:
     fixture = _service_fixture()
-    fixture.repository.projection_remains_valid = False
+    original = fixture.repository.projection.sources[0]
+    fresh_source = WikiSourceSnapshot(
+        source_id=original.source_id,
+        claim_id=original.claim_id,
+        document_id=original.document_id,
+        document_version_id=cast(
+            UUID,
+            changed_source.get("document_version_id", original.document_version_id),
+        ),
+        chunk_id=cast(UUID | None, changed_source.get("chunk_id", original.chunk_id)),
+        chunk_kind=original.chunk_kind,
+        chunk_ordinal=original.chunk_ordinal,
+        content_sha256=str(changed_source.get("content_sha256", original.content_sha256)),
+        heading_path=original.heading_path,
+        page_start=original.page_start,
+        page_end=original.page_end,
+    )
+    fixture.repository.fresh_projection = WikiIndexProjection(
+        aliases=fixture.repository.projection.aliases,
+        claims=fixture.repository.projection.claims,
+        source_paths=fixture.repository.projection.source_paths,
+        section_titles=fixture.repository.projection.section_titles,
+        sources=(fresh_source,),
+    )
 
     await fixture.service.run(fixture.job.id)
 
@@ -283,6 +317,61 @@ async def test_index_service_deletes_write_when_claim_sources_become_stale() -> 
     assert fixture.job.status == "succeeded"
     assert fixture.job.stage == "superseded"
     assert fixture.version.index_state == "not_required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    ["claim_text", "claim_trust", "claim_position", "alias"],
+)
+async def test_index_service_deletes_write_when_projection_content_changes(
+    change: str,
+) -> None:
+    fixture = _service_fixture()
+    projection = fixture.repository.projection
+    original_claim = projection.claims[0]
+    fresh_claim = _claim(
+        original_claim.id,
+        "已修改的事实" if change == "claim_text" else original_claim.text,
+        original_claim.claim_type,
+        "needs_review" if change == "claim_trust" else original_claim.trust_state,
+        position=1 if change == "claim_position" else original_claim.position,
+    )
+    fixture.repository.fresh_projection = WikiIndexProjection(
+        aliases=("双因素认证",) if change == "alias" else projection.aliases,
+        claims=(fresh_claim,),
+        source_paths=projection.source_paths,
+        section_titles=projection.section_titles,
+        sources=projection.sources,
+    )
+
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.index.deleted == [fixture.version.id]
+    assert fixture.job.stage == "superseded"
+    assert fixture.version.index_state != "ready"
+
+
+@pytest.mark.asyncio
+async def test_index_service_source_snapshot_order_does_not_change_signature() -> None:
+    claims = (
+        _claim(uuid4(), "第一条事实", "summary_fact", "verified", position=1),
+        _claim(uuid4(), "第二条事实", "summary_fact", "verified", position=2),
+    )
+    fixture = _service_fixture(claims=claims)
+    projection = fixture.repository.projection
+    fixture.repository.fresh_projection = WikiIndexProjection(
+        aliases=projection.aliases,
+        claims=projection.claims,
+        source_paths=projection.source_paths,
+        section_titles=projection.section_titles,
+        sources=tuple(reversed(projection.sources)),
+    )
+
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.index.deleted == []
+    assert fixture.version.index_state == "ready"
 
 
 @pytest.mark.asyncio
@@ -402,9 +491,9 @@ class _FakeRepository:
         self.page = page
         self.version = version
         self.projection = projection
+        self.fresh_projection = projection
         self.saved_states: list[tuple[str, str, int, str]] = []
         self.change_current_version_before_relock = False
-        self.projection_remains_valid = True
 
     async def lock_job_and_version(self, job_id: UUID) -> tuple[Any, Any, Any] | None:
         self.calls.append("lock")
@@ -427,24 +516,18 @@ class _FakeRepository:
         assert page_version_id == self.version.id
         return self.projection
 
-    async def relock_and_validate_projection(
+    async def relock_and_reload_projection(
         self,
         *,
         job_id: UUID,
         page_version_id: UUID,
-        projection_signature: str,
-    ) -> tuple[Any, Any, Any, bool]:
-        self.calls.append("relock_validate")
+    ) -> tuple[Any, Any, Any, WikiIndexProjection]:
+        self.calls.append("relock_reload")
         assert job_id == self.job.id
         assert page_version_id == self.version.id
-        assert projection_signature
         if self.change_current_version_before_relock:
             self.page.current_version_id = uuid4()
-        valid = (
-            self.page.current_version_id == self.version.id
-            and self.projection_remains_valid
-        )
-        return self.job, self.page, self.version, valid
+        return self.job, self.page, self.version, self.fresh_projection
 
 
 class _FakeEmbedder:
@@ -540,6 +623,22 @@ def _service_fixture(
         claims=actual_claims,
         source_paths=actual_paths,
         section_titles={},
+        sources=tuple(
+            WikiSourceSnapshot(
+                source_id=uuid4(),
+                claim_id=item.id,
+                document_id=uuid4(),
+                document_version_id=uuid4(),
+                chunk_id=uuid4(),
+                chunk_kind="child",
+                chunk_ordinal=index,
+                content_sha256="a" * 64,
+                heading_path=("规范", "登录"),
+                page_start=1,
+                page_end=1,
+            )
+            for index, item in enumerate(actual_claims)
+        ),
     )
     repository = _FakeRepository(
         calls=calls,

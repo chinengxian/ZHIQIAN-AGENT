@@ -74,6 +74,35 @@ def test_wiki_search_schema_declares_aliases_claim_metadata_and_reverse_indexes(
     assert any(index.name == "ix_wiki_claim_sources_locator" for index in sources.indexes)
 
 
+def test_wiki_independent_index_schema_declares_version_and_job_lifecycle() -> None:
+    """Wiki 独立索引必须持久化版本状态与任务诊断上下文。"""
+
+    versions = Base.metadata.tables["wiki_page_versions"]
+    jobs = Base.metadata.tables["wiki_jobs"]
+
+    assert {
+        "index_state",
+        "embedding_fingerprint",
+        "indexed_at",
+        "index_error_code",
+    } <= set(versions.c.keys())
+    assert versions.c.index_state.default is not None
+    assert versions.c.index_state.default.arg == "not_required"
+    assert {"page_version_id", "embedding_fingerprint", "error_reference"} <= set(
+        jobs.c.keys()
+    )
+    assert any(
+        isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_wiki_page_version_index_state"
+        for constraint in versions.constraints
+    )
+    assert any(
+        index.name == "ix_wiki_jobs_page_version_status"
+        and tuple(index.columns.keys()) == ("page_version_id", "status")
+        for index in jobs.indexes
+    )
+
+
 def test_knowledge_schema_declares_required_uniqueness_and_indexes() -> None:
     knowledge_bases = Base.metadata.tables["knowledge_bases"]
     versions = Base.metadata.tables["document_versions"]
@@ -150,7 +179,7 @@ def test_alembic_head_matches_startup_revision() -> None:
     config = Config(str(Path.cwd() / "alembic.ini"))
     scripts = ScriptDirectory.from_config(config)
 
-    assert EXPECTED_DATABASE_REVISION == "20261007_0004"
+    assert EXPECTED_DATABASE_REVISION == "20261007_0005"
     assert scripts.get_current_head() == EXPECTED_DATABASE_REVISION
 
 

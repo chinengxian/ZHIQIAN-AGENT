@@ -5,6 +5,7 @@ from typing import Self, assert_never
 
 from pydantic import (
     AnyHttpUrl,
+    Field,
     ModelWrapValidatorHandler,
     PositiveInt,
     SecretStr,
@@ -31,6 +32,12 @@ class EmbeddingProvider(StrEnum):
 class RerankProvider(StrEnum):
     NONE = "none"
     LOCAL_BGE = "local_bge"
+
+
+class WikiSearchBackend(StrEnum):
+    LEGACY = "legacy"
+    SHADOW = "shadow"
+    INDEPENDENT = "independent"
 
 
 def _configuration_error(field: str, message: str) -> InitErrorDetails:
@@ -99,6 +106,17 @@ class Settings(BaseSettings):
     milvus_uri: str = "http://127.0.0.1:19530"
     milvus_token: SecretStr | None = None
     milvus_collection: str = "knowledge_chunks"
+
+    # Wiki 独立索引默认关闭，并继续使用旧检索链路，避免改变现有运行行为。
+    wiki_index_enabled: bool = False
+    wiki_search_backend: WikiSearchBackend = WikiSearchBackend.LEGACY
+    wiki_milvus_collection_alias: str = "wiki_units"
+    wiki_milvus_collection_version: str = "wiki_units_v1"
+    wiki_dense_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
+    wiki_rerank_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+    wiki_keyword_coverage_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+    wiki_index_protocol_version: str = "wiki-index-v1"
+    wiki_relevance_profile: str = "wiki-relevance-v1"
 
     # Embedding 与聊天模型解耦，允许分别使用不同服务、模型和向量维度。
     embedding_provider: EmbeddingProvider = EmbeddingProvider.DASHSCOPE
@@ -237,6 +255,27 @@ class Settings(BaseSettings):
         if not self.milvus_collection.strip():
             errors.append(
                 _configuration_error("milvus_collection", "Milvus collection must not be blank")
+            )
+
+        # 仅在知识库启用时校验 Wiki 基础设施，保留纯聊天模式的最小配置能力。
+        if self.wiki_index_enabled:
+            wiki_identity_fields = (
+                ("wiki_milvus_collection_alias", self.wiki_milvus_collection_alias),
+                ("wiki_milvus_collection_version", self.wiki_milvus_collection_version),
+                ("wiki_index_protocol_version", self.wiki_index_protocol_version),
+                ("wiki_relevance_profile", self.wiki_relevance_profile),
+            )
+            for field, value in wiki_identity_fields:
+                if not value.strip():
+                    errors.append(
+                        _configuration_error(field, "Wiki index configuration must not be blank")
+                    )
+        elif self.wiki_search_backend is not WikiSearchBackend.LEGACY:
+            errors.append(
+                _configuration_error(
+                    "wiki_index_enabled",
+                    "Wiki index must be enabled for the selected search backend",
+                )
             )
 
         if self.embedding_provider is EmbeddingProvider.OPENAI:

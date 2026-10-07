@@ -122,9 +122,12 @@ def test_legacy_wiki_backend_allows_disabled_index(tmp_path: Path) -> None:
     assert settings.wiki_search_backend is WikiSearchBackend.LEGACY
 
 
-@pytest.mark.parametrize("backend", ["shadow", "independent"])
+@pytest.mark.parametrize(
+    "backend",
+    [WikiSearchBackend.SHADOW, WikiSearchBackend.INDEPENDENT],
+)
 def test_disabled_knowledge_rejects_non_legacy_backend_without_index(
-    backend: str,
+    backend: WikiSearchBackend,
 ) -> None:
     secret = "pure-chat-secret"
 
@@ -132,7 +135,7 @@ def test_disabled_knowledge_rejects_non_legacy_backend_without_index(
         Settings(
             model_provider=ModelProvider.OPENAI,
             openai_base_url="https://chat.example.test/v1",
-            openai_api_key=secret,
+            openai_api_key=SecretStr(secret),
             openai_model="chat-model",
             knowledge_enabled=False,
             wiki_search_backend=backend,

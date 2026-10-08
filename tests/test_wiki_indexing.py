@@ -262,7 +262,7 @@ async def test_index_service_cleans_write_when_final_save_fails() -> None:
 
 
 @pytest.mark.asyncio
-async def test_index_service_preserves_original_failure_when_cleanup_fails() -> None:
+async def test_index_service_records_retry_cleanup_debt_when_cleanup_fails() -> None:
     cleanup_message = "清理失败：内部 Milvus 地址"
     fixture = _service_fixture(
         index_count=0,
@@ -272,11 +272,43 @@ async def test_index_service_preserves_original_failure_when_cleanup_fails() -> 
     await fixture.service.run(fixture.job.id)
 
     assert fixture.job.status == "retry_wait"
-    assert fixture.job.stage == "cleanup_pending"
+    assert fixture.job.stage == "cleanup_pending_retry"
     assert fixture.job.error_code == "index_cleanup_failed"
     assert fixture.version.index_state == "failed"
     assert fixture.version.index_error_code == "index_cleanup_failed"
     assert cleanup_message not in fixture.job.error_reference
+
+
+@pytest.mark.asyncio
+async def test_index_service_reindexes_current_version_after_cleanup_recovers() -> None:
+    fixture = _service_fixture(
+        index_count=0,
+        delete_error=RuntimeError("暂时无法删除"),
+    )
+
+    await fixture.service.run(fixture.job.id)
+    assert fixture.job.stage == "cleanup_pending_retry"
+    first_embed_count = fixture.calls.count("embed")
+    first_replace_count = fixture.calls.count("replace")
+
+    fixture.index.delete_error = None
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.calls.count("embed") == first_embed_count
+    assert fixture.calls.count("replace") == first_replace_count
+    assert fixture.job.status == "retry_wait"
+    assert fixture.job.stage == "failed"
+    assert fixture.job.error_code == "index_retry_after_cleanup"
+    assert fixture.version.index_state == "failed"
+
+    fixture.index.count = 1
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.calls.count("embed") == first_embed_count + 1
+    assert fixture.calls.count("replace") == first_replace_count + 1
+    assert fixture.job.status == "succeeded"
+    assert fixture.job.stage == "completed"
+    assert fixture.version.index_state == "ready"
 
 
 @pytest.mark.asyncio
@@ -292,7 +324,7 @@ async def test_index_service_retries_cleanup_before_any_reindex_work() -> None:
     )
 
     await fixture.service.run(fixture.job.id)
-    assert fixture.job.stage == "cleanup_pending"
+    assert fixture.job.stage == "cleanup_pending_superseded"
     assert fixture.job.status == "retry_wait"
     assert fixture.version.index_state == "failed"
     first_embed_count = fixture.calls.count("embed")
@@ -318,9 +350,21 @@ async def test_index_service_hard_conflict_delete_failure_is_not_silent_success(
     await fixture.service.run(fixture.job.id)
 
     assert fixture.job.status in {"retry_wait", "failed"}
-    assert fixture.job.stage == "cleanup_pending"
+    assert fixture.job.stage == "cleanup_pending_conflict"
     assert fixture.job.error_code == "index_cleanup_failed"
     assert fixture.version.index_state == "failed"
+
+    first_embed_count = fixture.calls.count("embed")
+    first_replace_count = fixture.calls.count("replace")
+    fixture.index.delete_error = None
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.calls.count("embed") == first_embed_count
+    assert fixture.calls.count("replace") == first_replace_count
+    assert fixture.job.stage == "failed"
+    assert fixture.job.error_code == "index_state_conflict"
+    assert fixture.version.index_state == "failed"
+    assert fixture.version.index_error_code == "index_state_conflict"
 
 
 @pytest.mark.asyncio
@@ -612,7 +656,7 @@ async def test_index_service_cancellation_persists_cleanup_debt_when_delete_fail
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=1)
 
-    assert fixture.job.stage == "cleanup_pending"
+    assert fixture.job.stage == "cleanup_pending_retry"
     assert fixture.job.status in {"retry_wait", "failed"}
     assert fixture.job.error_code == "index_cleanup_failed"
     assert fixture.version.index_state == "failed"

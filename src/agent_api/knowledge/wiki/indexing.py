@@ -16,6 +16,13 @@ from agent_api.knowledge.infrastructure.milvus import WikiIndexedUnit
 
 _INDEXABLE_CLAIM_TYPES = frozenset({"summary_section", "summary_fact", "topic_fact"})
 _EXECUTABLE_JOB_STATUSES = frozenset({"pending", "retry_wait"})
+_CLEANUP_PENDING_STAGES = frozenset(
+    {
+        "cleanup_pending_retry",
+        "cleanup_pending_superseded",
+        "cleanup_pending_conflict",
+    }
+)
 _ResultT = TypeVar("_ResultT")
 
 
@@ -470,7 +477,11 @@ class WikiIndexService:
             if hard_conflict:
                 cleaned = await self._try_delete(target_version_id)
                 if not cleaned:
-                    await self._mark_cleanup_pending(job, target_version)
+                    await self._mark_cleanup_pending(
+                        job,
+                        target_version,
+                        disposition="conflict",
+                    )
                     return
                 cleanup_required = False
                 conflict_version = version if version.id == target_version_id else target_version
@@ -492,7 +503,11 @@ class WikiIndexService:
             if target_changed or projection_changed:
                 cleaned = await self._try_delete(target_version_id)
                 if not cleaned:
-                    await self._mark_cleanup_pending(job, target_version)
+                    await self._mark_cleanup_pending(
+                        job,
+                        target_version,
+                        disposition="superseded",
+                    )
                     return
                 cleanup_required = False
                 await self._mark_superseded(job, target_version)
@@ -517,14 +532,22 @@ class WikiIndexService:
                 if not cleaned:
                     with suppress(Exception):
                         await self._run_shielded_to_completion(
-                            self._mark_cleanup_pending(job, target_version)
+                            self._mark_cleanup_pending(
+                                job,
+                                target_version,
+                                disposition="retry",
+                            )
                         )
             raise
         except Exception as error:
             if cleanup_required:
                 cleaned = await self._try_delete(target_version_id)
                 if not cleaned:
-                    await self._mark_cleanup_pending(job, target_version)
+                    await self._mark_cleanup_pending(
+                        job,
+                        target_version,
+                        disposition="retry",
+                    )
                     return
             if finalizing and job.status not in {"running", "succeeded"}:
                 return
@@ -560,7 +583,7 @@ class WikiIndexService:
 
         return (
             job.page_version_id == version.id
-            and job.stage == "cleanup_pending"
+            and job.stage in _CLEANUP_PENDING_STAGES
             and job.status in {"retry_wait", "failed"}
             and version.index_state == "failed"
         )
@@ -576,9 +599,16 @@ class WikiIndexService:
         job.heartbeat_at = self._now()
         cleaned = await self._try_delete(version.id)
         if not cleaned:
-            await self._mark_cleanup_pending(job, version)
+            disposition = job.stage.removeprefix("cleanup_pending_")
+            await self._mark_cleanup_pending(job, version, disposition=disposition)
             return
-        await self._mark_superseded(job, version)
+        if job.stage == "cleanup_pending_superseded":
+            await self._mark_superseded(job, version)
+            return
+        if job.stage == "cleanup_pending_conflict":
+            await self._mark_state_conflict(job, version)
+            return
+        await self._mark_retry_after_cleanup(job, version)
 
     async def _await_with_heartbeat(
         self,
@@ -760,6 +790,7 @@ class WikiIndexService:
         version.index_error_code = "index_state_conflict"
         if job.status == "running":
             job.status = "retry_wait" if job.attempt_count < job.max_attempts else "failed"
+        if job.status in {"running", "retry_wait", "failed"}:
             job.stage = "failed"
             job.error_code = "index_state_conflict"
             job.error_reference = _stable_error_reference(
@@ -774,9 +805,13 @@ class WikiIndexService:
         self,
         job: WikiIndexJobLike,
         version: WikiPageVersionLike,
+        *,
+        disposition: str,
     ) -> None:
         """持久化删除债务，后续执行必须先重试清理。"""
 
+        if disposition not in {"retry", "superseded", "conflict"}:
+            raise ValueError("wiki_cleanup_disposition_invalid")
         error = _IndexCleanupFailed()
         version.index_state = "failed"
         version.embedding_fingerprint = None
@@ -784,10 +819,29 @@ class WikiIndexService:
         version.index_error_code = "index_cleanup_failed"
         if job.status != "failed":
             job.status = "retry_wait" if job.attempt_count < job.max_attempts else "failed"
-        job.stage = "cleanup_pending"
+        job.stage = f"cleanup_pending_{disposition}"
         job.heartbeat_at = self._now()
         job.error_code = "index_cleanup_failed"
         job.error_reference = _stable_error_reference(job.id, "cleanup", error)
+        await self._repository.save_state(job, version)
+
+    async def _mark_retry_after_cleanup(
+        self,
+        job: WikiIndexJobLike,
+        version: WikiPageVersionLike,
+    ) -> None:
+        """当前版本清理完成后恢复为可重试索引，而不是误判为过期。"""
+
+        error = _IndexCleanupFailed()
+        version.index_state = "failed"
+        version.embedding_fingerprint = None
+        version.indexed_at = None
+        version.index_error_code = "index_retry_after_cleanup"
+        job.status = "retry_wait" if job.attempt_count < job.max_attempts else "failed"
+        job.stage = "failed"
+        job.heartbeat_at = self._now()
+        job.error_code = "index_retry_after_cleanup"
+        job.error_reference = _stable_error_reference(job.id, "cleanup_recovered", error)
         await self._repository.save_state(job, version)
 
     async def _mark_failed(

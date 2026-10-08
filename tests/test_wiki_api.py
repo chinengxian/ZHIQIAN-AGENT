@@ -56,6 +56,9 @@ class FakeWikiRetrieval:
             excerpt="需要两个独立认证因素",
             score=0.9,
             rank=1,
+            parent_chunk_id=uuid4(),
+            focus_start=2,
+            focus_end=12,
         )
         claim = WikiMatchedClaim(
             id=uuid4(),
@@ -122,7 +125,13 @@ async def test_wiki_search_api_returns_ranked_claims_and_sources() -> None:
     assert response.status_code == 200
     assert payload["pages"][0]["matched_fields"] == ["alias", "source_chunk"]
     assert payload["pages"][0]["matched_claims"][0]["position"] == 9
-    assert payload["pages"][0]["matched_claims"][0]["sources"][0]["chunk_id"]
+    source = payload["pages"][0]["matched_claims"][0]["sources"][0]
+    assert source["chunk_id"]
+    assert source["parent_chunk_id"]
+    assert source["excerpt"] == "需要两个独立认证因素"
+    assert source["focus_start"] == 2
+    assert source["focus_end"] == 12
+    assert source["invalid_reason"] is None
     assert payload["degraded"] is False
     assert service.calls[0] == {
         "query": "双因素校验",

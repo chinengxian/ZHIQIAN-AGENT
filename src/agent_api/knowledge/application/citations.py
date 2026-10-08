@@ -17,6 +17,11 @@ class Source:
     excerpt: str
     score: float
     rank: int
+    parent_chunk_id: UUID | None = None
+    focus_start: int | None = None
+    focus_end: int | None = None
+    valid: bool = True
+    invalid_reason: str | None = None
 
     def public_dict(self) -> dict[str, object]:
         result = asdict(self)

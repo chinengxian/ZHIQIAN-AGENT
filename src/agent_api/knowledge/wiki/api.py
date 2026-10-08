@@ -45,11 +45,16 @@ class WikiSourceResponse(BaseModel):
     document_id: UUID
     document_version_id: UUID
     chunk_id: UUID | None
+    parent_chunk_id: UUID | None = None
     document_title: str
     heading_path: list[str]
     page_start: int | None
     page_end: int | None
+    excerpt: str = ""
+    focus_start: int | None = None
+    focus_end: int | None = None
     valid: bool
+    invalid_reason: str | None = None
 
 
 class WikiClaimResponse(BaseModel):
@@ -147,7 +152,8 @@ class WikiIndexBackfillResponse(BaseModel):
 
 
 class WikiSearchSourceResponse(BaseModel):
-    chunk_id: UUID
+    chunk_id: UUID | None
+    parent_chunk_id: UUID | None = None
     document_id: UUID
     document_version_id: UUID
     title: str
@@ -156,6 +162,10 @@ class WikiSearchSourceResponse(BaseModel):
     page_end: int | None
     heading_path: tuple[str, ...]
     excerpt: str
+    focus_start: int | None = None
+    focus_end: int | None = None
+    valid: bool = True
+    invalid_reason: str | None = None
     score: float
     rank: int
 

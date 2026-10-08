@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_api.knowledge.application.management import DEFAULT_WORKSPACE_ID
 from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.infrastructure.database.models import (
-    Chunk,
     Document,
     KnowledgeBase,
     OutboxEvent,
@@ -24,11 +23,11 @@ from agent_api.knowledge.infrastructure.database.models import (
 from agent_api.knowledge.wiki.index_jobs import (
     retry_page_index_job,
     schedule_current_page_indexes,
-    source_matches_chunk,
     try_backfill_lock,
 )
 from agent_api.knowledge.wiki.jobs import schedule_document_wiki
 from agent_api.knowledge.wiki.processor import WikiProcessor
+from agent_api.knowledge.wiki.read_model import VerifiedWikiClaim, WikiReadModel
 
 
 class WikiError(RuntimeError):
@@ -222,7 +221,7 @@ class WikiService:
             version = await session.get(WikiPageVersion, page.current_version_id)
             if version is None:
                 raise WikiError("wiki_page_version_not_found", 404)
-            all_claims = await self._claims_response(session, version.id)
+            all_claims = await self._claims_response(session, version.id, knowledge_base_id)
             summary_sections = self._summary_sections_response(version, all_claims)
             claims = [claim for claim in all_claims if claim["claim_type"] != "summary_section"]
             return self._page_response(page, version, claims, summary_sections)
@@ -302,7 +301,7 @@ class WikiService:
         ]
 
     async def _claims_response(
-        self, session: AsyncSession, page_version_id: UUID
+        self, session: AsyncSession, page_version_id: UUID, knowledge_base_id: UUID
     ) -> list[dict[str, Any]]:
         claims = list(
             await session.scalars(
@@ -311,65 +310,65 @@ class WikiService:
                 .order_by(WikiClaim.position, WikiClaim.id)
             )
         )
-        output: list[dict[str, Any]] = []
-        for claim in claims:
-            sources = list(
-                await session.scalars(
-                    select(WikiClaimSource).where(WikiClaimSource.claim_id == claim.id)
-                )
-            )
-            rendered_sources = []
-            for source in sources:
-                valid = await self._source_valid(session, source)
-                rendered_sources.append(
-                    {
-                        "document_id": source.document_id,
-                        "document_version_id": source.document_version_id,
-                        "chunk_id": source.chunk_id,
-                        "document_title": source.document_title,
-                        "heading_path": source.heading_path,
-                        "page_start": source.page_start,
-                        "page_end": source.page_end,
-                        "valid": valid,
-                    }
-                )
-            trusted = (
-                claim.trust_state == "verified"
-                and bool(rendered_sources)
-                and all(item["valid"] for item in rendered_sources)
-            )
-            output.append(
-                {
-                    "id": claim.id,
-                    "claim_key": claim.claim_key,
-                    "text": claim.text,
-                    "position": claim.position,
-                    "claim_type": claim.claim_type,
-                    "trust_state": "verified" if trusted else "needs_review",
-                    "reason": claim.reason if trusted else claim.reason or "source_not_current",
-                    "sources": rendered_sources,
-                }
-            )
-        return output
+        if not claims:
+            return []
+        read_model = WikiReadModel(session)
+        loaded = await read_model.load_verified_claims(
+            tuple(claim.id for claim in claims),
+            scope_ids=(knowledge_base_id,),
+            require_index_ready=False,
+        )
+        by_id = {claim.claim_id: claim for claim in loaded}
+        return [self._claim_response(by_id.get(claim.id), claim) for claim in claims]
 
     @staticmethod
-    async def _source_valid(session: AsyncSession, source: WikiClaimSource) -> bool:
-        document = await session.get(Document, source.document_id)
-        if (
-            document is None
-            or document.deleted_at is not None
-            or document.status != "ready"
-            or document.active_version_id != source.document_version_id
-        ):
-            return False
-        chunk = await session.scalar(
-            select(Chunk).where(
-                Chunk.document_version_id == source.document_version_id,
-                Chunk.kind == source.chunk_kind,
-                Chunk.ordinal == source.chunk_ordinal,
-            )
-        )
-        return chunk is not None and source_matches_chunk(source, chunk)
+    def _claim_response(
+        verified: VerifiedWikiClaim | None,
+        fallback: WikiClaim,
+    ) -> dict[str, Any]:
+        if verified is None:
+            return {
+                "id": fallback.id,
+                "claim_key": fallback.claim_key,
+                "text": fallback.text,
+                "position": fallback.position,
+                "claim_type": fallback.claim_type,
+                "trust_state": "needs_review",
+                "reason": fallback.reason or "source_not_current",
+                "sources": [],
+            }
+        trusted = verified.valid and bool(verified.sources)
+        return {
+            "id": verified.claim_id,
+            "claim_key": verified.claim_key,
+            "text": verified.text,
+            "position": verified.position,
+            "claim_type": verified.claim_type,
+            "trust_state": "verified" if trusted else "needs_review",
+            "reason": (
+                verified.reason
+                if trusted
+                else verified.reason or verified.invalid_reason or "source_not_current"
+            ),
+            "sources": [
+                {
+                    "document_id": source.document_id,
+                    "document_version_id": source.document_version_id,
+                    "chunk_id": source.chunk_id,
+                    "parent_chunk_id": source.parent_chunk_id,
+                    "document_title": source.document_title,
+                    "heading_path": list(source.heading_path),
+                    "page_start": source.page_start,
+                    "page_end": source.page_end,
+                    "excerpt": source.excerpt,
+                    "focus_start": source.focus_start,
+                    "focus_end": source.focus_end,
+                    "valid": source.valid,
+                    "invalid_reason": source.invalid_reason,
+                }
+                for source in verified.sources
+            ],
+        }
 
     async def list_versions(self, knowledge_base_id: UUID, page_id: UUID) -> list[dict[str, Any]]:
         async with self._sessions() as session:
@@ -452,7 +451,7 @@ class WikiService:
                 fingerprint=self._embedding_fingerprint,
             )
             return self._page_response(
-                page, version, await self._claims_response(session, version.id)
+                page, version, await self._claims_response(session, version.id, knowledge_base_id)
             )
 
     async def revert_page(
@@ -503,7 +502,7 @@ class WikiService:
                 fingerprint=self._embedding_fingerprint,
             )
             return self._page_response(
-                page, version, await self._claims_response(session, version.id)
+                page, version, await self._claims_response(session, version.id, knowledge_base_id)
             )
 
     async def review_page(

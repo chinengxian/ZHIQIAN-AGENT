@@ -27,6 +27,7 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiPageVersion,
 )
 from agent_api.knowledge.wiki.ranking import reciprocal_rank_fusion, select_mmr
+from agent_api.knowledge.wiki.read_model import VerifiedWikiClaim, WikiReadModel
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,28 @@ class _PageRecord:
     claims: tuple[_ClaimRecord, ...]
 
 
+def _search_source_response(source: Any) -> Source:
+    return Source(
+        citation_id="",
+        chunk_id=source.chunk_id,
+        document_id=source.document_id,
+        document_version_id=source.document_version_id,
+        title=source.document_title,
+        filename=source.filename,
+        page_start=source.page_start,
+        page_end=source.page_end,
+        heading_path=source.heading_path,
+        excerpt=source.excerpt,
+        score=0.0,
+        rank=0,
+        parent_chunk_id=source.parent_chunk_id,
+        focus_start=source.focus_start,
+        focus_end=source.focus_end,
+        valid=source.valid,
+        invalid_reason=source.invalid_reason,
+    )
+
+
 def _normalize_query(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).casefold().strip()
     return re.sub(r"\s+", " ", normalized)
@@ -130,14 +153,14 @@ def _escape_like_pattern(value: str) -> str:
 
 
 def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
-    title_score = func.similarity(func.lower(WikiPage.title), query)
-    summary_score = func.similarity(func.lower(WikiPageVersion.summary), query)
-    alias_similarity = func.similarity(func.lower(WikiPageAlias.alias), query)
-    alias_score = func.coalesce(func.max(alias_similarity), 0.0)
-    alias_matched = func.coalesce(func.bool_or(alias_similarity > 0.1), False)
-    alias_exact = func.coalesce(
-        func.bool_or(func.lower(WikiPageAlias.alias) == query), False
+    title_matched = func.lower(WikiPage.title).like(f"{_escape_like_pattern(query)}%", escape="\\")
+    alias_matched = func.coalesce(
+        func.bool_or(
+            func.lower(WikiPageAlias.alias).like(f"{_escape_like_pattern(query)}%", escape="\\")
+        ),
+        False,
     )
+    alias_exact = func.coalesce(func.bool_or(func.lower(WikiPageAlias.alias) == query), False)
     slug_query = query.replace(" ", "-")
     slug_matched = func.lower(WikiPage.slug).like(
         f"{_escape_like_pattern(slug_query)}%", escape="\\"
@@ -145,19 +168,15 @@ def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
     exact_match = or_(
         func.lower(WikiPage.title) == query,
         alias_exact,
-        func.lower(WikiPage.slug) == slug_query,
     )
-    relevance = func.greatest(title_score, summary_score, alias_score)
     return (
         select(
             WikiPage.id,
             WikiPage.title,
             WikiPage.slug,
-            WikiPageVersion.summary,
-            title_score.label("title_score"),
-            summary_score.label("summary_score"),
-            alias_score.label("alias_score"),
+            title_matched.label("title_matched"),
             alias_matched.label("alias_matched"),
+            slug_matched.label("slug_matched"),
             exact_match.label("exact_match"),
         )
         .join(
@@ -175,9 +194,9 @@ def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
             KnowledgeBase.enabled.is_(True),
             WikiConfig.enabled.is_(True),
             or_(
-                title_score > 0.1,
-                summary_score > 0.1,
-                alias_similarity > 0.1,
+                title_matched,
+                alias_matched,
+                alias_exact,
                 slug_matched,
             ),
         )
@@ -185,12 +204,12 @@ def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
             WikiPage.id,
             WikiPage.title,
             WikiPage.slug,
-            WikiPageVersion.summary,
         )
         .order_by(
             exact_match.desc(),
             slug_matched.desc(),
-            relevance.desc(),
+            title_matched.desc(),
+            alias_matched.desc(),
             WikiPage.id,
         )
         .limit(200)
@@ -235,9 +254,7 @@ class WikiRetrievalService:
         started = perf_counter()
         fingerprint = sha256(normalized.encode()).hexdigest()[:16]
         try:
-            metadata_ids, metadata_fields = await self._metadata_page_ids(
-                normalized, scope_ids
-            )
+            metadata_ids, metadata_fields = await self._metadata_page_ids(normalized, scope_ids)
         except Exception as error:
             raise WikiRetrievalError("wiki_retrieval_unavailable") from error
 
@@ -389,9 +406,7 @@ class WikiRetrievalService:
             if claim.claim_type not in RETRIEVABLE_CLAIM_TYPES:
                 continue
             matched = [
-                ranks[source.chunk_id]
-                for source in claim.sources
-                if source.chunk_id in ranks
+                ranks[source.chunk_id] for source in claim.sources if source.chunk_id in ranks
             ]
             source_score = 1.0 / min(matched) if matched else 0.0
             lexical = _text_relevance(query, claim.text)
@@ -423,11 +438,7 @@ class WikiRetrievalService:
             claims = [claim for claim, _ in self.rank_page_claims(normalized, page.claims)]
         else:
             claims = sorted(
-                (
-                    claim
-                    for claim in page.claims
-                    if claim.claim_type in RETRIEVABLE_CLAIM_TYPES
-                ),
+                (claim for claim in page.claims if claim.claim_type in RETRIEVABLE_CLAIM_TYPES),
                 key=lambda claim: (claim.position, claim.id),
             )
         selected = claims[cursor : cursor + limit]
@@ -446,36 +457,13 @@ class WikiRetrievalService:
         query: str,
         scope_ids: tuple[UUID, ...],
     ) -> tuple[list[UUID], dict[UUID, tuple[str, ...]]]:
-        slug_query = query.replace(" ", "-")
         async with self._sessions() as session:
-            rows = list((await session.execute(_build_metadata_statement(query, scope_ids))).all())
-        page_scores: dict[UUID, float] = {}
+            hits = await WikiReadModel(session).search_metadata(query, scope_ids, limit=40)
         matched: dict[UUID, list[str]] = {}
-        exact: dict[UUID, bool] = {}
-        for row in rows:
-            fields = matched.setdefault(row.id, [])
-            if row.title_score > 0.1:
-                fields.append("title")
-            if row.summary_score > 0.1:
-                fields.append("summary")
-            if row.alias_matched:
-                fields.append("alias")
-            if row.slug.casefold().startswith(slug_query):
-                fields.append("slug")
-            page_scores[row.id] = max(
-                page_scores.get(row.id, 0.0),
-                float(row.title_score or 0),
-                float(row.summary_score or 0),
-                float(row.alias_score or 0),
-            )
-            exact[row.id] = bool(row.exact_match)
-        ordered = sorted(
-            page_scores,
-            key=lambda page_id: (-int(exact[page_id]), -page_scores[page_id], str(page_id)),
-        )[:40]
-        return ordered, {
-            page_id: tuple(dict.fromkeys(matched[page_id])) for page_id in ordered
-        }
+        for hit in hits:
+            matched.setdefault(hit.page_id, []).append(hit.matched_field)
+        ordered = [hit.page_id for hit in hits]
+        return ordered, {page_id: tuple(dict.fromkeys(matched[page_id])) for page_id in ordered}
 
     async def _source_page_ids(
         self,
@@ -574,75 +562,48 @@ class WikiRetrievalService:
                     )
                 ).all()
             )
-            source_rows = list(
-                (
-                    await session.execute(
-                        select(WikiClaim, WikiClaimSource, Document, Chunk)
-                        .join(WikiPageVersion, WikiClaim.page_version_id == WikiPageVersion.id)
-                        .join(WikiPage, WikiPage.current_version_id == WikiPageVersion.id)
-                        .join(WikiClaimSource, WikiClaimSource.claim_id == WikiClaim.id)
-                        .join(Document, Document.id == WikiClaimSource.document_id)
-                        .join(Chunk, Chunk.id == WikiClaimSource.chunk_id)
-                        .where(
-                            WikiPage.id.in_(page_ids),
-                            WikiClaim.trust_state == "verified",
-                            WikiClaim.claim_type.in_(RETRIEVABLE_CLAIM_TYPES),
-                            Document.active_version_id == WikiClaimSource.document_version_id,
-                            Document.knowledge_base_id == WikiPage.knowledge_base_id,
-                            Document.status == "ready",
-                            Document.deleted_at.is_(None),
-                        )
-                        .order_by(WikiClaim.position, WikiClaim.id)
+            claim_ids = tuple(
+                await session.scalars(
+                    select(WikiClaim.id)
+                    .join(WikiPageVersion, WikiClaim.page_version_id == WikiPageVersion.id)
+                    .join(WikiPage, WikiPage.current_version_id == WikiPageVersion.id)
+                    .where(
+                        WikiPage.id.in_(page_ids),
+                        WikiClaim.trust_state == "verified",
+                        WikiClaim.claim_type.in_(RETRIEVABLE_CLAIM_TYPES),
                     )
-                ).all()
+                    .order_by(WikiClaim.position, WikiClaim.id)
+                )
+            )
+            verified_claims = await WikiReadModel(session).load_verified_claims(
+                claim_ids,
+                scope_ids=scope_ids,
+                require_index_ready=False,
             )
         aliases_by_page: dict[UUID, list[str]] = {}
         for page_id, alias in aliases:
             aliases_by_page.setdefault(page_id, []).append(alias)
-        claim_sources: dict[UUID, list[Source]] = {}
-        claims: dict[UUID, WikiClaim] = {}
-        for claim, source, document, chunk in source_rows:
-            if (
-                source.chunk_kind != chunk.kind
-                or source.chunk_ordinal != chunk.ordinal
-                or sha256(chunk.content.encode()).hexdigest() != source.content_sha256
-            ):
-                continue
-            claims[claim.id] = claim
-            claim_sources.setdefault(claim.id, []).append(
-                Source(
-                    citation_id="",
-                    chunk_id=chunk.id,
-                    document_id=document.id,
-                    document_version_id=chunk.document_version_id,
-                    title=document.title,
-                    filename=document.filename,
-                    page_start=chunk.page_start,
-                    page_end=chunk.page_end,
-                    heading_path=tuple(chunk.heading_path),
-                    excerpt=chunk.content[:500],
-                    score=0.0,
-                    rank=0,
-                )
-            )
+        claims_by_version: dict[UUID, list[VerifiedWikiClaim]] = {}
+        for claim in verified_claims:
+            if claim.valid:
+                claims_by_version.setdefault(claim.page_version_id, []).append(claim)
         records: dict[UUID, _PageRecord] = {}
         for page, version in page_rows:
             page_claims = tuple(
                 _ClaimRecord(
-                    id=claim.id,
+                    id=claim.claim_id,
                     text=claim.text,
                     position=claim.position,
                     claim_type=claim.claim_type,
-                    sources=tuple(claim_sources[claim.id]),
+                    sources=tuple(
+                        _search_source_response(source) for source in claim.sources if source.valid
+                    ),
                 )
                 for claim in sorted(
-                    (
-                        item
-                        for item in claims.values()
-                        if item.page_version_id == version.id and item.id in claim_sources
-                    ),
-                    key=lambda item: (item.position, str(item.id)),
+                    claims_by_version.get(version.id, []),
+                    key=lambda item: (item.position, str(item.claim_id)),
                 )
+                if any(source.valid for source in claim.sources)
             )
             records[page.id] = _PageRecord(
                 id=page.id,

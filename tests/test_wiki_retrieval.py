@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
+from hashlib import sha256
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.dialects import postgresql
 
 from agent_api.knowledge.application.citations import Source
+from agent_api.knowledge.infrastructure.database.models import Chunk
 from agent_api.knowledge.wiki.retrieval import (
     WikiRetrievalService,
     _build_metadata_statement,
@@ -100,6 +103,42 @@ class StubWikiRetrieval(WikiRetrievalService):
     ) -> dict[UUID, _PageRecord]:
         del scope_ids
         return {page_id: self.pages[page_id] for page_id in page_ids}
+
+
+class _Rows:
+    def __init__(self, rows: list[object]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[object]:
+        return self._rows
+
+
+class _HydrateSession:
+    def __init__(self, batches: list[list[object]], claim_ids: list[UUID]) -> None:
+        self._batches = batches
+        self._claim_ids = claim_ids
+        self.execute_count = 0
+
+    async def execute(self, statement: object) -> _Rows:
+        del statement
+        rows = self._batches[self.execute_count]
+        self.execute_count += 1
+        return _Rows(rows)
+
+    async def scalars(self, statement: object) -> list[UUID]:
+        del statement
+        return self._claim_ids
+
+
+class _HydrateSessionContext:
+    def __init__(self, session: _HydrateSession) -> None:
+        self._session = session
+
+    async def __aenter__(self) -> _HydrateSession:
+        return self._session
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
 
 
 def _page(
@@ -219,6 +258,94 @@ async def test_read_page_and_ranking_exclude_presentation_sections() -> None:
 
     assert [claim.claim_type for claim, _ in ranked] == ["summary_fact"]
     assert [claim.claim_type for claim in page["claims"]] == ["summary_fact"]
+
+
+async def test_hydrate_pages_uses_precise_parent_excerpt_for_legacy_sources() -> None:
+    base_id, page_id, version_id = uuid4(), uuid4(), uuid4()
+    document_id, document_version_id = uuid4(), uuid4()
+    parent = Chunk(
+        id=uuid4(),
+        document_version_id=document_version_id,
+        ordinal=0,
+        kind="parent",
+        content="前文。必须启用两个独立认证因素。后文。",
+        token_count=10,
+    )
+    child = Chunk(
+        id=uuid4(),
+        document_version_id=document_version_id,
+        parent_chunk_id=parent.id,
+        ordinal=1,
+        kind="child",
+        content="必须启用两个独立认证因素。",
+        char_start=3,
+        char_end=15,
+        token_count=10,
+    )
+    claim = SimpleNamespace(
+        id=uuid4(),
+        page_version_id=version_id,
+        claim_key="mfa",
+        text="必须启用 MFA",
+        trust_state="verified",
+        reason=None,
+        position=0,
+        claim_type="summary_fact",
+    )
+    source = SimpleNamespace(
+        id=uuid4(),
+        claim_id=claim.id,
+        document_id=document_id,
+        document_version_id=document_version_id,
+        chunk_id=child.id,
+        chunk_kind="child",
+        chunk_ordinal=1,
+        content_sha256=sha256(child.content.encode("utf-8")).hexdigest(),
+        document_title="认证规范",
+        heading_path=["认证"],
+        page_start=1,
+        page_end=1,
+    )
+    document = SimpleNamespace(
+        id=document_id,
+        title="认证规范",
+        filename="auth.md",
+        status="ready",
+        deleted_at=None,
+        active_version_id=document_version_id,
+    )
+    page = SimpleNamespace(
+        id=page_id,
+        knowledge_base_id=base_id,
+        slug="topic/auth",
+        title="身份认证",
+        page_type="topic",
+        current_version_id=version_id,
+    )
+    version = SimpleNamespace(id=version_id, summary="摘要", index_state="ready")
+    main_row = SimpleNamespace(
+        page=page,
+        version=version,
+        claim=claim,
+        source=source,
+        document=document,
+        chunk=child,
+    )
+    session = _HydrateSession(
+        batches=[[(page, version)], [], [main_row], [(parent,)]],
+        claim_ids=[claim.id],
+    )
+    retrieval = WikiRetrievalService(
+        lambda: _HydrateSessionContext(session), FakeSourceRetrieval([])
+    )  # type: ignore[arg-type]
+
+    records = await retrieval._hydrate_pages([page_id], (base_id,))
+
+    hydrated_source = records[page_id].claims[0].sources[0]
+    assert session.execute_count == 4
+    assert hydrated_source.parent_chunk_id == parent.id
+    assert hydrated_source.excerpt == parent.content
+    assert parent.content[hydrated_source.focus_start : hydrated_source.focus_end] == child.content
 
 
 async def test_reranker_failure_keeps_rrf_order() -> None:

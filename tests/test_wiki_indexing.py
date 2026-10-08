@@ -271,9 +271,56 @@ async def test_index_service_preserves_original_failure_when_cleanup_fails() -> 
 
     await fixture.service.run(fixture.job.id)
 
-    assert fixture.job.error_code == "index_count_mismatch"
-    assert fixture.version.index_error_code == "index_count_mismatch"
+    assert fixture.job.status == "retry_wait"
+    assert fixture.job.stage == "cleanup_pending"
+    assert fixture.job.error_code == "index_cleanup_failed"
+    assert fixture.version.index_state == "failed"
+    assert fixture.version.index_error_code == "index_cleanup_failed"
     assert cleanup_message not in fixture.job.error_reference
+
+
+@pytest.mark.asyncio
+async def test_index_service_retries_cleanup_before_any_reindex_work() -> None:
+    fixture = _service_fixture(delete_error=RuntimeError("暂时无法删除"))
+    projection = fixture.repository.projection
+    fixture.repository.fresh_projection = WikiIndexProjection(
+        aliases=("已变化别名",),
+        claims=projection.claims,
+        source_paths=projection.source_paths,
+        section_titles=projection.section_titles,
+        sources=projection.sources,
+    )
+
+    await fixture.service.run(fixture.job.id)
+    assert fixture.job.stage == "cleanup_pending"
+    assert fixture.job.status == "retry_wait"
+    assert fixture.version.index_state == "failed"
+    first_embed_count = fixture.calls.count("embed")
+    first_replace_count = fixture.calls.count("replace")
+
+    fixture.index.delete_error = None
+    fixture.page.current_version_id = uuid4()
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.calls.count("embed") == first_embed_count
+    assert fixture.calls.count("replace") == first_replace_count
+    assert fixture.calls.count("delete") == 2
+    assert fixture.job.status == "succeeded"
+    assert fixture.job.stage == "superseded"
+    assert fixture.version.index_state == "not_required"
+
+
+@pytest.mark.asyncio
+async def test_index_service_hard_conflict_delete_failure_is_not_silent_success() -> None:
+    fixture = _service_fixture(delete_error=RuntimeError("内部删除异常"))
+    fixture.repository.job_change_before_relock = ("embedding_fingerprint", "changed")
+
+    await fixture.service.run(fixture.job.id)
+
+    assert fixture.job.status in {"retry_wait", "failed"}
+    assert fixture.job.stage == "cleanup_pending"
+    assert fixture.job.error_code == "index_cleanup_failed"
+    assert fixture.version.index_state == "failed"
 
 
 @pytest.mark.asyncio
@@ -505,6 +552,73 @@ async def test_index_service_touches_heartbeat_during_blocking_embedding() -> No
 
 
 @pytest.mark.asyncio
+async def test_index_service_cancellation_stops_embedding_child() -> None:
+    fixture = _service_fixture(block_embedding=True, heartbeat_interval=0.01)
+    task = asyncio.create_task(fixture.service.run(fixture.job.id))
+    await asyncio.wait_for(fixture.embedder.started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert fixture.embedder.cancelled.is_set()
+    assert "replace" not in fixture.calls
+    assert fixture.index.units == []
+
+
+@pytest.mark.asyncio
+async def test_index_service_cancellation_settles_replace_then_cleans_write() -> None:
+    fixture = _service_fixture(block_replace=True, heartbeat_interval=0.01)
+    task = asyncio.create_task(fixture.service.run(fixture.job.id))
+    await asyncio.wait_for(fixture.index.replace_started.wait(), timeout=1)
+
+    task.cancel()
+    fixture.index.replace_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert fixture.index.replace_finished.is_set()
+    assert fixture.index.deleted == [fixture.version.id]
+    assert fixture.index.units == []
+
+
+@pytest.mark.asyncio
+async def test_index_service_cancellation_during_count_cleans_existing_write() -> None:
+    fixture = _service_fixture(block_count=True, heartbeat_interval=0.01)
+    task = asyncio.create_task(fixture.service.run(fixture.job.id))
+    await asyncio.wait_for(fixture.index.count_started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert fixture.index.count_cancelled.is_set()
+    assert fixture.index.deleted == [fixture.version.id]
+    assert fixture.index.units == []
+
+
+@pytest.mark.asyncio
+async def test_index_service_cancellation_persists_cleanup_debt_when_delete_fails() -> None:
+    fixture = _service_fixture(
+        block_replace=True,
+        delete_error=RuntimeError("删除服务内部地址"),
+        heartbeat_interval=0.01,
+    )
+    task = asyncio.create_task(fixture.service.run(fixture.job.id))
+    await asyncio.wait_for(fixture.index.replace_started.wait(), timeout=1)
+
+    task.cancel()
+    fixture.index.replace_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert fixture.job.stage == "cleanup_pending"
+    assert fixture.job.status in {"retry_wait", "failed"}
+    assert fixture.job.error_code == "index_cleanup_failed"
+    assert fixture.version.index_state == "failed"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("conflict_field", "conflict_value"),
     [
@@ -726,13 +840,18 @@ class _FakeEmbedder:
         self.block = block
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         self.calls.append("embed")
         assert texts
         if self.block:
             self.started.set()
-            await self.release.wait()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
         if self.vectors is not None:
             return self.vectors
         return [[0.1, 0.2] for _ in texts]
@@ -746,13 +865,22 @@ class _FakeIndex:
         count: int,
         replace_error: Exception | None = None,
         delete_error: Exception | None = None,
+        block_replace: bool = False,
+        block_count: bool = False,
     ) -> None:
         self.calls = calls
         self.count = count
         self.replace_error = replace_error
         self.delete_error = delete_error
+        self.block_replace = block_replace
+        self.block_count = block_count
         self.units: list[Any] = []
         self.deleted: list[UUID] = []
+        self.replace_started = asyncio.Event()
+        self.replace_release = asyncio.Event()
+        self.replace_finished = asyncio.Event()
+        self.count_started = asyncio.Event()
+        self.count_cancelled = asyncio.Event()
 
     async def replace_page_version(
         self,
@@ -762,11 +890,22 @@ class _FakeIndex:
         self.calls.append("replace")
         if self.replace_error is not None:
             raise self.replace_error
+        if self.block_replace:
+            self.replace_started.set()
+            await self.replace_release.wait()
         assert all(unit.page_version_id == page_version_id for unit in units)
         self.units = list(units)
+        self.replace_finished.set()
 
     async def count_page_version(self, page_version_id: UUID) -> int:
         self.calls.append("count")
+        if self.block_count:
+            self.count_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.count_cancelled.set()
+                raise
         return self.count
 
     async def delete_page_version(self, page_version_id: UUID) -> None:
@@ -806,6 +945,8 @@ def _service_fixture(
     heartbeat_interval: float = 30.0,
     relock_error: Exception | None = None,
     fail_save_stage_once: str | None = None,
+    block_replace: bool = False,
+    block_count: bool = False,
 ) -> _ServiceFixture:
     calls: list[str] = []
     version = _version(origin=origin, review_state=review_state)
@@ -864,6 +1005,8 @@ def _service_fixture(
         count=len(actual_claims) if index_count is None else index_count,
         replace_error=replace_error,
         delete_error=delete_error,
+        block_replace=block_replace,
+        block_count=block_count,
     )
     now = datetime(2026, 10, 8, 9, 30, tzinfo=UTC)
     service = WikiIndexService(

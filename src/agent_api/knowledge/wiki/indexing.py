@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -168,6 +169,10 @@ class _EmbeddingCountMismatch(RuntimeError):
 
 class _EmbeddingVectorInvalid(RuntimeError):
     """Embedding 向量为空、维度不符或包含非有限数。"""
+
+
+class _IndexCleanupFailed(RuntimeError):
+    """已写入索引清理失败，需要后续任务优先偿还删除债务。"""
 
 
 def _clean(value: str) -> str:
@@ -367,6 +372,9 @@ class WikiIndexService:
         if locked is None:
             return
         job, page, version = locked
+        if self._is_cleanup_pending(job, version):
+            await self._retry_cleanup(job, version)
+            return
         if not self._is_executable(job, version):
             return
         if page.current_version_id != version.id:
@@ -428,6 +436,7 @@ class WikiIndexService:
             await self._await_with_heartbeat(
                 job.id,
                 self._index.replace_page_version(target_version_id, indexed_units),
+                settle_on_cancel=True,
             )
 
             await self._advance(job, version, stage="verifying", progress=90)
@@ -459,7 +468,10 @@ class WikiIndexService:
                 embedding_fingerprint=original_fingerprint,
             )
             if hard_conflict:
-                await self._best_effort_delete(target_version_id)
+                cleaned = await self._try_delete(target_version_id)
+                if not cleaned:
+                    await self._mark_cleanup_pending(job, target_version)
+                    return
                 cleanup_required = False
                 conflict_version = version if version.id == target_version_id else target_version
                 await self._mark_state_conflict(job, conflict_version)
@@ -478,7 +490,10 @@ class WikiIndexService:
             )
             target_changed = page.current_version_id != target_version_id
             if target_changed or projection_changed:
-                await self._best_effort_delete(target_version_id)
+                cleaned = await self._try_delete(target_version_id)
+                if not cleaned:
+                    await self._mark_cleanup_pending(job, target_version)
+                    return
                 cleanup_required = False
                 await self._mark_superseded(job, target_version)
                 return
@@ -494,9 +509,23 @@ class WikiIndexService:
             job.error_code = None
             job.error_reference = None
             await self._repository.save_state(job, target_version)
+        except asyncio.CancelledError:
+            if cleanup_required:
+                cleaned = await self._run_shielded_to_completion(
+                    self._try_delete(target_version_id)
+                )
+                if not cleaned:
+                    with suppress(Exception):
+                        await self._run_shielded_to_completion(
+                            self._mark_cleanup_pending(job, target_version)
+                        )
+            raise
         except Exception as error:
             if cleanup_required:
-                await self._best_effort_delete(target_version_id)
+                cleaned = await self._try_delete(target_version_id)
+                if not cleaned:
+                    await self._mark_cleanup_pending(job, target_version)
+                    return
             if finalizing and job.status not in {"running", "succeeded"}:
                 return
             await self._mark_failed(
@@ -522,22 +551,90 @@ class WikiIndexService:
         )
         return normal_start or recovered_start
 
+    @staticmethod
+    def _is_cleanup_pending(
+        job: WikiIndexJobLike,
+        version: WikiPageVersionLike,
+    ) -> bool:
+        """清理债务优先于当前版本与普通索引状态校验。"""
+
+        return (
+            job.page_version_id == version.id
+            and job.stage == "cleanup_pending"
+            and job.status in {"retry_wait", "failed"}
+            and version.index_state == "failed"
+        )
+
+    async def _retry_cleanup(
+        self,
+        job: WikiIndexJobLike,
+        version: WikiPageVersionLike,
+    ) -> None:
+        """只重试删除，不重复执行 Embedding 或 Milvus replace。"""
+
+        job.attempt_count += 1
+        job.heartbeat_at = self._now()
+        cleaned = await self._try_delete(version.id)
+        if not cleaned:
+            await self._mark_cleanup_pending(job, version)
+            return
+        await self._mark_superseded(job, version)
+
     async def _await_with_heartbeat(
         self,
         job_id: UUID,
         operation: Awaitable[_ResultT],
+        *,
+        settle_on_cancel: bool = False,
     ) -> _ResultT:
         """等待外部慢操作，并用独立轻量事务维持任务租约。"""
 
         task = asyncio.ensure_future(operation)
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=self._heartbeat_interval)
-            if task in done:
-                return task.result()
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=self._heartbeat_interval)
+                if task in done:
+                    return task.result()
+                try:
+                    await self._repository.touch_heartbeat(job_id, self._now())
+                except Exception:
+                    # 心跳失败不能取消可能已在远端执行的 Embedding 或 Milvus 写入。
+                    continue
+        except asyncio.CancelledError:
+            if settle_on_cancel:
+                await self._settle_child(task)
+            else:
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+            raise
+
+    @staticmethod
+    async def _settle_child(task: asyncio.Future[_ResultT]) -> None:
+        """父任务取消后等待不可中断的线程封装操作真正落稳。"""
+
+        while not task.done():
             try:
-                await self._repository.touch_heartbeat(job_id, self._now())
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
             except Exception:
-                # 心跳失败不能取消可能已在远端执行的 Embedding 或 Milvus 写入。
+                break
+        if task.done() and not task.cancelled():
+            with suppress(Exception):
+                task.result()
+
+    @staticmethod
+    async def _run_shielded_to_completion(operation: Awaitable[_ResultT]) -> _ResultT:
+        """即使收到二次取消，也等待清理或状态持久化完成。"""
+
+        task = asyncio.ensure_future(operation)
+        while True:
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done():
+                    return task.result()
                 continue
 
     def _validate_vectors(self, vectors: Sequence[Sequence[float]]) -> None:
@@ -577,13 +674,14 @@ class WikiIndexService:
             and version.review_state == "published"
         )
 
-    async def _best_effort_delete(self, page_version_id: UUID) -> None:
-        """尽力清理已 flush 投影，清理异常不得覆盖原始失败。"""
+    async def _try_delete(self, page_version_id: UUID) -> bool:
+        """清理已 flush 投影，返回显式结果且不传播服务端错误文本。"""
 
         try:
             await self._index.delete_page_version(page_version_id)
         except Exception:
-            return
+            return False
+        return True
 
     async def _advance(
         self,
@@ -670,6 +768,26 @@ class WikiIndexService:
                 RuntimeError("index_state_conflict"),
             )
         job.heartbeat_at = self._now()
+        await self._repository.save_state(job, version)
+
+    async def _mark_cleanup_pending(
+        self,
+        job: WikiIndexJobLike,
+        version: WikiPageVersionLike,
+    ) -> None:
+        """持久化删除债务，后续执行必须先重试清理。"""
+
+        error = _IndexCleanupFailed()
+        version.index_state = "failed"
+        version.embedding_fingerprint = None
+        version.indexed_at = None
+        version.index_error_code = "index_cleanup_failed"
+        if job.status != "failed":
+            job.status = "retry_wait" if job.attempt_count < job.max_attempts else "failed"
+        job.stage = "cleanup_pending"
+        job.heartbeat_at = self._now()
+        job.error_code = "index_cleanup_failed"
+        job.error_reference = _stable_error_reference(job.id, "cleanup", error)
         await self._repository.save_state(job, version)
 
     async def _mark_failed(

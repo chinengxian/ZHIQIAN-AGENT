@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from uuid import UUID
 
 import pytest
 
 from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.infrastructure.database.models import (
+    Chunk,
+    Document,
+    WikiClaimSource,
     WikiJob,
     WikiPage,
     WikiPageVersion,
 )
+from agent_api.knowledge.wiki.service import WikiService
 from agent_api.knowledge.wiki.index_jobs import (
     SqlAlchemyWikiIndexRepository,
     apply_page_index_setup_failure,
@@ -161,6 +166,44 @@ def test_recovered_indexing_version_remains_indexing() -> None:
     assert version.index_state == "indexing"
 
 
+def test_stale_job_at_max_attempts_fails_version_with_stable_diagnostics() -> None:
+    version = WikiPageVersion(
+        id=VERSION_ID,
+        page_id=UUID("81000000-0000-0000-0000-000000000004"),
+        version_no=1,
+        title="标题",
+        content="正文",
+        summary="摘要",
+        origin="pipeline",
+        review_state="published",
+        index_state="indexing",
+    )
+    job = WikiJob(
+        id=JOB_ID,
+        knowledge_base_id=KB_ID,
+        page_version_id=VERSION_ID,
+        job_type="page_index",
+        status="running",
+        stage="writing",
+        progress=70,
+        attempt_count=5,
+        max_attempts=5,
+        reserved_tokens=0,
+        heartbeat_at=datetime.now(UTC) - timedelta(minutes=6),
+        payload={},
+        idempotency_key=f"wiki-index:{VERSION_ID}:fp-v1",
+    )
+
+    SqlAlchemyWikiIndexRepository.prepare_stale_recovery(job, version)
+
+    assert job.status == "failed"
+    assert job.error_code == "wiki_index_heartbeat_timeout"
+    assert job.error_reference is not None
+    assert version.index_state == "failed"
+    assert version.index_error_code == "wiki_index_heartbeat_timeout"
+    assert job.next_retry_at is None
+
+
 def test_index_job_never_reserves_wiki_tokens() -> None:
     job = WikiJob(
         knowledge_base_id=KB_ID,
@@ -291,6 +334,95 @@ async def test_backfill_creates_two_grounded_jobs_skips_manual_and_keeps_tokens(
     assert tokens_charged == 1234
     assert len(first.added) == 2
     assert second.added == []
+
+
+async def test_backfill_requeues_existing_failed_job_without_duplicate_job() -> None:
+    page = WikiPage(
+        id=UUID("81000000-0000-0000-0000-000000000004"),
+        knowledge_base_id=KB_ID,
+        slug="summary/doc",
+        page_type="summary",
+        title="规范",
+        current_version_id=VERSION_ID,
+    )
+    version = WikiPageVersion(
+        id=VERSION_ID,
+        page_id=page.id,
+        version_no=1,
+        title="规范",
+        content="正文",
+        summary="摘要",
+        origin="pipeline",
+        review_state="published",
+        index_state="failed",
+        embedding_fingerprint=None,
+        index_error_code="embedding_failed",
+    )
+    failed_job = WikiJob(
+        id=JOB_ID,
+        knowledge_base_id=KB_ID,
+        page_version_id=VERSION_ID,
+        embedding_fingerprint="fp-v1",
+        job_type="page_index",
+        status="failed",
+        stage="failed",
+        progress=35,
+        attempt_count=5,
+        max_attempts=5,
+        reserved_tokens=0,
+        payload={},
+        idempotency_key=f"wiki-index:{VERSION_ID}:fp-v1",
+    )
+
+    class _Result:
+        def __iter__(self):
+            return iter(((page, version),))
+
+    class _Session:
+        def __init__(self) -> None:
+            self.values = iter((1, None, failed_job))
+            self.added: list[object] = []
+
+        async def execute(self, statement: object) -> _Result:
+            del statement
+            return _Result()
+
+        async def scalar(self, statement: object) -> object:
+            del statement
+            return next(self.values)
+
+        def add(self, value: object) -> None:
+            self.added.append(value)
+
+    session = _Session()
+    result = await schedule_current_page_indexes(
+        session,  # type: ignore[arg-type]
+        knowledge_base_id=KB_ID,
+        index_enabled=True,
+        fingerprint="fp-v1",
+    )
+
+    assert result == (0, 1, 0)
+    assert version.index_state == "pending"
+    assert version.embedding_fingerprint == "fp-v1"
+    assert failed_job.status == "pending"
+    assert failed_job.attempt_count == 0
+    assert len(session.added) == 1
+
+    # 同一事务后的重复回填只报告 existing，不再增加等价任务或事件。
+    class _RepeatedSession(_Session):
+        def __init__(self) -> None:
+            self.values = iter((1,))
+            self.added = []
+
+    repeated = _RepeatedSession()
+    assert await schedule_current_page_indexes(
+        repeated,  # type: ignore[arg-type]
+        knowledge_base_id=KB_ID,
+        index_enabled=True,
+        fingerprint="fp-v1",
+    ) == (0, 1, 0)
+    assert repeated.added == []
 
 
 async def test_non_executable_job_releases_locked_session() -> None:
@@ -525,3 +657,59 @@ async def test_retry_with_existing_new_fingerprint_returns_exact_job() -> None:
     assert result == existing_id
     lookup_sql = str(session.statements[-1].compile()).lower()
     assert "idempotency_key" in lookup_sql
+
+
+async def test_source_validation_rejects_mismatched_chunk_id() -> None:
+    document_id = UUID("84000000-0000-0000-0000-000000000001")
+    document_version_id = UUID("84000000-0000-0000-0000-000000000002")
+    expected_chunk_id = UUID("84000000-0000-0000-0000-000000000003")
+    actual_chunk_id = UUID("84000000-0000-0000-0000-000000000004")
+    content = "可信原文"
+    document = Document(
+        id=document_id,
+        knowledge_base_id=KB_ID,
+        title="规范",
+        filename="policy.md",
+        mime_type="text/markdown",
+        status="ready",
+        active_version_id=document_version_id,
+    )
+    chunk = Chunk(
+        id=actual_chunk_id,
+        document_version_id=document_version_id,
+        ordinal=0,
+        kind="child",
+        content=content,
+        token_count=4,
+    )
+    source = WikiClaimSource(
+        claim_id=UUID("84000000-0000-0000-0000-000000000005"),
+        document_id=document_id,
+        document_version_id=document_version_id,
+        chunk_id=expected_chunk_id,
+        chunk_kind="child",
+        chunk_ordinal=0,
+        content_sha256=sha256(content.encode()).hexdigest(),
+        document_title="规范",
+        heading_path=[],
+    )
+
+    class _Session:
+        async def get(self, model: object, identity: UUID) -> Document:
+            del model, identity
+            return document
+
+        async def scalar(self, statement: object) -> Chunk:
+            del statement
+            return chunk
+
+    assert await WikiService._source_valid(  # noqa: SLF001
+        _Session(),  # type: ignore[arg-type]
+        source,
+    ) is False
+
+    chunk.id = expected_chunk_id
+    assert await WikiService._source_valid(  # noqa: SLF001
+        _Session(),  # type: ignore[arg-type]
+        source,
+    ) is True

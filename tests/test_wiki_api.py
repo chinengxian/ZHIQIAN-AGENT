@@ -6,7 +6,13 @@ import httpx
 from fastapi import FastAPI
 
 from agent_api.knowledge.application.citations import Source
-from agent_api.knowledge.wiki.api import WikiPageResponse, get_wiki_retrieval, router
+from agent_api.knowledge.wiki.api import (
+    WikiJobResponse,
+    WikiPageResponse,
+    WikiPageSummary,
+    get_wiki_retrieval,
+    router,
+)
 from agent_api.knowledge.wiki.retrieval import (
     WikiMatchedClaim,
     WikiMatchedPage,
@@ -193,3 +199,39 @@ def test_page_response_exposes_sections_and_metadata_separately_from_claims() ->
 
     assert page.summary_sections[0].title == "概述"
     assert page.metadata[0].value == "3.0"
+
+
+def test_page_and_job_responses_expose_index_diagnostics_without_content() -> None:
+    page = WikiPageSummary.model_validate(
+        {
+            "id": uuid4(),
+            "knowledge_base_id": uuid4(),
+            "slug": "summary/doc",
+            "page_type": "summary",
+            "title": "规范",
+            "current_version_id": uuid4(),
+            "index_state": "failed",
+            "index_error_code": "embedding_failed",
+        }
+    )
+    job = WikiJobResponse.model_validate(
+        {
+            "id": uuid4(),
+            "page_version_id": uuid4(),
+            "embedding_fingerprint": "fp-v1",
+            "job_type": "page_index",
+            "status": "failed",
+            "stage": "failed",
+            "progress": 70,
+            "error_code": "embedding_failed",
+            "error_reference": "ref-123",
+            "estimated_tokens": 0,
+            "actual_tokens": None,
+            "charged_tokens": 0,
+            "created_at": "2026-10-08T00:00:00Z",
+        }
+    )
+
+    assert page.index_state == "failed"
+    assert job.page_version_id is not None
+    assert "content" not in job.model_dump()

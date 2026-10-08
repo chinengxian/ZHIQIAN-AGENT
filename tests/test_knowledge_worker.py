@@ -116,5 +116,9 @@ def test_celery_factory_uses_json_and_schedules_outbox_dispatch() -> None:
     assert app.conf.beat_schedule["recover-stale-ingestion-jobs"]["task"] == (
         "agent_api.knowledge.recover_stale_jobs"
     )
+    assert app.conf.beat_schedule["recover-stale-wiki-index-jobs"]["task"] == (
+        "agent_api.knowledge.recover_stale_wiki_index_jobs"
+    )
+    assert app.conf.beat_schedule["recover-stale-wiki-index-jobs"]["schedule"] == 60.0
     # 日志应记录 Celery 应用身份而不是展开包含 broker 凭据的内部配置对象。
     assert "queue-secret" not in repr(app)

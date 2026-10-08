@@ -13,6 +13,8 @@ def test_outbox_event_type_members_are_complete() -> None:
         OutboxEventType.DOCUMENT_VERSION_CLEANUP_REQUESTED,
         OutboxEventType.KNOWLEDGE_BASE_DELETION_REQUESTED,
         OutboxEventType.WIKI_DOCUMENT_GENERATE_REQUESTED,
+        OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
+        OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED,
     }
 
 

@@ -13,6 +13,8 @@ from agent_api.knowledge.infrastructure.database.models import (
 )
 from agent_api.knowledge.wiki.index_jobs import (
     SqlAlchemyWikiIndexRepository,
+    apply_page_index_setup_failure,
+    retry_page_index_job,
     mark_and_schedule_page_index,
     schedule_current_page_indexes,
     schedule_page_index,
@@ -363,3 +365,163 @@ def test_retry_time_does_not_exceed_five_minutes(attempt: int) -> None:
     now = datetime.now(UTC)
     delay = SqlAlchemyWikiIndexRepository.retry_delay(attempt)
     assert now + timedelta(seconds=delay) <= now + timedelta(minutes=5)
+
+
+def test_setup_failure_schedules_retry_without_exposing_exception_text() -> None:
+    version = WikiPageVersion(
+        id=VERSION_ID,
+        page_id=UUID("81000000-0000-0000-0000-000000000004"),
+        version_no=1,
+        title="标题",
+        content="正文",
+        summary="摘要",
+        origin="pipeline",
+        review_state="published",
+        index_state="pending",
+    )
+    job = WikiJob(
+        id=JOB_ID,
+        knowledge_base_id=KB_ID,
+        page_version_id=VERSION_ID,
+        job_type="page_index",
+        status="pending",
+        stage="pending",
+        progress=0,
+        attempt_count=0,
+        max_attempts=5,
+        reserved_tokens=0,
+        payload={},
+        idempotency_key=f"wiki-index:{VERSION_ID}:fp-v1",
+    )
+
+    event = apply_page_index_setup_failure(
+        job,
+        version,
+        stage="milvus_setup",
+        error=RuntimeError("正文与secret都不能进入错误"),
+        now=datetime(2026, 10, 8, tzinfo=UTC),
+    )
+
+    assert job.attempt_count == 1
+    assert job.status == "retry_wait"
+    assert version.index_state == "failed"
+    assert job.error_code == "wiki_index_worker_setup_failed"
+    assert "正文" not in (job.error_reference or "")
+    assert "secret" not in (job.error_reference or "")
+    assert event is not None
+    assert event.payload == {"job_id": str(JOB_ID)}
+    assert event.available_at == datetime(2026, 10, 8, tzinfo=UTC) + timedelta(seconds=2)
+
+
+def test_fifth_setup_failure_is_terminal_without_retry_event() -> None:
+    version = WikiPageVersion(
+        id=VERSION_ID,
+        page_id=UUID("81000000-0000-0000-0000-000000000004"),
+        version_no=1,
+        title="标题",
+        content="正文",
+        summary="摘要",
+        origin="pipeline",
+        review_state="published",
+        index_state="failed",
+    )
+    job = WikiJob(
+        id=JOB_ID,
+        knowledge_base_id=KB_ID,
+        page_version_id=VERSION_ID,
+        job_type="page_index",
+        status="retry_wait",
+        stage="failed",
+        progress=0,
+        attempt_count=4,
+        max_attempts=5,
+        reserved_tokens=0,
+        payload={},
+        idempotency_key=f"wiki-index:{VERSION_ID}:fp-v1",
+    )
+
+    event = apply_page_index_setup_failure(
+        job,
+        version,
+        stage="embedding_setup",
+        error=RuntimeError("do-not-leak"),
+        now=datetime(2026, 10, 8, tzinfo=UTC),
+    )
+
+    assert job.attempt_count == 5
+    assert job.status == "failed"
+    assert event is None
+
+
+async def test_retry_with_new_fingerprint_creates_new_consistent_job() -> None:
+    old = WikiJob(
+        id=JOB_ID,
+        knowledge_base_id=KB_ID,
+        page_version_id=VERSION_ID,
+        embedding_fingerprint="old-fp",
+        job_type="page_index",
+        status="failed",
+        stage="failed",
+        progress=0,
+        attempt_count=5,
+        max_attempts=5,
+        reserved_tokens=0,
+        payload={},
+        idempotency_key=f"wiki-index:{VERSION_ID}:old-fp",
+    )
+    new_id = UUID("81000000-0000-0000-0000-000000000006")
+    session = _ScheduleSession(new_id)
+
+    result = await retry_page_index_job(
+        session,  # type: ignore[arg-type]
+        knowledge_base_id=KB_ID,
+        page_version_id=VERSION_ID,
+        fingerprint="new-fp",
+        failed_job=old,
+    )
+
+    assert result == new_id
+    assert old.embedding_fingerprint == "old-fp"
+    assert old.idempotency_key == f"wiki-index:{VERSION_ID}:old-fp"
+
+
+async def test_retry_with_existing_new_fingerprint_returns_exact_job() -> None:
+    old = WikiJob(
+        id=JOB_ID,
+        knowledge_base_id=KB_ID,
+        page_version_id=VERSION_ID,
+        embedding_fingerprint="old-fp",
+        job_type="page_index",
+        status="failed",
+        stage="failed",
+        progress=0,
+        attempt_count=5,
+        max_attempts=5,
+        reserved_tokens=0,
+        payload={},
+        idempotency_key=f"wiki-index:{VERSION_ID}:old-fp",
+    )
+    existing_id = UUID("81000000-0000-0000-0000-000000000007")
+
+    class _Session(_ScheduleSession):
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.calls = 0
+
+        async def scalar(self, statement: object) -> UUID | None:
+            self.statements.append(statement)
+            self.calls += 1
+            return None if self.calls == 1 else existing_id
+
+    session = _Session()
+    result = await retry_page_index_job(
+        session,  # type: ignore[arg-type]
+        knowledge_base_id=KB_ID,
+        page_version_id=VERSION_ID,
+        fingerprint="new-fp",
+        failed_job=old,
+    )
+
+    assert result == existing_id
+    lookup_sql = str(session.statements[-1].compile()).lower()
+    assert "idempotency_key" in lookup_sql

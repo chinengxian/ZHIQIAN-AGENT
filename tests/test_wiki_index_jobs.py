@@ -15,7 +15,6 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiPage,
     WikiPageVersion,
 )
-from agent_api.knowledge.wiki.service import WikiService
 from agent_api.knowledge.wiki.index_jobs import (
     SqlAlchemyWikiIndexRepository,
     apply_page_index_setup_failure,
@@ -24,6 +23,7 @@ from agent_api.knowledge.wiki.index_jobs import (
     schedule_current_page_indexes,
     schedule_page_index,
 )
+from agent_api.knowledge.wiki.service import WikiService
 
 KB_ID = UUID("81000000-0000-0000-0000-000000000001")
 VERSION_ID = UUID("81000000-0000-0000-0000-000000000002")
@@ -703,13 +703,19 @@ async def test_source_validation_rejects_mismatched_chunk_id() -> None:
             del statement
             return chunk
 
-    assert await WikiService._source_valid(  # noqa: SLF001
-        _Session(),  # type: ignore[arg-type]
-        source,
-    ) is False
+    assert (
+        await WikiService._source_valid(  # noqa: SLF001
+            _Session(),  # type: ignore[arg-type]
+            source,
+        )
+        is False
+    )
 
     chunk.id = expected_chunk_id
-    assert await WikiService._source_valid(  # noqa: SLF001
-        _Session(),  # type: ignore[arg-type]
-        source,
-    ) is True
+    assert (
+        await WikiService._source_valid(  # noqa: SLF001
+            _Session(),  # type: ignore[arg-type]
+            source,
+        )
+        is True
+    )

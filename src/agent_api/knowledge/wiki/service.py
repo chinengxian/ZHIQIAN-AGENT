@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from hashlib import sha256
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -25,6 +24,7 @@ from agent_api.knowledge.infrastructure.database.models import (
 from agent_api.knowledge.wiki.index_jobs import (
     retry_page_index_job,
     schedule_current_page_indexes,
+    source_matches_chunk,
     try_backfill_lock,
 )
 from agent_api.knowledge.wiki.jobs import schedule_document_wiki
@@ -369,10 +369,7 @@ class WikiService:
                 Chunk.ordinal == source.chunk_ordinal,
             )
         )
-        return (
-            chunk is not None
-            and sha256(chunk.content.encode()).hexdigest() == source.content_sha256
-        )
+        return chunk is not None and source_matches_chunk(source, chunk)
 
     async def list_versions(self, knowledge_base_id: UUID, page_id: UUID) -> list[dict[str, Any]]:
         async with self._sessions() as session:

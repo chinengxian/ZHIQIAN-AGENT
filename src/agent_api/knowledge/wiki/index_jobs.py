@@ -6,7 +6,7 @@ from hashlib import sha256
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, select, text, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -48,6 +48,18 @@ def _setup_error_reference(job_id: UUID, stage: str, error: BaseException) -> st
 
     payload = f"{job_id}:{stage}:{type(error).__module__}.{type(error).__qualname__}"
     return sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def source_matches_chunk(source: WikiClaimSource, chunk: Chunk) -> bool:
+    """来源显式记录 chunk_id 时必须与定位字段解析出的分块完全一致。"""
+
+    return (
+        (source.chunk_id is None or source.chunk_id == chunk.id)
+        and source.document_version_id == chunk.document_version_id
+        and source.chunk_kind == chunk.kind
+        and source.chunk_ordinal == chunk.ordinal
+        and sha256(chunk.content.encode("utf-8")).hexdigest() == source.content_sha256
+    )
 
 
 def apply_page_index_setup_failure(
@@ -301,13 +313,10 @@ async def schedule_current_page_indexes(
             "pending",
             "indexing",
             "ready",
-            "failed",
         }:
-            # 重复回填只报告既有任务，不能把 ready 或失败诊断降回 pending。
+            # 重复回填只报告已在执行或完成的同指纹任务，不能把 ready 降回 pending。
             existing += 1
             continue
-        version.index_state = "pending"
-        version.embedding_fingerprint = fingerprint
         job_id = await schedule_page_index(
             session,
             knowledge_base_id=knowledge_base_id,
@@ -315,8 +324,33 @@ async def schedule_current_page_indexes(
             fingerprint=fingerprint,
         )
         if job_id is None:
+            expected_key = f"wiki-index:{version.id}:{fingerprint}"
+            existing_job = await session.scalar(
+                select(WikiJob).where(WikiJob.idempotency_key == expected_key)
+            )
+            if existing_job is not None and existing_job.status == "failed":
+                await retry_page_index_job(
+                    session,
+                    knowledge_base_id=knowledge_base_id,
+                    page_version_id=version.id,
+                    fingerprint=fingerprint,
+                    failed_job=existing_job,
+                )
+                version.index_state = "pending"
+                version.embedding_fingerprint = fingerprint
+                version.index_error_code = None
+            elif existing_job is not None and existing_job.status in {
+                "pending",
+                "retry_wait",
+            }:
+                version.index_state = "pending"
+                version.embedding_fingerprint = fingerprint
+                version.index_error_code = None
             existing += 1
         else:
+            version.index_state = "pending"
+            version.embedding_fingerprint = fingerprint
+            version.index_error_code = None
             created += 1
     return created, existing, skipped
 
@@ -346,11 +380,27 @@ class SqlAlchemyWikiIndexRepository:
     def prepare_stale_recovery(job: WikiJob, version: WikiPageVersion) -> None:
         """恢复任务租约但保留 indexing，供 Task4 的 recovered_start 继续执行。"""
 
-        job.status = "retry_wait" if job.attempt_count < job.max_attempts else "failed"
-        job.next_retry_at = datetime.now(UTC)
-        job.heartbeat_at = datetime.now(UTC)
-        if version.index_state != "indexing":
-            version.index_state = "failed"
+        now = datetime.now(UTC)
+        job.heartbeat_at = now
+        if job.attempt_count < job.max_attempts:
+            job.status = "retry_wait"
+            job.next_retry_at = now
+            if version.index_state != "indexing":
+                version.index_state = "failed"
+            return
+        job.status = "failed"
+        job.stage = "failed"
+        job.next_retry_at = None
+        job.error_code = "wiki_index_heartbeat_timeout"
+        job.error_reference = _setup_error_reference(
+            job.id,
+            "heartbeat_timeout",
+            TimeoutError(),
+        )
+        version.index_state = "failed"
+        version.embedding_fingerprint = None
+        version.indexed_at = None
+        version.index_error_code = job.error_code
 
     async def lock_job_and_version(
         self, job_id: UUID
@@ -547,6 +597,10 @@ class SqlAlchemyWikiIndexRepository:
                         Chunk.document_version_id == WikiClaimSource.document_version_id,
                         Chunk.kind == WikiClaimSource.chunk_kind,
                         Chunk.ordinal == WikiClaimSource.chunk_ordinal,
+                        or_(
+                            WikiClaimSource.chunk_id.is_(None),
+                            Chunk.id == WikiClaimSource.chunk_id,
+                        ),
                     ),
                 )
                 .where(WikiClaimSource.claim_id.in_(claim_ids))
@@ -556,7 +610,7 @@ class SqlAlchemyWikiIndexRepository:
         paths: dict[UUID, list[str]] = defaultdict(list)
         snapshots: list[WikiSourceSnapshot] = []
         for source, chunk in rows:
-            if sha256(chunk.content.encode("utf-8")).hexdigest() != source.content_sha256:
+            if not source_matches_chunk(source, chunk):
                 continue
             path = " / ".join(
                 str(part).strip() for part in source.heading_path if str(part).strip()

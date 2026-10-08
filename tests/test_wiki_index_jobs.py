@@ -222,6 +222,75 @@ async def test_repeated_backfill_keeps_ready_version_ready() -> None:
     assert version.index_state == "ready"
 
 
+async def test_backfill_creates_two_grounded_jobs_skips_manual_and_keeps_tokens() -> None:
+    versions: list[tuple[WikiPage, WikiPageVersion]] = []
+    for index, origin in enumerate(("pipeline", "revert", "user"), start=1):
+        page_id = UUID(f"82000000-0000-0000-0000-{index:012d}")
+        version_id = UUID(f"83000000-0000-0000-0000-{index:012d}")
+        page = WikiPage(
+            id=page_id,
+            knowledge_base_id=KB_ID,
+            slug=f"summary/{index}",
+            page_type="summary",
+            title=f"规范{index}",
+            current_version_id=version_id,
+        )
+        version = WikiPageVersion(
+            id=version_id,
+            page_id=page_id,
+            version_no=1,
+            title=page.title,
+            content="正文",
+            summary="摘要",
+            origin=origin,
+            review_state="published",
+            index_state="not_required",
+        )
+        versions.append((page, version))
+
+    class _Result:
+        def __iter__(self):
+            return iter(versions)
+
+    class _Session:
+        def __init__(self, values: list[object]) -> None:
+            self.values = iter(values)
+            self.added: list[object] = []
+
+        async def execute(self, statement: object) -> _Result:
+            del statement
+            return _Result()
+
+        async def scalar(self, statement: object) -> object:
+            del statement
+            return next(self.values)
+
+        def add(self, value: object) -> None:
+            self.added.append(value)
+
+    tokens_charged = 1234
+    first = _Session([1, JOB_ID, 1, UUID("81000000-0000-0000-0000-000000000005")])
+    first_result = await schedule_current_page_indexes(
+        first,  # type: ignore[arg-type]
+        knowledge_base_id=KB_ID,
+        index_enabled=True,
+        fingerprint="fp-v1",
+    )
+    second = _Session([1, 1])
+    second_result = await schedule_current_page_indexes(
+        second,  # type: ignore[arg-type]
+        knowledge_base_id=KB_ID,
+        index_enabled=True,
+        fingerprint="fp-v1",
+    )
+
+    assert first_result == (2, 0, 1)
+    assert second_result == (0, 2, 1)
+    assert tokens_charged == 1234
+    assert len(first.added) == 2
+    assert second.added == []
+
+
 async def test_non_executable_job_releases_locked_session() -> None:
     page = WikiPage(
         id=UUID("81000000-0000-0000-0000-000000000004"),

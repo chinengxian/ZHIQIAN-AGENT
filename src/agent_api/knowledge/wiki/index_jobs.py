@@ -37,6 +37,86 @@ _CLEANUP_PENDING_STAGES = {
 }
 
 
+def _retry_delay(attempt_count: int) -> int:
+    """按任务尝试次数计算最多五分钟的指数退避。"""
+
+    return int(min(300, 2 ** min(max(attempt_count, 0), 8)))
+
+
+def _setup_error_reference(job_id: UUID, stage: str, error: BaseException) -> str:
+    """只哈希异常类型，不把异常文本、正文或凭据写入数据库。"""
+
+    payload = f"{job_id}:{stage}:{type(error).__module__}.{type(error).__qualname__}"
+    return sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def apply_page_index_setup_failure(
+    job: WikiJob,
+    version: WikiPageVersion,
+    *,
+    stage: str,
+    error: BaseException,
+    now: datetime,
+) -> OutboxEvent | None:
+    """把 Worker 装配失败收敛为可重试或终止状态。"""
+
+    job.attempt_count += 1
+    job.status = "retry_wait" if job.attempt_count < job.max_attempts else "failed"
+    job.stage = "failed"
+    job.heartbeat_at = now
+    job.error_code = "wiki_index_worker_setup_failed"
+    job.error_reference = _setup_error_reference(job.id, stage, error)
+    version.index_state = "failed"
+    version.embedding_fingerprint = None
+    version.indexed_at = None
+    version.index_error_code = job.error_code
+    if job.status == "failed":
+        job.next_retry_at = None
+        return None
+    job.next_retry_at = now + timedelta(seconds=_retry_delay(job.attempt_count))
+    return OutboxEvent(
+        event_key=f"wiki-index-setup-retry:{job.id}:{job.attempt_count}",
+        event_type=OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
+        aggregate_id=job.id,
+        payload={"job_id": str(job.id)},
+        available_at=job.next_retry_at,
+    )
+
+
+async def record_page_index_setup_failure(
+    sessions: async_sessionmaker[AsyncSession],
+    job_id: UUID,
+    *,
+    stage: str,
+    error: BaseException,
+) -> None:
+    """在独立 PostgreSQL 事务中锁定任务并持久化装配失败。"""
+
+    async with sessions() as session, session.begin():
+        row = (
+            await session.execute(
+                select(WikiJob, WikiPageVersion)
+                .join(WikiPageVersion, WikiJob.page_version_id == WikiPageVersion.id)
+                .where(WikiJob.id == job_id, WikiJob.job_type == "page_index")
+                .with_for_update()
+            )
+        ).one_or_none()
+        if row is None:
+            return
+        job, version = row
+        if job.status not in {"pending", "retry_wait", "running"}:
+            return
+        event = apply_page_index_setup_failure(
+            job,
+            version,
+            stage=stage,
+            error=error,
+            now=datetime.now(UTC),
+        )
+        if event is not None:
+            session.add(event)
+
+
 async def schedule_page_index(
     session: AsyncSession,
     *,
@@ -80,6 +160,55 @@ async def schedule_page_index(
         )
     )
     return inserted
+
+
+async def retry_page_index_job(
+    session: AsyncSession,
+    *,
+    knowledge_base_id: UUID,
+    page_version_id: UUID,
+    fingerprint: str,
+    failed_job: WikiJob | None,
+) -> UUID:
+    """同指纹复用失败任务；指纹变化时创建或精确复用新幂等键任务。"""
+
+    expected_key = f"wiki-index:{page_version_id}:{fingerprint}"
+    if (
+        failed_job is not None
+        and failed_job.embedding_fingerprint == fingerprint
+        and failed_job.idempotency_key == expected_key
+    ):
+        failed_job.status = "pending"
+        failed_job.stage = "pending"
+        failed_job.progress = 0
+        failed_job.attempt_count = 0
+        failed_job.next_retry_at = None
+        failed_job.error_code = None
+        failed_job.error_reference = None
+        session.add(
+            OutboxEvent(
+                event_key=f"wiki-index-manual-retry:{failed_job.id}:{uuid4()}",
+                event_type=OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
+                aggregate_id=failed_job.id,
+                payload={"job_id": str(failed_job.id)},
+            )
+        )
+        return failed_job.id
+
+    job_id = await schedule_page_index(
+        session,
+        knowledge_base_id=knowledge_base_id,
+        page_version_id=page_version_id,
+        fingerprint=fingerprint,
+    )
+    if job_id is not None:
+        return job_id
+    existing_id = await session.scalar(
+        select(WikiJob.id).where(WikiJob.idempotency_key == expected_key)
+    )
+    if existing_id is None:
+        raise RuntimeError("wiki_index_retry_job_missing")
+    return existing_id
 
 
 async def has_indexable_sources(session: AsyncSession, page_version_id: UUID) -> bool:
@@ -211,7 +340,7 @@ class SqlAlchemyWikiIndexRepository:
     def retry_delay(attempt_count: int) -> int:
         """按尝试次数计算最多五分钟的指数退避。"""
 
-        return int(min(300, 2 ** min(max(attempt_count, 0), 8)))
+        return _retry_delay(attempt_count)
 
     @staticmethod
     def prepare_stale_recovery(job: WikiJob, version: WikiPageVersion) -> None:

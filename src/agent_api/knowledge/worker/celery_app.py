@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -23,6 +24,7 @@ from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
 from agent_api.knowledge.wiki.generator import ChatWikiGenerator
 from agent_api.knowledge.wiki.index_jobs import (
     SqlAlchemyWikiIndexRepository,
+    record_page_index_setup_failure,
     recover_stale_page_index_jobs,
 )
 from agent_api.knowledge.wiki.indexing import WikiIndexService, embedding_fingerprint
@@ -33,6 +35,14 @@ from agent_api.llm.strategy import STRATEGIES
 
 settings = get_settings()
 app = create_celery_app(settings)
+
+
+class WikiIndexWorkerError(RuntimeError):
+    """只暴露稳定错误码的 Wiki 索引 Worker 异常。"""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 async def _process_event(event_type: OutboxEventType, payload: dict[str, object]) -> None:
@@ -59,35 +69,67 @@ async def _process_event(event_type: OutboxEventType, payload: dict[str, object]
         OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
         OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED,
     }:
-        database = DatabaseRuntime(settings.database_url.get_secret_value())
-        token = settings.milvus_token.get_secret_value() if settings.milvus_token else None
-        options: dict[str, str] = {"uri": settings.milvus_uri}
-        if token:
-            options["token"] = token
-        milvus = await asyncio.to_thread(MilvusClient, **options)
+        wiki_database: DatabaseRuntime | None = None
+        wiki_milvus: MilvusClient | None = None
+        stage = "database_setup"
+        job_id: UUID | None = None
         try:
+            if event_type is OutboxEventType.WIKI_PAGE_INDEX_REQUESTED:
+                job_id = UUID(str(payload["job_id"]))
+            wiki_database = DatabaseRuntime(settings.database_url.get_secret_value())
+            token = settings.milvus_token.get_secret_value() if settings.milvus_token else None
+            options: dict[str, str] = {"uri": settings.milvus_uri}
+            if token:
+                options["token"] = token
+            stage = "milvus_setup"
+            wiki_milvus = await asyncio.to_thread(MilvusClient, **options)
             index = MilvusWikiIndex(
-                milvus,
+                wiki_milvus,
                 search_collection=settings.wiki_milvus_collection_alias,
                 write_collection=settings.wiki_milvus_collection_version,
             )
             if event_type is OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED:
+                stage = "delete"
                 await index.delete_page_version(UUID(str(payload["page_version_id"])))
                 return
+            stage = "repository_setup"
             repository = SqlAlchemyWikiIndexRepository(
-                database.session_factory,
+                wiki_database.session_factory,
                 embedding_dimension=settings.embedding_dimension,
             )
+            stage = "embedding_setup"
+            embedder = create_embedding_adapter(settings)
+            stage = "service_setup"
             service = WikiIndexService(
                 repository=repository,
-                embedder=create_embedding_adapter(settings),
+                embedder=embedder,
                 index=index,
                 embedding_dimension=settings.embedding_dimension,
             )
-            await service.run(UUID(str(payload["job_id"])))
+            stage = "service_run"
+            assert job_id is not None
+            await service.run(job_id)
+        except Exception as error:
+            if event_type is OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED:
+                raise WikiIndexWorkerError("wiki_index_delete_failed") from None
+            if wiki_database is None or job_id is None:
+                raise WikiIndexWorkerError("wiki_index_database_unavailable") from None
+            try:
+                await record_page_index_setup_failure(
+                    wiki_database.session_factory,
+                    job_id,
+                    stage=stage,
+                    error=error,
+                )
+            except Exception:
+                raise WikiIndexWorkerError("wiki_index_failure_persist_failed") from None
         finally:
-            await asyncio.to_thread(milvus.close)
-            await database.close()
+            if wiki_milvus is not None:
+                with suppress(Exception):
+                    await asyncio.to_thread(wiki_milvus.close)
+            if wiki_database is not None:
+                with suppress(Exception):
+                    await wiki_database.close()
         return
     async with KnowledgeWorkerRuntime(settings) as runtime:
         if runtime.pipeline is None:
@@ -110,7 +152,7 @@ async def _schedule_durable_retry(job_id: UUID, *, delay_seconds: int) -> None:
 @app.task(  # type: ignore[untyped-decorator]
     bind=True,
     name="agent_api.knowledge.process_event",
-    max_retries=3,
+    max_retries=5,
 )
 def process_event(
     task: Task,
@@ -136,6 +178,14 @@ def process_event(
         except Exception:
             # PostgreSQL 不可用时，先利用 Celery 自身的重试维持任务存活。
             raise task.retry(exc=RuntimeError(error.code), countdown=countdown) from None
+    except WikiIndexWorkerError as error:
+        # PostgreSQL 本身不可用或删除失败时，使用 Celery 的有限退避兜底。
+        countdown = min(300, 2 ** min(task.request.retries + 1, 8))
+        raise task.retry(
+            exc=RuntimeError(error.code),
+            countdown=countdown,
+            max_retries=5,
+        ) from None
 
 
 async def _dispatch_outbox() -> int:

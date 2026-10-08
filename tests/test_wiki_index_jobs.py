@@ -14,8 +14,8 @@ from agent_api.knowledge.infrastructure.database.models import (
 from agent_api.knowledge.wiki.index_jobs import (
     SqlAlchemyWikiIndexRepository,
     apply_page_index_setup_failure,
-    retry_page_index_job,
     mark_and_schedule_page_index,
+    retry_page_index_job,
     schedule_current_page_indexes,
     schedule_page_index,
 )

@@ -23,8 +23,8 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiTokenUsage,
 )
 from agent_api.knowledge.wiki.index_jobs import (
+    retry_page_index_job,
     schedule_current_page_indexes,
-    schedule_page_index,
     try_backfill_lock,
 )
 from agent_api.knowledge.wiki.jobs import schedule_document_wiki
@@ -576,31 +576,13 @@ class WikiService:
                 .limit(1)
                 .with_for_update()
             )
-            if job is None:
-                job_id = await schedule_page_index(
-                    session,
-                    knowledge_base_id=knowledge_base_id,
-                    page_version_id=version.id,
-                    fingerprint=self._embedding_fingerprint,
-                )
-            else:
-                job.status = "pending"
-                job.stage = "pending"
-                job.progress = 0
-                job.attempt_count = 0
-                job.next_retry_at = None
-                job.error_code = None
-                job.error_reference = None
-                job.embedding_fingerprint = self._embedding_fingerprint
-                job_id = job.id
-                session.add(
-                    OutboxEvent(
-                        event_key=f"wiki-index-manual-retry:{job.id}:{uuid4()}",
-                        event_type=OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
-                        aggregate_id=job.id,
-                        payload={"job_id": str(job.id)},
-                    )
-                )
+            job_id = await retry_page_index_job(
+                session,
+                knowledge_base_id=knowledge_base_id,
+                page_version_id=version.id,
+                fingerprint=self._embedding_fingerprint,
+                failed_job=job,
+            )
             version.index_state = "pending"
             version.embedding_fingerprint = self._embedding_fingerprint
             version.index_error_code = None

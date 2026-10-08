@@ -332,7 +332,13 @@ async def test_wiki_delete_failure_is_retried_and_database_failure_uses_celery_f
         coroutine.close()  # type: ignore[attr-defined]
         raise module.WikiIndexWorkerError("wiki_index_database_unavailable")
 
+    def _retry(**kwargs: object) -> None:
+        assert kwargs["countdown"] == 2
+        assert kwargs["max_retries"] == 5
+        raise Retry("wiki retry")
+
     monkeypatch.setattr(module.asyncio, "run", _run_and_fail)
+    monkeypatch.setattr(module.process_event, "retry", _retry)
     with pytest.raises(Retry):
         module.process_event.run(
             event_id=str(uuid4()),

@@ -22,6 +22,11 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiPageVersion,
     WikiTokenUsage,
 )
+from agent_api.knowledge.wiki.index_jobs import (
+    schedule_current_page_indexes,
+    schedule_page_index,
+    try_backfill_lock,
+)
 from agent_api.knowledge.wiki.jobs import schedule_document_wiki
 from agent_api.knowledge.wiki.processor import WikiProcessor
 
@@ -38,8 +43,16 @@ class WikiError(RuntimeError):
 class WikiService:
     """负责 Wiki 配置、页面版本与可信来源的事务边界。"""
 
-    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        *,
+        index_enabled: bool = False,
+        embedding_fingerprint: str = "",
+    ) -> None:
         self._sessions = sessions
+        self._index_enabled = index_enabled
+        self._embedding_fingerprint = embedding_fingerprint
 
     async def _base(self, session: AsyncSession, knowledge_base_id: UUID) -> KnowledgeBase:
         base = await session.scalar(
@@ -154,16 +167,20 @@ class WikiService:
     ) -> list[dict[str, Any]]:
         async with self._sessions() as session:
             await self._base(session, knowledge_base_id)
-            query = select(WikiPage).where(
-                WikiPage.knowledge_base_id == knowledge_base_id,
-                WikiPage.deleted_at.is_(None),
-                WikiPage.current_version_id.is_not(None),
+            query = (
+                select(WikiPage, WikiPageVersion)
+                .join(WikiPageVersion, WikiPage.current_version_id == WikiPageVersion.id)
+                .where(
+                    WikiPage.knowledge_base_id == knowledge_base_id,
+                    WikiPage.deleted_at.is_(None),
+                    WikiPage.current_version_id.is_not(None),
+                )
             )
             if page_type is not None:
                 query = query.where(WikiPage.page_type == page_type)
             if cursor is not None:
                 query = query.where(WikiPage.slug > cursor)
-            pages = list(await session.scalars(query.order_by(WikiPage.slug).limit(limit)))
+            pages = list(await session.execute(query.order_by(WikiPage.slug).limit(limit)))
             return [
                 {
                     "id": page.id,
@@ -172,8 +189,10 @@ class WikiService:
                     "page_type": page.page_type,
                     "title": page.title,
                     "current_version_id": page.current_version_id,
+                    "index_state": version.index_state,
+                    "index_error_code": version.index_error_code,
                 }
-                for page in pages
+                for page, version in pages
             ]
 
     async def rebuild_aggregation_pages(self, knowledge_base_id: UUID) -> dict[str, Any]:
@@ -181,7 +200,12 @@ class WikiService:
 
         async with self._sessions() as session:
             await self._base(session, knowledge_base_id)
-        await WikiProcessor.rebuild_aggregation_pages(self._sessions, knowledge_base_id)
+        await WikiProcessor.rebuild_aggregation_pages(
+            self._sessions,
+            knowledge_base_id,
+            index_enabled=self._index_enabled,
+            embedding_fingerprint=self._embedding_fingerprint,
+        )
         pages = await self.list_pages(knowledge_base_id)
         return {
             "knowledge_base_id": knowledge_base_id,
@@ -217,6 +241,8 @@ class WikiService:
             "page_type": page.page_type,
             "title": page.title,
             "current_version_id": version.id,
+            "index_state": version.index_state,
+            "index_error_code": version.index_error_code,
             "version_no": version.version_no,
             "content": version.content,
             "summary": version.summary,
@@ -250,13 +276,17 @@ class WikiService:
         """把摘要段落标题从发布元数据与其可验证来源重新组合。"""
 
         raw_sections = version.generation_metadata.get("summary_sections", [])
-        titles = {
-            item["claim_key"]: item["title"]
-            for item in raw_sections
-            if isinstance(item, dict)
-            and isinstance(item.get("claim_key"), str)
-            and isinstance(item.get("title"), str)
-        } if isinstance(raw_sections, list) else {}
+        titles = (
+            {
+                item["claim_key"]: item["title"]
+                for item in raw_sections
+                if isinstance(item, dict)
+                and isinstance(item.get("claim_key"), str)
+                and isinstance(item.get("title"), str)
+            }
+            if isinstance(raw_sections, list)
+            else {}
+        )
         return [
             {
                 "id": claim["id"],
@@ -418,6 +448,12 @@ class WikiService:
             page.current_version_id = version.id
             await WikiProcessor._rebuild_topic_pages(session, knowledge_base_id)
             await WikiProcessor._rebuild_index(session, knowledge_base_id)
+            await schedule_current_page_indexes(
+                session,
+                knowledge_base_id=knowledge_base_id,
+                index_enabled=self._index_enabled,
+                fingerprint=self._embedding_fingerprint,
+            )
             return self._page_response(
                 page, version, await self._claims_response(session, version.id)
             )
@@ -463,6 +499,12 @@ class WikiService:
             page.current_version_id = version.id
             await WikiProcessor._rebuild_topic_pages(session, knowledge_base_id)
             await WikiProcessor._rebuild_index(session, knowledge_base_id)
+            await schedule_current_page_indexes(
+                session,
+                knowledge_base_id=knowledge_base_id,
+                index_enabled=self._index_enabled,
+                fingerprint=self._embedding_fingerprint,
+            )
             return self._page_response(
                 page, version, await self._claims_response(session, version.id)
             )
@@ -503,7 +545,85 @@ class WikiService:
                 page.current_version_id = candidate.id
                 await WikiProcessor._rebuild_topic_pages(session, knowledge_base_id)
                 await WikiProcessor._rebuild_index(session, knowledge_base_id)
+                await schedule_current_page_indexes(
+                    session,
+                    knowledge_base_id=knowledge_base_id,
+                    index_enabled=self._index_enabled,
+                    fingerprint=self._embedding_fingerprint,
+                )
             return self._version_response(candidate)
+
+    async def retry_page_index(self, knowledge_base_id: UUID, page_id: UUID) -> dict[str, Any]:
+        """只允许显式重试当前失败版本，且不产生 Wiki 模型计费。"""
+
+        async with self._sessions() as session, session.begin():
+            await self._base(session, knowledge_base_id)
+            page = await self._page(session, knowledge_base_id, page_id, lock=True)
+            if page.current_version_id is None:
+                raise WikiError("wiki_index_retry_not_allowed", 409)
+            version = await session.get(
+                WikiPageVersion, page.current_version_id, with_for_update=True
+            )
+            if not self._index_enabled or version is None or version.index_state != "failed":
+                raise WikiError("wiki_index_retry_not_allowed", 409)
+            job = await session.scalar(
+                select(WikiJob)
+                .where(
+                    WikiJob.page_version_id == version.id,
+                    WikiJob.job_type == "page_index",
+                )
+                .order_by(WikiJob.created_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            if job is None:
+                job_id = await schedule_page_index(
+                    session,
+                    knowledge_base_id=knowledge_base_id,
+                    page_version_id=version.id,
+                    fingerprint=self._embedding_fingerprint,
+                )
+            else:
+                job.status = "pending"
+                job.stage = "pending"
+                job.progress = 0
+                job.attempt_count = 0
+                job.next_retry_at = None
+                job.error_code = None
+                job.error_reference = None
+                job.embedding_fingerprint = self._embedding_fingerprint
+                job_id = job.id
+                session.add(
+                    OutboxEvent(
+                        event_key=f"wiki-index-manual-retry:{job.id}:{uuid4()}",
+                        event_type=OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
+                        aggregate_id=job.id,
+                        payload={"job_id": str(job.id)},
+                    )
+                )
+            version.index_state = "pending"
+            version.embedding_fingerprint = self._embedding_fingerprint
+            version.index_error_code = None
+            return {"job_id": job_id, "page_version_id": version.id}
+
+    async def backfill_index(self, knowledge_base_id: UUID) -> dict[str, int]:
+        """无模型回填当前可信版本；不读取或修改 token 计数。"""
+
+        async with self._sessions() as session, session.begin():
+            await self._base(session, knowledge_base_id)
+            if not await try_backfill_lock(session, knowledge_base_id):
+                raise WikiError("wiki_index_rebuild_in_progress", 409)
+            created, existing, skipped = await schedule_current_page_indexes(
+                session,
+                knowledge_base_id=knowledge_base_id,
+                index_enabled=self._index_enabled,
+                fingerprint=self._embedding_fingerprint,
+            )
+            return {
+                "created_jobs": created,
+                "existing_jobs": existing,
+                "skipped_versions": skipped,
+            }
 
     @staticmethod
     async def _next_version_no(session: AsyncSession, page_id: UUID) -> int:
@@ -572,16 +692,21 @@ class WikiService:
                 usage = await session.scalar(
                     select(WikiTokenUsage).where(WikiTokenUsage.job_id == job.id)
                 )
-                output.append({
-                    "id": job.id,
-                    "job_type": job.job_type,
-                    "status": job.status,
-                    "stage": job.stage,
-                    "progress": job.progress,
-                    "error_code": job.error_code,
-                    "estimated_tokens": int(job.payload.get("estimated_tokens", 0)),
-                    "actual_tokens": usage.measured_tokens if usage else None,
-                    "charged_tokens": usage.charged_tokens if usage else 0,
-                    "created_at": job.created_at,
-                })
+                output.append(
+                    {
+                        "id": job.id,
+                        "job_type": job.job_type,
+                        "status": job.status,
+                        "stage": job.stage,
+                        "progress": job.progress,
+                        "error_code": job.error_code,
+                        "error_reference": job.error_reference,
+                        "page_version_id": job.page_version_id,
+                        "embedding_fingerprint": job.embedding_fingerprint,
+                        "estimated_tokens": int(job.payload.get("estimated_tokens", 0)),
+                        "actual_tokens": usage.measured_tokens if usage else None,
+                        "charged_tokens": usage.charged_tokens if usage else 0,
+                        "created_at": job.created_at,
+                    }
+                )
             return output

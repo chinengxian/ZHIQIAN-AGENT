@@ -18,6 +18,7 @@ from agent_api.knowledge.wiki.retrieval import (
     WikiMatchedPage,
     WikiSearchResult,
 )
+from agent_api.knowledge.wiki.service import WikiError
 
 
 class FakeWikiRetrieval:
@@ -85,6 +86,14 @@ class FakeWikiService:
             "topic_pages": 2,
             "summary_pages": 3,
         }
+
+    async def retry_page_index(self, knowledge_base_id, page_id):
+        del knowledge_base_id, page_id
+        raise WikiError("wiki_index_retry_not_allowed", 409)
+
+    async def backfill_index(self, knowledge_base_id):
+        del knowledge_base_id
+        raise WikiError("wiki_index_rebuild_in_progress", 409)
 
 
 def _app(service: FakeWikiRetrieval) -> FastAPI:
@@ -154,9 +163,7 @@ async def test_wiki_rebuild_aggregation_api_is_model_free() -> None:
     app.state.wiki_service = FakeWikiService()
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post(
-            f"/api/v1/knowledge-bases/{base_id}/wiki/rebuild-aggregation"
-        )
+        response = await client.post(f"/api/v1/knowledge-bases/{base_id}/wiki/rebuild-aggregation")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -164,6 +171,24 @@ async def test_wiki_rebuild_aggregation_api_is_model_free() -> None:
         "topic_pages": 2,
         "summary_pages": 3,
     }
+
+
+async def test_wiki_index_retry_and_backfill_return_stable_conflict_codes() -> None:
+    base_id = uuid4()
+    page_id = uuid4()
+    app = _app(FakeWikiRetrieval())
+    app.state.wiki_service = FakeWikiService()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        retry = await client.post(
+            f"/api/v1/knowledge-bases/{base_id}/wiki/pages/{page_id}/index/retry"
+        )
+        backfill = await client.post(f"/api/v1/knowledge-bases/{base_id}/wiki/index/backfill")
+
+    assert retry.status_code == 409
+    assert retry.json()["detail"]["code"] == "wiki_index_retry_not_allowed"
+    assert backfill.status_code == 409
+    assert backfill.json()["detail"]["code"] == "wiki_index_rebuild_in_progress"
 
 
 def test_page_response_exposes_sections_and_metadata_separately_from_claims() -> None:

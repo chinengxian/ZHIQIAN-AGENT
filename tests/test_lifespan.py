@@ -134,6 +134,9 @@ async def test_lifespan_publishes_and_closes_knowledge_application_services(
         assert app.state.knowledge_management is not None
         assert app.state.knowledge_retrieval is not None
         assert app.state.wiki_retrieval is not None
+        # Wiki 业务层只接收启动时的同一份 Settings 派生值，不自行读取环境。
+        assert app.state.wiki_service._index_enabled is False
+        assert len(app.state.wiki_service._embedding_fingerprint) == 64
 
     assert startup.closed is True
     assert milvus.close_calls == 1

@@ -31,6 +31,8 @@ class WikiPageSummary(BaseModel):
     page_type: Literal["summary", "topic", "index"]
     title: str
     current_version_id: UUID | None
+    index_state: Literal["not_required", "pending", "indexing", "ready", "failed"] = "not_required"
+    index_error_code: str | None = None
 
 
 class WikiAggregationRebuildResponse(BaseModel):
@@ -124,10 +126,24 @@ class WikiJobResponse(BaseModel):
     stage: str
     progress: int
     error_code: str | None
+    error_reference: str | None = None
+    page_version_id: UUID | None = None
+    embedding_fingerprint: str | None = None
     estimated_tokens: int
     actual_tokens: int | None
     charged_tokens: int
     created_at: datetime
+
+
+class WikiIndexRetryResponse(BaseModel):
+    job_id: UUID
+    page_version_id: UUID
+
+
+class WikiIndexBackfillResponse(BaseModel):
+    created_jobs: int
+    existing_jobs: int
+    skipped_versions: int
 
 
 class WikiSearchSourceResponse(BaseModel):
@@ -247,9 +263,7 @@ async def list_pages(
 
 
 @router.post("/rebuild-aggregation", response_model=WikiAggregationRebuildResponse)
-async def rebuild_aggregation(
-    knowledge_base_id: UUID, service: WikiServiceDependency
-) -> Any:
+async def rebuild_aggregation(knowledge_base_id: UUID, service: WikiServiceDependency) -> Any:
     try:
         return await service.rebuild_aggregation_pages(knowledge_base_id)
     except WikiError as error:
@@ -326,6 +340,37 @@ async def review_page(
             base_version=payload.base_version,
             decision=payload.decision,
         )
+    except WikiError as error:
+        _raise_http_error(error)
+
+
+@router.post(
+    "/pages/{page_id}/index/retry",
+    response_model=WikiIndexRetryResponse,
+    status_code=202,
+)
+async def retry_page_index(
+    knowledge_base_id: UUID,
+    page_id: UUID,
+    service: WikiServiceDependency,
+) -> Any:
+    try:
+        return await service.retry_page_index(knowledge_base_id, page_id)
+    except WikiError as error:
+        _raise_http_error(error)
+
+
+@router.post(
+    "/index/backfill",
+    response_model=WikiIndexBackfillResponse,
+    status_code=202,
+)
+async def backfill_index(
+    knowledge_base_id: UUID,
+    service: WikiServiceDependency,
+) -> Any:
+    try:
+        return await service.backfill_index(knowledge_base_id)
     except WikiError as error:
         _raise_http_error(error)
 

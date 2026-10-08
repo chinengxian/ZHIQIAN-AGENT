@@ -5,19 +5,27 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from celery import Task  # type: ignore[import-untyped]
+from pymilvus import MilvusClient  # type: ignore[import-untyped]
 
 from agent_api.core.config import get_settings
 from agent_api.knowledge.application.ingestion import IngestionPipelineError
 from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
+from agent_api.knowledge.infrastructure.embedding.embedding import create_embedding_adapter
 from agent_api.knowledge.infrastructure.jobs.outbox import (
     CeleryEventPublisher,
     OutboxDispatcher,
     SqlAlchemyOutboxRepository,
 )
 from agent_api.knowledge.infrastructure.jobs.repository import SqlAlchemyIngestionRepository
+from agent_api.knowledge.infrastructure.milvus import MilvusWikiIndex
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
 from agent_api.knowledge.wiki.generator import ChatWikiGenerator
+from agent_api.knowledge.wiki.index_jobs import (
+    SqlAlchemyWikiIndexRepository,
+    recover_stale_page_index_jobs,
+)
+from agent_api.knowledge.wiki.indexing import WikiIndexService, embedding_fingerprint
 from agent_api.knowledge.wiki.processor import WikiProcessor
 from agent_api.knowledge.worker.celery_factory import create_celery_app
 from agent_api.knowledge.worker.runtime import KnowledgeWorkerRuntime, handle_event
@@ -38,10 +46,47 @@ async def _process_event(event_type: OutboxEventType, payload: dict[str, object]
                 else settings.anthropic_model
             ) or "configured-model"
             processor = WikiProcessor(
-                database.session_factory, ChatWikiGenerator(model, model_name)
+                database.session_factory,
+                ChatWikiGenerator(model, model_name),
+                index_enabled=settings.wiki_index_enabled,
+                embedding_fingerprint=embedding_fingerprint(settings),
             )
             await processor.run(UUID(str(payload["job_id"])))
         finally:
+            await database.close()
+        return
+    if event_type in {
+        OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
+        OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED,
+    }:
+        database = DatabaseRuntime(settings.database_url.get_secret_value())
+        token = settings.milvus_token.get_secret_value() if settings.milvus_token else None
+        options: dict[str, str] = {"uri": settings.milvus_uri}
+        if token:
+            options["token"] = token
+        milvus = await asyncio.to_thread(MilvusClient, **options)
+        try:
+            index = MilvusWikiIndex(
+                milvus,
+                search_collection=settings.wiki_milvus_collection_alias,
+                write_collection=settings.wiki_milvus_collection_version,
+            )
+            if event_type is OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED:
+                await index.delete_page_version(UUID(str(payload["page_version_id"])))
+                return
+            repository = SqlAlchemyWikiIndexRepository(
+                database.session_factory,
+                embedding_dimension=settings.embedding_dimension,
+            )
+            service = WikiIndexService(
+                repository=repository,
+                embedder=create_embedding_adapter(settings),
+                index=index,
+                embedding_dimension=settings.embedding_dimension,
+            )
+            await service.run(UUID(str(payload["job_id"])))
+        finally:
+            await asyncio.to_thread(milvus.close)
             await database.close()
         return
     async with KnowledgeWorkerRuntime(settings) as runtime:
@@ -147,3 +192,18 @@ def recover_stale_wiki_jobs() -> int:
     """周期恢复 Wiki Worker 崩溃后遗留的任务。"""
 
     return asyncio.run(_recover_stale_wiki_jobs())
+
+
+async def _recover_stale_wiki_index_jobs() -> int:
+    database = DatabaseRuntime(settings.database_url.get_secret_value())
+    try:
+        return await recover_stale_page_index_jobs(database.session_factory)
+    finally:
+        await database.close()
+
+
+@app.task(name="agent_api.knowledge.recover_stale_wiki_index_jobs")  # type: ignore[untyped-decorator]
+def recover_stale_wiki_index_jobs() -> int:
+    """每分钟恢复心跳超过五分钟的 Wiki 页面索引任务。"""
+
+    return asyncio.run(_recover_stale_wiki_index_jobs())

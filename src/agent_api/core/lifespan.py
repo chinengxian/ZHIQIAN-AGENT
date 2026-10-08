@@ -17,6 +17,7 @@ from agent_api.knowledge.infrastructure.startup import (
     create_knowledge_startup,
 )
 from agent_api.knowledge.tools.readonly import create_knowledge_tools
+from agent_api.knowledge.wiki.indexing import embedding_fingerprint
 from agent_api.knowledge.wiki.retrieval import WikiRetrievalService
 from agent_api.knowledge.wiki.service import WikiService
 from agent_api.llm.agent import LangChainAgentStream
@@ -61,7 +62,11 @@ def create_lifespan(
                     knowledge_startup.storage,
                     settings,
                 )
-                wiki_service = WikiService(knowledge_database.session_factory)
+                wiki_service = WikiService(
+                    knowledge_database.session_factory,
+                    index_enabled=settings.wiki_index_enabled,
+                    embedding_fingerprint=embedding_fingerprint(settings),
+                )
                 milvus_options = {"uri": settings.milvus_uri}
                 if settings.milvus_token is not None:
                     milvus_options["token"] = settings.milvus_token.get_secret_value()

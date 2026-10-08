@@ -62,9 +62,7 @@ def test_generation_checkpoint_maps_summary_sections_to_exact_chunks() -> None:
                     "source_indices": [1, 3],
                 }
             ],
-            "summary_claims": [
-                {"text": "必须使用唯一身份。", "source_indices": [2]}
-            ],
+            "summary_claims": [{"text": "必须使用唯一身份。", "source_indices": [2]}],
             "topics": [],
         },
         chunks,
@@ -122,8 +120,7 @@ def test_summary_content_contains_only_readable_sections() -> None:
     content = render_summary_content("安全规范", sections)
 
     assert content == (
-        "## 概述\n\n本规范覆盖身份与访问控制。\n\n"
-        "## 核心要求\n\n特权操作必须启用多因素认证。"
+        "## 概述\n\n本规范覆盖身份与访问控制。\n\n## 核心要求\n\n特权操作必须启用多因素认证。"
     )
     assert "[^" not in content
     assert "# 安全规范" not in content

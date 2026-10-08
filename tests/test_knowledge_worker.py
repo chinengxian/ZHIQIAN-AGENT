@@ -1,3 +1,4 @@
+import importlib
 from uuid import UUID
 
 import pytest
@@ -122,3 +123,85 @@ def test_celery_factory_uses_json_and_schedules_outbox_dispatch() -> None:
     assert app.conf.beat_schedule["recover-stale-wiki-index-jobs"]["schedule"] == 60.0
     # 日志应记录 Celery 应用身份而不是展开包含 broker 凭据的内部配置对象。
     assert "queue-secret" not in repr(app)
+
+
+async def test_wiki_worker_assembles_index_and_delete_events_without_deleting_pg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """索引事件装配完整服务；删除事件只清 Milvus 单元并关闭资源。"""
+
+    worker_settings = Settings(
+        model_provider=ModelProvider.OPENAI,
+        openai_base_url=AnyHttpUrl("https://example.test/v1"),
+        openai_api_key=SecretStr("test-secret"),
+        openai_model="test-model",
+        _env_file=None,  # type: ignore[call-arg]
+    )
+    monkeypatch.setattr("agent_api.core.config.get_settings", lambda: worker_settings)
+    module = importlib.import_module("agent_api.knowledge.worker.celery_app")
+    calls: list[tuple[str, UUID | None]] = []
+
+    class _Database:
+        session_factory = object()
+
+        def __init__(self, url: str) -> None:
+            del url
+            calls.append(("database_open", None))
+
+        async def close(self) -> None:
+            calls.append(("database_close", None))
+
+    class _Milvus:
+        def __init__(self, **kwargs: str) -> None:
+            del kwargs
+            calls.append(("milvus_open", None))
+
+        def close(self) -> None:
+            calls.append(("milvus_close", None))
+
+    class _Index:
+        def __init__(self, client: object, **kwargs: str) -> None:
+            del client, kwargs
+
+        async def delete_page_version(self, version_id: UUID) -> None:
+            calls.append(("delete", version_id))
+
+    class _Repository:
+        def __init__(self, sessions: object, *, embedding_dimension: int) -> None:
+            del sessions, embedding_dimension
+
+    class _Service:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        async def run(self, job_id: UUID) -> None:
+            calls.append(("run", job_id))
+
+    monkeypatch.setattr(module, "DatabaseRuntime", _Database)
+    monkeypatch.setattr(module, "MilvusClient", _Milvus)
+    monkeypatch.setattr(module, "MilvusWikiIndex", _Index)
+    monkeypatch.setattr(module, "SqlAlchemyWikiIndexRepository", _Repository)
+    monkeypatch.setattr(module, "WikiIndexService", _Service)
+    monkeypatch.setattr(module, "create_embedding_adapter", lambda _: object())
+
+    await module._process_event(
+        OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
+        {"job_id": str(JOB_ID)},
+    )
+    await module._process_event(
+        OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED,
+        {"page_version_id": str(VERSION_ID)},
+    )
+
+    async def _recover(_: object) -> int:
+        calls.append(("recover", None))
+        return 2
+
+    monkeypatch.setattr(module, "recover_stale_page_index_jobs", _recover)
+    assert await module._recover_stale_wiki_index_jobs() == 2
+
+    assert ("run", JOB_ID) in calls
+    assert ("delete", VERSION_ID) in calls
+    assert ("recover", None) in calls
+    assert calls.count(("database_close", None)) == 3
+    assert calls.count(("milvus_close", None)) == 2

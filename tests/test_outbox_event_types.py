@@ -20,9 +20,7 @@ def test_outbox_event_type_members_are_complete() -> None:
 
 def test_outbox_event_type_is_json_compatible() -> None:
     encoded = json.dumps({"event_type": OutboxEventType.DOCUMENT_INGESTION_REQUESTED})
-    assert json.loads(encoded) == {
-        "event_type": OutboxEventType.DOCUMENT_INGESTION_REQUESTED.value
-    }
+    assert json.loads(encoded) == {"event_type": OutboxEventType.DOCUMENT_INGESTION_REQUESTED.value}
 
 
 def test_outbox_event_type_rejects_unknown_value() -> None:

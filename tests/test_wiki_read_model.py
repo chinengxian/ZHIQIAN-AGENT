@@ -300,6 +300,9 @@ async def test_load_verified_claims_marks_cross_scope_document_invalid_for_page_
     assert claims[0].sources[0].focus_end is None
     assert claims[0].sources[0].document_title == ""
     assert claims[0].sources[0].filename == ""
+    assert claims[0].sources[0].heading_path == ()
+    assert claims[0].sources[0].page_start is None
+    assert claims[0].sources[0].page_end is None
 
 
 async def test_load_verified_claims_uses_fixed_batches_for_many_claims() -> None:

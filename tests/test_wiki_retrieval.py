@@ -313,6 +313,7 @@ async def test_hydrate_pages_uses_precise_parent_excerpt_for_legacy_sources() ->
         status="ready",
         deleted_at=None,
         active_version_id=document_version_id,
+        knowledge_base_id=base_id,
     )
     page = SimpleNamespace(
         id=page_id,
@@ -346,6 +347,80 @@ async def test_hydrate_pages_uses_precise_parent_excerpt_for_legacy_sources() ->
     assert hydrated_source.parent_chunk_id == parent.id
     assert hydrated_source.excerpt == parent.content
     assert parent.content[hydrated_source.focus_start : hydrated_source.focus_end] == child.content
+
+
+async def test_hydrate_pages_filters_cross_scope_document_sources_for_legacy_search() -> None:
+    base_id, page_id, version_id = uuid4(), uuid4(), uuid4()
+    document_id, document_version_id = uuid4(), uuid4()
+    child = Chunk(
+        id=uuid4(),
+        document_version_id=document_version_id,
+        ordinal=1,
+        kind="child",
+        content="跨知识库来源不应进入搜索结果。",
+        token_count=10,
+    )
+    claim = SimpleNamespace(
+        id=uuid4(),
+        page_version_id=version_id,
+        claim_key="scope",
+        text="搜索只能返回同知识库来源",
+        trust_state="verified",
+        reason=None,
+        position=0,
+        claim_type="summary_fact",
+    )
+    source = SimpleNamespace(
+        id=uuid4(),
+        claim_id=claim.id,
+        document_id=document_id,
+        document_version_id=document_version_id,
+        chunk_id=child.id,
+        chunk_kind="child",
+        chunk_ordinal=1,
+        content_sha256=sha256(child.content.encode("utf-8")).hexdigest(),
+        document_title="外部规范",
+        heading_path=["外部"],
+        page_start=1,
+        page_end=1,
+    )
+    document = SimpleNamespace(
+        id=document_id,
+        title="外部规范",
+        filename="external.md",
+        status="ready",
+        deleted_at=None,
+        active_version_id=document_version_id,
+        knowledge_base_id=uuid4(),
+    )
+    page = SimpleNamespace(
+        id=page_id,
+        knowledge_base_id=base_id,
+        slug="topic/scope",
+        title="范围隔离",
+        page_type="topic",
+        current_version_id=version_id,
+    )
+    version = SimpleNamespace(id=version_id, summary="摘要", index_state="ready")
+    main_row = SimpleNamespace(
+        page=page,
+        version=version,
+        claim=claim,
+        source=source,
+        document=document,
+        chunk=child,
+    )
+    session = _HydrateSession(
+        batches=[[(page, version)], [], [main_row], []],
+        claim_ids=[claim.id],
+    )
+    retrieval = WikiRetrievalService(
+        lambda: _HydrateSessionContext(session), FakeSourceRetrieval([])
+    )  # type: ignore[arg-type]
+
+    records = await retrieval._hydrate_pages([page_id], (base_id,))
+
+    assert records[page_id].claims == ()
 
 
 async def test_reranker_failure_keeps_rrf_order() -> None:

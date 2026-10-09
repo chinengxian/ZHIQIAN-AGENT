@@ -28,6 +28,8 @@ class Source:
         result["chunk_id"] = str(self.chunk_id)
         result["document_id"] = str(self.document_id)
         result["document_version_id"] = str(self.document_version_id)
+        if self.parent_chunk_id is not None:
+            result["parent_chunk_id"] = str(self.parent_chunk_id)
         result["heading_path"] = list(self.heading_path)
         return result
 

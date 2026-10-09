@@ -73,8 +73,10 @@ def _row(
     chunk_ordinal: int = 1,
     chunk_content: str = "必须启用两个独立认证因素。",
     parent_content: str = "前文。必须启用两个独立认证因素。后文。",
+    document_scope_matches: bool = True,
 ) -> SimpleNamespace:
     page_id = uuid4()
+    knowledge_base_id = uuid4()
     version_id = uuid4()
     current_version_id = version_id if page_current else uuid4()
     document_id = uuid4()
@@ -122,11 +124,12 @@ def _row(
         status="ready" if document_ready else "failed",
         deleted_at=None,
         active_version_id=document_version_id if document_active else uuid4(),
+        knowledge_base_id=knowledge_base_id if document_scope_matches else uuid4(),
     )
     return SimpleNamespace(
         page=SimpleNamespace(
             id=page_id,
-            knowledge_base_id=uuid4(),
+            knowledge_base_id=knowledge_base_id,
             slug="topic/auth",
             page_type="topic",
             title="身份认证",
@@ -270,6 +273,22 @@ async def test_load_verified_claims_marks_stale_claims_and_sources_invalid() -> 
         "chunk_ordinal_mismatch",
         "chunk_hash_mismatch",
     ]
+
+
+async def test_load_verified_claims_marks_cross_scope_document_invalid_for_page_display() -> None:
+    row = _row(document_scope_matches=False)
+    session = _FakeSession([row], [(row.parent,)])
+
+    claims = await WikiReadModel(session).load_verified_claims(
+        (row.claim.id,),
+        scope_ids=(row.page.knowledge_base_id,),
+        require_index_ready=False,
+    )
+
+    assert claims[0].valid is False
+    assert claims[0].invalid_reason == "document_scope_mismatch"
+    assert claims[0].sources[0].valid is False
+    assert claims[0].sources[0].invalid_reason == "document_scope_mismatch"
 
 
 async def test_load_verified_claims_uses_fixed_batches_for_many_claims() -> None:
@@ -453,12 +472,17 @@ async def test_load_verified_claims_uses_real_join_filters_and_fixed_query_count
     runtime = DatabaseRuntime(DATABASE_URL)
     knowledge_base_id = uuid4()
     out_of_scope_id = uuid4()
+    cross_source_id = uuid4()
     if not await _database_available(runtime):
         await runtime.close()
         pytest.skip("local knowledge PostgreSQL is not available")
     try:
         async with runtime.session_factory() as session, session.begin():
-            claim_ids = await _seed_verified_claims_fixture(session, knowledge_base_id)
+            claim_ids = await _seed_verified_claims_fixture(
+                session,
+                knowledge_base_id,
+                cross_source_knowledge_base_id=cross_source_id,
+            )
             out_of_scope_claim_id = await _seed_out_of_scope_claim(session, out_of_scope_id)
 
         statements: list[str] = []
@@ -500,10 +524,14 @@ async def test_load_verified_claims_uses_real_join_filters_and_fixed_query_count
         assert by_key["kind-mismatch"].sources[0].invalid_reason == "chunk_kind_mismatch"
         assert by_key["ordinal-mismatch"].sources[0].invalid_reason == "chunk_ordinal_mismatch"
         assert by_key["hash-mismatch"].sources[0].invalid_reason == "chunk_hash_mismatch"
+        assert by_key["cross-scope-document"].sources[0].invalid_reason == (
+            "document_scope_mismatch"
+        )
         assert len(statements) == 2
     finally:
         await _cleanup_wiki_read_model_base(runtime, knowledge_base_id)
         await _cleanup_wiki_read_model_base(runtime, out_of_scope_id)
+        await _cleanup_wiki_read_model_base(runtime, cross_source_id)
         await runtime.close()
 
 
@@ -529,7 +557,10 @@ async def _cleanup_wiki_read_model_base(
 
 
 async def _seed_verified_claims_fixture(
-    session: object, knowledge_base_id: UUID
+    session: object,
+    knowledge_base_id: UUID,
+    *,
+    cross_source_knowledge_base_id: UUID | None = None,
 ) -> tuple[UUID, ...]:
     page_id = uuid4()
     old_version_id = uuid4()
@@ -541,6 +572,9 @@ async def _seed_verified_claims_fixture(
     stale_child_id = uuid4()
     source_text = "必须启用两个独立认证因素。"
     source_hash = sha256(source_text.encode("utf-8")).hexdigest()
+    cross_document_id = uuid4()
+    cross_version_id = uuid4()
+    cross_child_id = uuid4()
     session.add(
         KnowledgeBase(
             id=knowledge_base_id,
@@ -551,6 +585,16 @@ async def _seed_verified_claims_fixture(
         )
     )
     session.add(WikiConfig(knowledge_base_id=knowledge_base_id, enabled=True))
+    if cross_source_knowledge_base_id is not None:
+        session.add(
+            KnowledgeBase(
+                id=cross_source_knowledge_base_id,
+                workspace_id=DEFAULT_WORKSPACE_ID,
+                name=f"Wiki read model cross source {cross_source_knowledge_base_id}",
+                description="",
+                enabled=True,
+            )
+        )
     document = Document(
         id=document_id,
         knowledge_base_id=knowledge_base_id,
@@ -561,6 +605,35 @@ async def _seed_verified_claims_fixture(
     )
     session.add(document)
     await session.flush()
+    if cross_source_knowledge_base_id is not None:
+        cross_document = Document(
+            id=cross_document_id,
+            knowledge_base_id=cross_source_knowledge_base_id,
+            title="外部认证规范",
+            filename="external-auth.md",
+            mime_type="text/markdown",
+            status="ready",
+        )
+        session.add(cross_document)
+        await session.flush()
+        session.add(
+            DocumentVersion(
+                id=cross_version_id,
+                document_id=cross_document_id,
+                version_no=1,
+                file_path="external-auth-v1.md",
+                sha256="3" * 64,
+                file_size=100,
+                pipeline_version="test",
+                embedding_provider="test",
+                embedding_model="test",
+                embedding_dimension=3,
+                embedding_fingerprint="test",
+                status="ready",
+            )
+        )
+        await session.flush()
+        cross_document.active_version_id = cross_version_id
     session.add_all(
         (
             DocumentVersion(
@@ -595,6 +668,18 @@ async def _seed_verified_claims_fixture(
     )
     await session.flush()
     document.active_version_id = active_version_id
+    cross_child = (
+        Chunk(
+            id=cross_child_id,
+            document_version_id=cross_version_id,
+            ordinal=1,
+            kind="child",
+            content=source_text,
+            token_count=10,
+        )
+        if cross_source_knowledge_base_id is not None
+        else None
+    )
     parent = Chunk(
         id=parent_id,
         document_version_id=active_version_id,
@@ -622,7 +707,10 @@ async def _seed_verified_claims_fixture(
         content=source_text,
         token_count=10,
     )
-    session.add_all((parent, child, stale_child))
+    chunks = [parent, child, stale_child]
+    if cross_child is not None:
+        chunks.append(cross_child)
+    session.add_all(chunks)
     page = WikiPage(
         id=page_id,
         knowledge_base_id=knowledge_base_id,
@@ -755,6 +843,18 @@ async def _seed_verified_claims_fixture(
                 chunk_ordinal=chunk_ordinal,
                 content_sha256=content_sha,
                 trust_state=trust_state,
+            )
+        )
+    if cross_source_knowledge_base_id is not None:
+        claim_ids.append(
+            await _add_claim_with_source(
+                session,
+                page_version_id=current_version.id,
+                claim_key="cross-scope-document",
+                document_id=cross_document_id,
+                document_version_id=cross_version_id,
+                chunk_id=cross_child_id,
+                content_sha256=source_hash,
             )
         )
     return tuple(claim_ids)

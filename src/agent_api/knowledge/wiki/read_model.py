@@ -253,7 +253,7 @@ class WikiReadModel:
             )
             if source is None:
                 continue
-            source_item = self._build_source(source, document, chunk, parents)
+            source_item = self._build_source(source, document, chunk, parents, page)
             state.sources.append(source_item)
             if state.invalid_reason is None and not source_item.valid:
                 state.invalid_reason = source_item.invalid_reason
@@ -346,8 +346,9 @@ class WikiReadModel:
         document: Any,
         chunk: Chunk | None,
         parents: dict[UUID, Chunk],
+        page: Any,
     ) -> VerifiedWikiSource:
-        invalid_reason = _source_invalid_reason(source, document, chunk)
+        invalid_reason = _source_invalid_reason(source, document, chunk, page)
         parent = (
             parents.get(chunk.parent_chunk_id)
             if chunk is not None and chunk.parent_chunk_id
@@ -385,9 +386,16 @@ class _ClaimBuildState:
     sources: list[VerifiedWikiSource]
 
 
-def _source_invalid_reason(source: Any, document: Any, chunk: Chunk | None) -> str | None:
+def _source_invalid_reason(
+    source: Any,
+    document: Any,
+    chunk: Chunk | None,
+    page: Any,
+) -> str | None:
     if document is None or document.deleted_at is not None or document.status != "ready":
         return "document_not_ready"
+    if document.knowledge_base_id != page.knowledge_base_id:
+        return "document_scope_mismatch"
     if document.active_version_id != source.document_version_id:
         return "document_version_not_active"
     if chunk is None:

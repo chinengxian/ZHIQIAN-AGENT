@@ -276,7 +276,12 @@ async def test_load_verified_claims_marks_stale_claims_and_sources_invalid() -> 
 
 
 async def test_load_verified_claims_marks_cross_scope_document_invalid_for_page_display() -> None:
-    row = _row(document_scope_matches=False)
+    external_text = "外部知识库的机密认证流程。"
+    row = _row(
+        document_scope_matches=False,
+        chunk_content=external_text,
+        parent_content=f"前文。{external_text}后文。",
+    )
     session = _FakeSession([row], [(row.parent,)])
 
     claims = await WikiReadModel(session).load_verified_claims(
@@ -289,6 +294,12 @@ async def test_load_verified_claims_marks_cross_scope_document_invalid_for_page_
     assert claims[0].invalid_reason == "document_scope_mismatch"
     assert claims[0].sources[0].valid is False
     assert claims[0].sources[0].invalid_reason == "document_scope_mismatch"
+    assert claims[0].sources[0].excerpt == ""
+    assert claims[0].sources[0].parent_chunk_id is None
+    assert claims[0].sources[0].focus_start is None
+    assert claims[0].sources[0].focus_end is None
+    assert claims[0].sources[0].document_title == ""
+    assert claims[0].sources[0].filename == ""
 
 
 async def test_load_verified_claims_uses_fixed_batches_for_many_claims() -> None:

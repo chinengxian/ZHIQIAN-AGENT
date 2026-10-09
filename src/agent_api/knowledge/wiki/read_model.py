@@ -349,23 +349,28 @@ class WikiReadModel:
         page: Any,
     ) -> VerifiedWikiSource:
         invalid_reason = _source_invalid_reason(source, document, chunk, page)
-        parent = (
-            parents.get(chunk.parent_chunk_id)
-            if chunk is not None and chunk.parent_chunk_id
-            else chunk
-        )
-        excerpt = (
-            build_source_excerpt(parent, chunk)
-            if chunk is not None and parent is not None
-            else WikiSourceExcerpt(None, "", None, None)
-        )
+        redact_content = invalid_reason == "document_scope_mismatch"
+        if redact_content:
+            # 跨知识库来源只暴露稳定错误码，避免页面展示泄露外部正文或标题。
+            excerpt = WikiSourceExcerpt(None, "", None, None)
+        else:
+            parent = (
+                parents.get(chunk.parent_chunk_id)
+                if chunk is not None and chunk.parent_chunk_id
+                else chunk
+            )
+            excerpt = (
+                build_source_excerpt(parent, chunk)
+                if chunk is not None and parent is not None
+                else WikiSourceExcerpt(None, "", None, None)
+            )
         return VerifiedWikiSource(
             document_id=source.document_id,
             document_version_id=source.document_version_id,
             chunk_id=chunk.id if chunk is not None else source.chunk_id,
             parent_chunk_id=excerpt.parent_chunk_id,
-            document_title=source.document_title,
-            filename=document.filename if document is not None else "",
+            document_title="" if redact_content else source.document_title,
+            filename="" if redact_content or document is None else document.filename,
             heading_path=tuple(source.heading_path),
             page_start=source.page_start,
             page_end=source.page_end,

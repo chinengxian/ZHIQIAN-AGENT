@@ -8,7 +8,7 @@ from hashlib import sha256
 from typing import Any, Literal, cast
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_api.knowledge.application.management import DEFAULT_WORKSPACE_ID
@@ -126,10 +126,6 @@ def _normalize_metadata(value: str) -> str:
     return re.sub(r"\s+", " ", normalized)
 
 
-def _escape_like_pattern(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
 def _main_claim_statement(
     claim_ids: tuple[UUID, ...],
     scope_ids: tuple[UUID, ...],
@@ -160,10 +156,7 @@ def _main_claim_statement(
 
 
 def _metadata_statement(query: str, scope_ids: tuple[UUID, ...], limit: int) -> Any:
-    normalized = _normalize_metadata(query)
-    slug_query = normalized.replace(" ", "-")
-    title_prefix = f"{_escape_like_pattern(normalized)}%"
-    slug_prefix = f"{_escape_like_pattern(slug_query)}%"
+    del query, limit
     return (
         select(
             WikiPage.id.label("page_id"),
@@ -182,15 +175,8 @@ def _metadata_statement(query: str, scope_ids: tuple[UUID, ...], limit: int) -> 
             KnowledgeBase.workspace_id == DEFAULT_WORKSPACE_ID,
             KnowledgeBase.enabled.is_(True),
             WikiConfig.enabled.is_(True),
-            or_(
-                func.lower(WikiPage.slug).like(slug_prefix, escape="\\"),
-                func.lower(WikiPage.title).like(title_prefix, escape="\\"),
-                func.lower(WikiPageAlias.alias).like(title_prefix, escape="\\"),
-                WikiPageAlias.normalized_alias == normalized,
-            ),
         )
         .order_by(WikiPage.id)
-        .limit(max(limit * 4, limit))
     )
 
 

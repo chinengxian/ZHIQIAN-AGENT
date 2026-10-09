@@ -1,13 +1,37 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from hashlib import sha256
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
-from agent_api.knowledge.infrastructure.database.models import Chunk
-from agent_api.knowledge.wiki.read_model import WikiReadModel, build_source_excerpt
+import pytest
+from sqlalchemy import delete, event, update
+from sqlalchemy.dialects import postgresql
+
+from agent_api.knowledge.application.management import DEFAULT_WORKSPACE_ID
+from agent_api.knowledge.infrastructure.database.models import (
+    Chunk,
+    Document,
+    DocumentVersion,
+    KnowledgeBase,
+    WikiClaim,
+    WikiClaimSource,
+    WikiConfig,
+    WikiPage,
+    WikiPageAlias,
+    WikiPageVersion,
+)
+from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
+from agent_api.knowledge.wiki.read_model import (
+    WikiReadModel,
+    _metadata_statement,
+    build_source_excerpt,
+)
 from agent_api.knowledge.wiki.service import WikiService
+
+DATABASE_URL = "postgresql+asyncpg://agent:agent@127.0.0.1:5432/agent"
 
 
 def _chunk(
@@ -288,6 +312,14 @@ async def test_search_metadata_uses_exact_and_prefix_fields_without_similarity()
     ]
 
 
+def test_metadata_statement_does_not_filter_title_or_alias_before_normalization() -> None:
+    statement = _metadata_statement("mfa control", (uuid4(),), limit=10)
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+
+    assert "lower(wiki_pages.title) LIKE" not in sql
+    assert "lower(wiki_page_aliases.alias) LIKE" not in sql
+
+
 async def test_get_page_uses_read_model_once_and_returns_source_excerpt_fields() -> None:
     row = _row()
     page = row.page
@@ -314,3 +346,462 @@ async def test_get_page_uses_read_model_once_and_returns_source_excerpt_fields()
     assert source["excerpt"] == row.parent.content
     assert row.chunk.content == source["excerpt"][source["focus_start"] : source["focus_end"]]
     assert source["invalid_reason"] is None
+
+
+@pytest.mark.knowledge_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_KNOWLEDGE_INTEGRATION") != "1",
+    reason="set RUN_KNOWLEDGE_INTEGRATION=1 to use local knowledge containers",
+)
+async def test_search_metadata_matches_normalized_title_and_alias_prefixes() -> None:
+    runtime = DatabaseRuntime(DATABASE_URL)
+    knowledge_base_id = uuid4()
+    title_page_id = uuid4()
+    alias_page_id = uuid4()
+    if not await _database_available(runtime):
+        await runtime.close()
+        pytest.skip("local knowledge PostgreSQL is not available")
+    try:
+        async with runtime.session_factory() as session, session.begin():
+            session.add(
+                KnowledgeBase(
+                    id=knowledge_base_id,
+                    workspace_id=DEFAULT_WORKSPACE_ID,
+                    name=f"Wiki read model metadata {knowledge_base_id}",
+                    description="",
+                    enabled=True,
+                )
+            )
+            session.add(WikiConfig(knowledge_base_id=knowledge_base_id, enabled=True))
+            title_page = WikiPage(
+                id=title_page_id,
+                knowledge_base_id=knowledge_base_id,
+                slug="topic/normalized-title",
+                page_type="topic",
+                title="ＭＦＡ　　Control 策略",
+            )
+            alias_page = WikiPage(
+                id=alias_page_id,
+                knowledge_base_id=knowledge_base_id,
+                slug="topic/normalized-alias",
+                page_type="topic",
+                title="其他策略",
+            )
+            session.add_all((title_page, alias_page))
+            await session.flush()
+            title_version = WikiPageVersion(
+                page_id=title_page_id,
+                version_no=1,
+                title=title_page.title,
+                content="title",
+                summary="",
+                generation_metadata={},
+                origin="pipeline",
+                review_state="published",
+                index_state="ready",
+            )
+            alias_version = WikiPageVersion(
+                page_id=alias_page_id,
+                version_no=1,
+                title=alias_page.title,
+                content="alias",
+                summary="",
+                generation_metadata={},
+                origin="pipeline",
+                review_state="published",
+                index_state="ready",
+            )
+            session.add_all((title_version, alias_version))
+            await session.flush()
+            title_page.current_version_id = title_version.id
+            alias_page.current_version_id = alias_version.id
+            session.add(
+                WikiPageAlias(
+                    page_id=alias_page_id,
+                    alias="ＭＦＡ　　Alias 策略",
+                    normalized_alias="mfa alias 策略",
+                )
+            )
+
+        async with runtime.session_factory() as session:
+            hits = await WikiReadModel(session).search_metadata(
+                "mfa control",
+                (knowledge_base_id,),
+                limit=10,
+            )
+            alias_hits = await WikiReadModel(session).search_metadata(
+                "mfa alias",
+                (knowledge_base_id,),
+                limit=10,
+            )
+
+        assert [(hit.page_id, hit.matched_field) for hit in hits] == [(title_page_id, "title")]
+        assert [(hit.page_id, hit.matched_field) for hit in alias_hits] == [
+            (alias_page_id, "alias")
+        ]
+    finally:
+        await _cleanup_wiki_read_model_base(runtime, knowledge_base_id)
+        await runtime.close()
+
+
+@pytest.mark.knowledge_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_KNOWLEDGE_INTEGRATION") != "1",
+    reason="set RUN_KNOWLEDGE_INTEGRATION=1 to use local knowledge containers",
+)
+async def test_load_verified_claims_uses_real_join_filters_and_fixed_query_count() -> None:
+    runtime = DatabaseRuntime(DATABASE_URL)
+    knowledge_base_id = uuid4()
+    out_of_scope_id = uuid4()
+    if not await _database_available(runtime):
+        await runtime.close()
+        pytest.skip("local knowledge PostgreSQL is not available")
+    try:
+        async with runtime.session_factory() as session, session.begin():
+            claim_ids = await _seed_verified_claims_fixture(session, knowledge_base_id)
+            out_of_scope_claim_id = await _seed_out_of_scope_claim(session, out_of_scope_id)
+
+        statements: list[str] = []
+
+        def count_selects(
+            conn: object,
+            cursor: object,
+            statement: str,
+            parameters: object,
+            context: object,
+            executemany: bool,
+        ) -> None:
+            del conn, cursor, parameters, context, executemany
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(runtime._engine.sync_engine, "before_cursor_execute", count_selects)
+        try:
+            async with runtime.session_factory() as session:
+                claims = await WikiReadModel(session).load_verified_claims(
+                    (*claim_ids, out_of_scope_claim_id),
+                    scope_ids=(knowledge_base_id,),
+                    require_index_ready=True,
+                )
+        finally:
+            event.remove(runtime._engine.sync_engine, "before_cursor_execute", count_selects)
+
+        by_key = {claim.claim_key: claim for claim in claims}
+        valid_claims = [claim for claim in claims if claim.valid]
+
+        assert len(valid_claims) == 20
+        assert len(claims) == len(claim_ids)
+        assert out_of_scope_claim_id not in {claim.claim_id for claim in claims}
+        assert by_key["old-page-version"].invalid_reason == "page_version_not_current"
+        assert by_key["needs-review"].invalid_reason == "claim_not_verified"
+        assert by_key["inactive-document-version"].sources[0].invalid_reason == (
+            "document_version_not_active"
+        )
+        assert by_key["kind-mismatch"].sources[0].invalid_reason == "chunk_kind_mismatch"
+        assert by_key["ordinal-mismatch"].sources[0].invalid_reason == "chunk_ordinal_mismatch"
+        assert by_key["hash-mismatch"].sources[0].invalid_reason == "chunk_hash_mismatch"
+        assert len(statements) == 2
+    finally:
+        await _cleanup_wiki_read_model_base(runtime, knowledge_base_id)
+        await _cleanup_wiki_read_model_base(runtime, out_of_scope_id)
+        await runtime.close()
+
+
+async def _database_available(runtime: DatabaseRuntime) -> bool:
+    try:
+        async with runtime._engine.connect():
+            return True
+    except OSError:
+        return False
+
+
+async def _cleanup_wiki_read_model_base(
+    runtime: DatabaseRuntime,
+    knowledge_base_id: UUID,
+) -> None:
+    async with runtime.session_factory() as session, session.begin():
+        await session.execute(
+            update(WikiPage)
+            .where(WikiPage.knowledge_base_id == knowledge_base_id)
+            .values(current_version_id=None)
+        )
+        await session.execute(delete(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id))
+
+
+async def _seed_verified_claims_fixture(
+    session: object, knowledge_base_id: UUID
+) -> tuple[UUID, ...]:
+    page_id = uuid4()
+    old_version_id = uuid4()
+    document_id = uuid4()
+    active_version_id = uuid4()
+    stale_version_id = uuid4()
+    parent_id = uuid4()
+    child_id = uuid4()
+    stale_child_id = uuid4()
+    source_text = "必须启用两个独立认证因素。"
+    source_hash = sha256(source_text.encode("utf-8")).hexdigest()
+    session.add(
+        KnowledgeBase(
+            id=knowledge_base_id,
+            workspace_id=DEFAULT_WORKSPACE_ID,
+            name=f"Wiki read model claims {knowledge_base_id}",
+            description="",
+            enabled=True,
+        )
+    )
+    session.add(WikiConfig(knowledge_base_id=knowledge_base_id, enabled=True))
+    document = Document(
+        id=document_id,
+        knowledge_base_id=knowledge_base_id,
+        title="认证规范",
+        filename="auth.md",
+        mime_type="text/markdown",
+        status="ready",
+    )
+    session.add(document)
+    await session.flush()
+    session.add_all(
+        (
+            DocumentVersion(
+                id=active_version_id,
+                document_id=document_id,
+                version_no=1,
+                file_path="auth-v1.md",
+                sha256="1" * 64,
+                file_size=100,
+                pipeline_version="test",
+                embedding_provider="test",
+                embedding_model="test",
+                embedding_dimension=3,
+                embedding_fingerprint="test",
+                status="ready",
+            ),
+            DocumentVersion(
+                id=stale_version_id,
+                document_id=document_id,
+                version_no=2,
+                file_path="auth-v2.md",
+                sha256="2" * 64,
+                file_size=100,
+                pipeline_version="test",
+                embedding_provider="test",
+                embedding_model="test",
+                embedding_dimension=3,
+                embedding_fingerprint="test",
+                status="ready",
+            ),
+        )
+    )
+    await session.flush()
+    document.active_version_id = active_version_id
+    parent = Chunk(
+        id=parent_id,
+        document_version_id=active_version_id,
+        ordinal=0,
+        kind="parent",
+        content=f"前文。{source_text}后文。",
+        token_count=20,
+    )
+    child = Chunk(
+        id=child_id,
+        document_version_id=active_version_id,
+        parent_chunk_id=parent_id,
+        ordinal=1,
+        kind="child",
+        content=source_text,
+        char_start=3,
+        char_end=3 + len(source_text),
+        token_count=10,
+    )
+    stale_child = Chunk(
+        id=stale_child_id,
+        document_version_id=stale_version_id,
+        ordinal=1,
+        kind="child",
+        content=source_text,
+        token_count=10,
+    )
+    session.add_all((parent, child, stale_child))
+    page = WikiPage(
+        id=page_id,
+        knowledge_base_id=knowledge_base_id,
+        slug="topic/auth",
+        page_type="topic",
+        title="身份认证",
+    )
+    session.add(page)
+    await session.flush()
+    current_version = WikiPageVersion(
+        page_id=page_id,
+        version_no=2,
+        title="身份认证",
+        content="current",
+        summary="",
+        generation_metadata={},
+        origin="pipeline",
+        review_state="published",
+        index_state="ready",
+    )
+    old_version = WikiPageVersion(
+        id=old_version_id,
+        page_id=page_id,
+        version_no=1,
+        title="身份认证旧版",
+        content="old",
+        summary="",
+        generation_metadata={},
+        origin="pipeline",
+        review_state="published",
+        index_state="ready",
+    )
+    session.add_all((old_version, current_version))
+    await session.flush()
+    page.current_version_id = current_version.id
+    claim_ids: list[UUID] = []
+    for index in range(20):
+        claim_ids.append(
+            await _add_claim_with_source(
+                session,
+                page_version_id=current_version.id,
+                claim_key=f"valid-{index:02d}",
+                document_id=document_id,
+                document_version_id=active_version_id,
+                chunk_id=child_id,
+                content_sha256=source_hash,
+            )
+        )
+    invalid_specs = [
+        (
+            "old-page-version",
+            old_version_id,
+            "verified",
+            active_version_id,
+            child_id,
+            "child",
+            1,
+            source_hash,
+        ),
+        (
+            "needs-review",
+            current_version.id,
+            "needs_review",
+            active_version_id,
+            child_id,
+            "child",
+            1,
+            source_hash,
+        ),
+        (
+            "inactive-document-version",
+            current_version.id,
+            "verified",
+            stale_version_id,
+            stale_child_id,
+            "child",
+            1,
+            source_hash,
+        ),
+        (
+            "kind-mismatch",
+            current_version.id,
+            "verified",
+            active_version_id,
+            child_id,
+            "parent",
+            1,
+            source_hash,
+        ),
+        (
+            "ordinal-mismatch",
+            current_version.id,
+            "verified",
+            active_version_id,
+            child_id,
+            "child",
+            99,
+            source_hash,
+        ),
+        (
+            "hash-mismatch",
+            current_version.id,
+            "verified",
+            active_version_id,
+            child_id,
+            "child",
+            1,
+            "0" * 64,
+        ),
+    ]
+    for (
+        claim_key,
+        page_version_id,
+        trust_state,
+        document_version_id,
+        chunk_id,
+        chunk_kind,
+        chunk_ordinal,
+        content_sha,
+    ) in invalid_specs:
+        claim_ids.append(
+            await _add_claim_with_source(
+                session,
+                page_version_id=page_version_id,
+                claim_key=claim_key,
+                document_id=document_id,
+                document_version_id=document_version_id,
+                chunk_id=chunk_id,
+                chunk_kind=chunk_kind,
+                chunk_ordinal=chunk_ordinal,
+                content_sha256=content_sha,
+                trust_state=trust_state,
+            )
+        )
+    return tuple(claim_ids)
+
+
+async def _seed_out_of_scope_claim(session: object, knowledge_base_id: UUID) -> UUID:
+    claim_ids = await _seed_verified_claims_fixture(session, knowledge_base_id)
+    return claim_ids[0]
+
+
+async def _add_claim_with_source(
+    session: object,
+    *,
+    page_version_id: UUID,
+    claim_key: str,
+    document_id: UUID,
+    document_version_id: UUID,
+    chunk_id: UUID,
+    content_sha256: str,
+    trust_state: str = "verified",
+    chunk_kind: str = "child",
+    chunk_ordinal: int = 1,
+) -> UUID:
+    claim = WikiClaim(
+        page_version_id=page_version_id,
+        claim_key=claim_key,
+        text=f"{claim_key} 必须启用 MFA",
+        trust_state=trust_state,
+        reason=None,
+        position=0,
+        claim_type="summary_fact",
+    )
+    session.add(claim)
+    await session.flush()
+    session.add(
+        WikiClaimSource(
+            claim_id=claim.id,
+            document_id=document_id,
+            document_version_id=document_version_id,
+            chunk_id=chunk_id,
+            chunk_kind=chunk_kind,
+            chunk_ordinal=chunk_ordinal,
+            content_sha256=content_sha256,
+            document_title="认证规范",
+            heading_path=["认证"],
+            page_start=1,
+            page_end=1,
+        )
+    )
+    return claim.id

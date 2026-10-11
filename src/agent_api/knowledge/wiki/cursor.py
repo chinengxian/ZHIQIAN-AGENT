@@ -16,8 +16,8 @@ CURSOR_ERROR = "wiki_search_cursor_expired"
 class SearchCursor:
     query_fingerprint: str
     collection_version: str
-    last_score: float
-    last_unit_id: UUID
+    last_page_sort_key: tuple[int, int, int, float, str]
+    last_page_id: UUID
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,8 +35,8 @@ def encode_cursor(cursor: SearchCursor) -> str:
     payload = {
         "query_fingerprint": cursor.query_fingerprint,
         "collection_version": cursor.collection_version,
-        "last_score": cursor.last_score,
-        "last_unit_id": str(cursor.last_unit_id),
+        "last_page_sort_key": list(cursor.last_page_sort_key),
+        "last_page_id": str(cursor.last_page_id),
     }
     return _encode_payload(payload)
 
@@ -48,7 +48,12 @@ def decode_cursor(
     collection_version: str,
 ) -> SearchCursor:
     payload = _decode_payload(token)
-    if set(payload) != {"query_fingerprint", "collection_version", "last_score", "last_unit_id"}:
+    if set(payload) != {
+        "query_fingerprint",
+        "collection_version",
+        "last_page_sort_key",
+        "last_page_id",
+    }:
         raise WikiCursorError(CURSOR_ERROR)
     if payload["query_fingerprint"] != query_fingerprint:
         raise WikiCursorError(CURSOR_ERROR)
@@ -58,18 +63,15 @@ def decode_cursor(
         raise WikiCursorError(CURSOR_ERROR)
     if not isinstance(payload["collection_version"], str):
         raise WikiCursorError(CURSOR_ERROR)
-    score = payload["last_score"]
-    if not isinstance(score, int | float) or isinstance(score, bool):
+    page_id = _parse_uuid(payload["last_page_id"])
+    sort_key = _parse_page_sort_key(payload["last_page_sort_key"])
+    if sort_key[-1] != str(page_id):
         raise WikiCursorError(CURSOR_ERROR)
-    normalized_score = float(score)
-    if not math.isfinite(normalized_score) or normalized_score < 0:
-        raise WikiCursorError(CURSOR_ERROR)
-    unit_id = _parse_uuid(payload["last_unit_id"])
     return SearchCursor(
         query_fingerprint=payload["query_fingerprint"],
         collection_version=payload["collection_version"],
-        last_score=normalized_score,
-        last_unit_id=unit_id,
+        last_page_sort_key=sort_key,
+        last_page_id=page_id,
     )
 
 
@@ -143,3 +145,25 @@ def _parse_uuid(value: Any) -> UUID:
         return UUID(value)
     except ValueError:
         raise WikiCursorError(CURSOR_ERROR) from None
+
+
+def _parse_page_sort_key(value: Any) -> tuple[int, int, int, float, str]:
+    if not isinstance(value, list) or len(value) != 5:
+        raise WikiCursorError(CURSOR_ERROR)
+    exact, multi_source, summary_page, score, page_id = value
+    if (
+        not isinstance(exact, int)
+        or isinstance(exact, bool)
+        or not isinstance(multi_source, int)
+        or isinstance(multi_source, bool)
+        or not isinstance(summary_page, int)
+        or isinstance(summary_page, bool)
+    ):
+        raise WikiCursorError(CURSOR_ERROR)
+    if not isinstance(score, int | float) or isinstance(score, bool):
+        raise WikiCursorError(CURSOR_ERROR)
+    normalized_score = float(score)
+    if not math.isfinite(normalized_score):
+        raise WikiCursorError(CURSOR_ERROR)
+    parsed_page_id = _parse_uuid(page_id)
+    return (exact, multi_source, summary_page, normalized_score, str(parsed_page_id))

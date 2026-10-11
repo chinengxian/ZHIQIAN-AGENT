@@ -211,31 +211,15 @@ class WikiIndependentRetrievalService:
 
         started = perf_counter()
         query_fingerprint = sha256(normalized.encode("utf-8")).hexdigest()[:16]
-        try:
-            decoded_cursor = (
-                decode_cursor(
-                    cursor,
-                    query_fingerprint=query_fingerprint,
-                    collection_version=self._collection_version,
-                )
-                if cursor is not None
-                else None
+        decoded_cursor = (
+            decode_cursor(
+                cursor,
+                query_fingerprint=query_fingerprint,
+                collection_version=self._collection_version,
             )
-        except WikiCursorError:
-            self._record_search_event(
-                query_fingerprint,
-                started,
-                0,
-                0,
-                0,
-                0,
-                0,
-                False,
-                "wiki_search_cursor_expired",
-                no_answer=True,
-                cursor_expired=True,
-            )
-            raise
+            if cursor is not None
+            else None
+        )
         candidate_limit = max(page_limit * 10, 50)
         try:
             vector = (await self._embedder.embed_documents([normalized]))[0]
@@ -279,16 +263,6 @@ class WikiIndependentRetrievalService:
             raise WikiRetrievalError("wiki_retrieval_unavailable") from error
 
         ordered = self._deduplicate(accepted)
-        if decoded_cursor is not None:
-            ordered = [
-                item
-                for item in ordered
-                if item.score < decoded_cursor.last_score
-                or (
-                    item.score == decoded_cursor.last_score
-                    and str(item.candidate.unit_id) > str(decoded_cursor.last_unit_id)
-                )
-            ]
         if not ordered:
             self._record_search_event(
                 query_fingerprint,
@@ -312,27 +286,59 @@ class WikiIndependentRetrievalService:
                 collection_version=self._collection_version,
             )
 
-        selected_units = ordered[:claim_limit]
+        page_items = self._page_items(ordered)
+        if decoded_cursor is not None:
+            page_items = [
+                (page_id, items, sort_key)
+                for page_id, items, sort_key in page_items
+                if sort_key > decoded_cursor.last_page_sort_key
+            ]
+        if not page_items:
+            self._record_search_event(
+                query_fingerprint,
+                started,
+                len(dense_hits),
+                len(keyword_hits),
+                len(metadata_hits),
+                0,
+                filtered_count,
+                degraded,
+                degradation_reason,
+                no_answer=True,
+            )
+            return WikiSearchResult(
+                (),
+                degraded,
+                degradation_reason,
+                None,
+                no_answer=True,
+                no_answer_reason="below_relevance_threshold",
+                collection_version=self._collection_version,
+            )
+
         pages = self._build_pages(
-            selected_units,
+            page_items,
             accepted,
             scope_ids,
             page_limit=page_limit,
             claim_limit=claim_limit,
         )
-        last = self._cursor_boundary_after_pages(ordered, pages)
+        last = self._cursor_boundary_after_pages(page_items, pages)
         next_cursor = None
         if last is not None:
-            boundary_index = max(index for index, item in enumerate(ordered) if item is last)
+            last_page_id, _, last_sort_key = last
+            boundary_index = max(
+                index for index, (page_id, _, _) in enumerate(page_items) if page_id == last_page_id
+            )
         else:
             boundary_index = -1
-        if last is not None and boundary_index + 1 < len(ordered):
+        if last is not None and boundary_index + 1 < len(page_items):
             next_cursor = encode_cursor(
                 SearchCursor(
                     query_fingerprint=query_fingerprint,
                     collection_version=self._collection_version,
-                    last_score=last.score,
-                    last_unit_id=last.candidate.unit_id,
+                    last_page_sort_key=last_sort_key,
+                    last_page_id=last_page_id,
                 )
             )
         self._record_search_event(
@@ -587,25 +593,30 @@ class WikiIndependentRetrievalService:
         output.sort(key=lambda item: (-item.score, str(item.candidate.unit_id)))
         return output
 
-    def _build_pages(
+    def _page_items(
         self,
         ordered: list[_Accepted],
+    ) -> list[tuple[UUID, list[_Accepted], tuple[int, int, int, float, str]]]:
+        by_page: dict[UUID, list[_Accepted]] = defaultdict(list)
+        for item in ordered:
+            by_page[item.claim.page_id].append(item)
+        return sorted(
+            ((page_id, items, self._page_sort_key(items)) for page_id, items in by_page.items()),
+            key=lambda entry: entry[2],
+        )
+
+    def _build_pages(
+        self,
+        page_items: list[tuple[UUID, list[_Accepted], tuple[int, int, int, float, str]]],
         all_accepted: list[_Accepted],
         scope_ids: tuple[UUID, ...],
         *,
         page_limit: int,
         claim_limit: int,
     ) -> tuple[WikiMatchedPage, ...]:
-        by_page: dict[UUID, list[_Accepted]] = defaultdict(list)
-        for item in ordered:
-            by_page[item.claim.page_id].append(item)
-        page_items = sorted(
-            by_page.items(),
-            key=lambda entry: self._page_sort_key(entry[1]),
-        )
         pages: list[WikiMatchedPage] = []
         remaining_claims = claim_limit
-        for page_id, items in page_items:
+        for page_id, items, _ in page_items:
             if len(pages) >= page_limit or remaining_claims <= 0:
                 break
             claims: list[WikiMatchedClaim] = []
@@ -683,15 +694,16 @@ class WikiIndependentRetrievalService:
 
     @staticmethod
     def _cursor_boundary_after_pages(
-        ordered: list[_Accepted],
+        page_items: list[tuple[UUID, list[_Accepted], tuple[int, int, int, float, str]]],
         pages: tuple[WikiMatchedPage, ...],
-    ) -> _Accepted | None:
+    ) -> tuple[UUID, list[_Accepted], tuple[int, int, int, float, str]] | None:
         returned_page_ids = {page.id for page in pages}
         boundary = None
-        for item in ordered:
-            if item.claim.page_id in returned_page_ids:
-                # 搜索分页按页面返回，cursor 必须越过已返回页面的所有候选，避免下一页重复页面。
-                boundary = item
+        for page_item in page_items:
+            page_id, _, _ = page_item
+            if page_id in returned_page_ids:
+                # cursor 使用最终页面排序边界，避免页面排序提升时漏掉未返回页面。
+                boundary = page_item
         return boundary
 
     def _index_backlog_count(self) -> int:

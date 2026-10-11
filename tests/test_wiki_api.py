@@ -17,6 +17,7 @@ from agent_api.knowledge.wiki.api import (
     router,
 )
 from agent_api.knowledge.wiki.cursor import WikiCursorError
+from agent_api.knowledge.wiki.independent_retrieval import WikiIndependentRetrievalService
 from agent_api.knowledge.wiki.retrieval import (
     WikiMatchedClaim,
     WikiMatchedPage,
@@ -133,7 +134,40 @@ class FakeWikiService:
         raise WikiError("wiki_index_rebuild_in_progress", 409)
 
 
-def _app(service: FakeWikiRetrieval) -> FastAPI:
+class UnusedWikiIndex:
+    async def search_dense(self, vector, knowledge_base_ids, limit):
+        raise AssertionError("expired cursor should be rejected before dense search")
+
+    async def search_keyword(self, query, knowledge_base_ids, limit):
+        raise AssertionError("expired cursor should be rejected before keyword search")
+
+
+class UnusedWikiEmbedder:
+    async def embed_documents(self, texts):
+        raise AssertionError("expired cursor should be rejected before embedding")
+
+
+class UnusedReadModel:
+    async def search_metadata(self, query, scope_ids, limit):
+        raise AssertionError("expired cursor should be rejected before metadata search")
+
+    async def load_verified_claims(self, claim_ids, scope_ids, require_index_ready):
+        raise AssertionError("expired cursor should be rejected before claim load")
+
+
+def _independent_service() -> WikiIndependentRetrievalService:
+    return WikiIndependentRetrievalService(
+        index=UnusedWikiIndex(),
+        embedder=UnusedWikiEmbedder(),
+        read_model=UnusedReadModel(),
+        collection_version="wiki_units_v1",
+        dense_threshold=0.55,
+        rerank_threshold=0.5,
+        keyword_coverage_threshold=0.5,
+    )
+
+
+def _app(service: object) -> FastAPI:
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_wiki_retrieval] = lambda: service
@@ -202,6 +236,29 @@ async def test_wiki_search_api_maps_expired_cursor_to_conflict(
     search_event = next(event for event in events if event["event"] == "wiki_search")
     assert search_event["cursor_expired"] is True
     assert "认证" not in caplog.text
+
+
+async def test_wiki_search_api_records_expired_independent_cursor_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    base_id = uuid4()
+    caplog.set_level(logging.INFO, logger="agent_api.knowledge")
+    transport = httpx.ASGITransport(app=_app(_independent_service()))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            f"/api/v1/knowledge-bases/{base_id}/wiki/search",
+            params={"q": "MFA", "cursor": "expired"},
+        )
+
+    assert response.status_code == 409
+    events = [json.loads(record.getMessage()) for record in caplog.records]
+    cursor_events = [
+        event
+        for event in events
+        if event["event"] == "wiki_search" and event["cursor_expired"] is True
+    ]
+    assert len(cursor_events) == 1
+    assert "MFA" not in caplog.text
 
 
 async def test_wiki_page_api_records_expired_claim_cursor(

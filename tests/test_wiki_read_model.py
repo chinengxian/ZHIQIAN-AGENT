@@ -66,6 +66,7 @@ def _row(
     trust_state: str = "verified",
     document_active: bool = True,
     document_ready: bool = True,
+    document_deleted: bool = False,
     source_kind: str = "child",
     source_ordinal: int = 1,
     source_hash: str | None = None,
@@ -122,7 +123,7 @@ def _row(
         title="认证规范",
         filename="auth.md",
         status="ready" if document_ready else "failed",
-        deleted_at=None,
+        deleted_at=object() if document_deleted else None,
         active_version_id=document_version_id if document_active else uuid4(),
         knowledge_base_id=knowledge_base_id if document_scope_matches else uuid4(),
     )
@@ -303,6 +304,45 @@ async def test_load_verified_claims_marks_cross_scope_document_invalid_for_page_
     assert claims[0].sources[0].heading_path == ()
     assert claims[0].sources[0].page_start is None
     assert claims[0].sources[0].page_end is None
+
+
+@pytest.mark.parametrize(
+    ("document_ready", "document_deleted"),
+    [(False, False), (True, True)],
+)
+async def test_load_verified_claims_redacts_cross_scope_unready_document_sources(
+    document_ready: bool,
+    document_deleted: bool,
+) -> None:
+    external_text = "外部知识库的未就绪机密来源。"
+    row = _row(
+        document_scope_matches=False,
+        document_ready=document_ready,
+        document_deleted=document_deleted,
+        chunk_content=external_text,
+        parent_content=f"前文。{external_text}后文。",
+    )
+    session = _FakeSession([row], [(row.parent,)])
+
+    claims = await WikiReadModel(session).load_verified_claims(
+        (row.claim.id,),
+        scope_ids=(row.page.knowledge_base_id,),
+        require_index_ready=False,
+    )
+
+    source = claims[0].sources[0]
+    assert claims[0].valid is False
+    assert claims[0].invalid_reason == "document_scope_mismatch"
+    assert source.invalid_reason == "document_scope_mismatch"
+    assert source.excerpt == ""
+    assert source.parent_chunk_id is None
+    assert source.focus_start is None
+    assert source.focus_end is None
+    assert source.document_title == ""
+    assert source.filename == ""
+    assert source.heading_path == ()
+    assert source.page_start is None
+    assert source.page_end is None
 
 
 async def test_load_verified_claims_uses_fixed_batches_for_many_claims() -> None:

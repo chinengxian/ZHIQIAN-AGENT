@@ -397,10 +397,12 @@ def _source_invalid_reason(
     chunk: Chunk | None,
     page: Any,
 ) -> str | None:
-    if document is None or document.deleted_at is not None or document.status != "ready":
+    if document is None:
         return "document_not_ready"
     if document.knowledge_base_id != page.knowledge_base_id:
         return "document_scope_mismatch"
+    if document.deleted_at is not None or document.status != "ready":
+        return "document_not_ready"
     if document.active_version_id != source.document_version_id:
         return "document_version_not_active"
     if chunk is None:

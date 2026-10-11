@@ -349,9 +349,9 @@ class WikiReadModel:
         page: Any,
     ) -> VerifiedWikiSource:
         invalid_reason = _source_invalid_reason(source, document, chunk, page)
-        redact_content = invalid_reason == "document_scope_mismatch"
+        redact_content = document is None or invalid_reason == "document_scope_mismatch"
         if redact_content:
-            # 跨知识库来源只暴露稳定错误码，避免页面展示泄露外部正文或标题。
+            # 未证明同属当前知识库的来源只暴露稳定错误码，避免页面展示泄露外部正文或标题。
             excerpt = WikiSourceExcerpt(None, "", None, None)
         else:
             parent = (

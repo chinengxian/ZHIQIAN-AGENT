@@ -345,6 +345,36 @@ async def test_load_verified_claims_redacts_cross_scope_unready_document_sources
     assert source.page_end is None
 
 
+async def test_load_verified_claims_redacts_orphan_document_sources() -> None:
+    orphan_text = "孤儿来源中的机密正文。"
+    row = _row(
+        chunk_content=orphan_text,
+        parent_content=f"前文。{orphan_text}后文。",
+    )
+    row.document = None
+    session = _FakeSession([row], [(row.parent,)])
+
+    claims = await WikiReadModel(session).load_verified_claims(
+        (row.claim.id,),
+        scope_ids=(row.page.knowledge_base_id,),
+        require_index_ready=False,
+    )
+
+    source = claims[0].sources[0]
+    assert claims[0].valid is False
+    assert claims[0].invalid_reason == "document_not_ready"
+    assert source.invalid_reason == "document_not_ready"
+    assert source.excerpt == ""
+    assert source.parent_chunk_id is None
+    assert source.focus_start is None
+    assert source.focus_end is None
+    assert source.document_title == ""
+    assert source.filename == ""
+    assert source.heading_path == ()
+    assert source.page_start is None
+    assert source.page_end is None
+
+
 async def test_load_verified_claims_uses_fixed_batches_for_many_claims() -> None:
     rows = [_row(claim_id=uuid4()) for _ in range(20)]
     session = _FakeSession(rows, [(item.parent,) for item in rows])

@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 import pytest
 
-from agent_api.knowledge.wiki.ranking import reciprocal_rank_fusion, select_mmr
+from agent_api.knowledge.wiki.ranking import (
+    WikiScoredCandidate,
+    deduplicate_scored_candidates,
+    reciprocal_rank_fusion,
+    select_mmr,
+)
 
 
 def test_rrf_fuses_channels_without_comparing_raw_scores() -> None:
@@ -41,3 +48,40 @@ def test_mmr_handles_empty_limit_and_invalid_lambda() -> None:
     assert select_mmr([("a", 1.0, "事实")], limit=0) == []
     with pytest.raises(ValueError, match="invalid_mmr_lambda"):
         select_mmr([("a", 1.0, "事实")], limit=1, lambda_=1.1)
+
+
+def test_deduplicates_scored_candidates_by_fact_fingerprint() -> None:
+    first_unit = UUID("00000000-0000-0000-0000-000000000001")
+    second_unit = UUID("00000000-0000-0000-0000-000000000002")
+    low = WikiScoredCandidate(
+        unit_id=first_unit,
+        page_id=UUID("10000000-0000-0000-0000-000000000001"),
+        claim_id=UUID("20000000-0000-0000-0000-000000000001"),
+        rrf_score=0.1,
+        dense_score=0.6,
+        keyword_score=0.1,
+        keyword_coverage=0.1,
+        rerank_score=None,
+        exact_metadata_match=False,
+    )
+    high_duplicate = WikiScoredCandidate(
+        unit_id=second_unit,
+        page_id=UUID("10000000-0000-0000-0000-000000000002"),
+        claim_id=UUID("20000000-0000-0000-0000-000000000002"),
+        rrf_score=0.2,
+        dense_score=0.9,
+        keyword_score=0.1,
+        keyword_coverage=0.1,
+        rerank_score=None,
+        exact_metadata_match=False,
+    )
+
+    deduplicated = deduplicate_scored_candidates(
+        [low, high_duplicate],
+        fact_fingerprints={
+            low.unit_id: "same-fact",
+            high_duplicate.unit_id: "same-fact",
+        },
+    )
+
+    assert deduplicated == [high_duplicate]

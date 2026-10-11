@@ -53,7 +53,7 @@ class WikiRelevancePolicy:
     def rejection_reasons(self, candidate: WikiScoredCandidate) -> tuple[str, ...]:
         """返回低于阈值的稳定信号，便于日志和评测定位。"""
 
-        if candidate.exact_metadata_match:
+        if self.accept(candidate):
             return ()
         if candidate.rerank_score is not None:
             if candidate.rerank_score < self.rerank_threshold:

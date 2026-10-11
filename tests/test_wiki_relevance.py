@@ -36,6 +36,10 @@ def test_policy_rejects_rrf_candidate_without_relevance_evidence() -> None:
 
     assert policy.accept(rejected) is False
     assert policy.reject_reason(rejected) == "below_relevance_threshold"
+    assert policy.rejection_reasons(rejected) == (
+        "below_dense_threshold",
+        "below_keyword_coverage",
+    )
 
 
 def test_exact_alias_is_accepted_without_dense_score() -> None:
@@ -46,22 +50,33 @@ def test_exact_alias_is_accepted_without_dense_score() -> None:
     assert policy.accept(candidate(dense=None, keyword=0.0, rerank=None, exact=True)) is True
 
 
+def test_policy_returns_stable_rerank_rejection_reason() -> None:
+    policy = WikiRelevancePolicy(
+        dense_threshold=0.55, rerank_threshold=0.50, keyword_threshold=0.50
+    )
+
+    rejected = candidate(dense=0.70, keyword=0.0, rerank=0.49, exact=False)
+
+    assert policy.rejection_reasons(rejected) == ("below_rerank_threshold",)
+
+
 @pytest.mark.parametrize(
-    ("candidate_value", "reason"),
+    "accepted",
     [
-        (candidate(dense=0.70, keyword=0.0, rerank=0.49, exact=False), "below_rerank_threshold"),
-        (candidate(dense=0.20, keyword=0.60, rerank=None, exact=False), "below_dense_threshold"),
-        (candidate(dense=0.60, keyword=0.20, rerank=None, exact=False), "below_keyword_coverage"),
+        candidate(dense=0.20, keyword=0.60, rerank=None, exact=False),
+        candidate(dense=0.60, keyword=0.20, rerank=None, exact=False),
+        candidate(dense=0.70, keyword=0.0, rerank=0.50, exact=False),
     ],
 )
-def test_policy_returns_stable_signal_reasons(
-    candidate_value: WikiScoredCandidate, reason: str
+def test_policy_returns_no_rejection_reasons_for_accepted_candidates(
+    accepted: WikiScoredCandidate,
 ) -> None:
     policy = WikiRelevancePolicy(
         dense_threshold=0.55, rerank_threshold=0.50, keyword_threshold=0.50
     )
 
-    assert reason in policy.rejection_reasons(candidate_value)
+    assert policy.accept(accepted) is True
+    assert policy.rejection_reasons(accepted) == ()
 
 
 def test_fact_fingerprint_normalizes_text_and_sorts_sources() -> None:
@@ -103,3 +118,28 @@ async def test_local_bge_score_returns_float_scores_and_rerank_keeps_compatibili
 
     assert await reranker.score("query", ["low", "high"]) == [0.2, 0.9]
     assert await reranker.rerank("query", ["low", "high"]) == [1, 0]
+
+
+async def test_local_bge_score_empty_input_does_not_call_model() -> None:
+    class FakeCrossEncoder:
+        def predict(self, pairs: list[tuple[str, str]], *, batch_size: int) -> list[float]:
+            raise AssertionError("empty input should not call model")
+
+    reranker = LocalBGEReranker("model", "cpu", 8)
+    reranker._model = FakeCrossEncoder()
+
+    assert await reranker.score("query", []) == []
+
+
+async def test_local_bge_score_rejects_scalar_prediction() -> None:
+    class FakeCrossEncoder:
+        def predict(self, pairs: list[tuple[str, str]], *, batch_size: int) -> float:
+            assert pairs == [("query", "text")]
+            assert batch_size == 8
+            return 0.2
+
+    reranker = LocalBGEReranker("model", "cpu", 8)
+    reranker._model = FakeCrossEncoder()
+
+    with pytest.raises(ValueError, match="invalid_rerank_score_count"):
+        await reranker.score("query", ["text"])

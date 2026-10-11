@@ -14,6 +14,8 @@ class LocalBGEReranker:
         self._model: Any = None
 
     async def score(self, query: str, texts: list[str]) -> list[float]:
+        if not texts:
+            return []
         return await asyncio.to_thread(self._score_sync, query, texts)
 
     async def rerank(self, query: str, texts: list[str]) -> list[int]:
@@ -21,12 +23,17 @@ class LocalBGEReranker:
         return sorted(range(len(texts)), key=lambda index: scores[index], reverse=True)
 
     def _score_sync(self, query: str, texts: list[str]) -> list[float]:
+        if not texts:
+            return []
         if self._model is None:
             from sentence_transformers import CrossEncoder  # type: ignore[import-not-found]
 
             self._model = CrossEncoder(self._model_name, device=self._device)
         scores = self._model.predict([(query, text) for text in texts], batch_size=self._batch_size)
-        result = [float(score) for score in scores]
+        try:
+            result = [float(score) for score in scores]
+        except (TypeError, ValueError):
+            raise ValueError("invalid_rerank_score_count") from None
         if len(result) != len(texts):
             raise ValueError("invalid_rerank_score_count")
         return result

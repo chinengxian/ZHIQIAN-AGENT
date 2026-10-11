@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -60,11 +61,14 @@ def decode_cursor(
     score = payload["last_score"]
     if not isinstance(score, int | float) or isinstance(score, bool):
         raise WikiCursorError(CURSOR_ERROR)
+    normalized_score = float(score)
+    if not math.isfinite(normalized_score) or normalized_score < 0:
+        raise WikiCursorError(CURSOR_ERROR)
     unit_id = _parse_uuid(payload["last_unit_id"])
     return SearchCursor(
         query_fingerprint=payload["query_fingerprint"],
         collection_version=payload["collection_version"],
-        last_score=float(score),
+        last_score=normalized_score,
         last_unit_id=unit_id,
     )
 
@@ -86,7 +90,7 @@ def decode_page_claim_cursor(token: str, *, page_version_id: UUID) -> PageClaimC
     if decoded_page_version_id != page_version_id:
         raise WikiCursorError(CURSOR_ERROR)
     position = payload["last_position"]
-    if not isinstance(position, int) or isinstance(position, bool):
+    if not isinstance(position, int) or isinstance(position, bool) or position < 0:
         raise WikiCursorError(CURSOR_ERROR)
     claim_id = _parse_uuid(payload["last_claim_id"])
     return PageClaimCursor(
@@ -97,17 +101,24 @@ def decode_page_claim_cursor(token: str, *, page_version_id: UUID) -> PageClaimC
 
 
 def _encode_payload(payload: dict[str, Any]) -> str:
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
 def _decode_payload(token: str) -> dict[str, Any]:
+    if not isinstance(token, str):
+        raise WikiCursorError(CURSOR_ERROR)
     if len(token.encode("utf-8")) > MAX_CURSOR_BYTES:
         raise WikiCursorError(CURSOR_ERROR)
     try:
         padding = "=" * (-len(token) % 4)
         raw = base64.urlsafe_b64decode((token + padding).encode("ascii"))
-        payload = json.loads(raw.decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
     except (
         binascii.Error,
         UnicodeDecodeError,
@@ -119,6 +130,10 @@ def _decode_payload(token: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise WikiCursorError(CURSOR_ERROR)
     return payload
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid_json_constant:{value}")
 
 
 def _parse_uuid(value: Any) -> UUID:

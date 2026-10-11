@@ -4,6 +4,7 @@ import asyncio
 import re
 import unicodedata
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from time import perf_counter
@@ -165,12 +166,14 @@ class WikiIndependentRetrievalService:
         sessions: async_sessionmaker[AsyncSession] | None = None,
         read_model: WikiReadModelLike | None = None,
         scorer: WikiScorer | None = None,
+        index_backlog_provider: Callable[[], int] | None = None,
     ) -> None:
         self._sessions = sessions
         self._index = index
         self._embedder = embedder
         self._read_model = read_model
         self._scorer = scorer
+        self._index_backlog_provider = index_backlog_provider
         self._collection_version = collection_version
         self._policy = WikiRelevancePolicy(
             dense_threshold=dense_threshold,
@@ -208,15 +211,31 @@ class WikiIndependentRetrievalService:
 
         started = perf_counter()
         query_fingerprint = sha256(normalized.encode("utf-8")).hexdigest()[:16]
-        decoded_cursor = (
-            decode_cursor(
-                cursor,
-                query_fingerprint=query_fingerprint,
-                collection_version=self._collection_version,
+        try:
+            decoded_cursor = (
+                decode_cursor(
+                    cursor,
+                    query_fingerprint=query_fingerprint,
+                    collection_version=self._collection_version,
+                )
+                if cursor is not None
+                else None
             )
-            if cursor is not None
-            else None
-        )
+        except WikiCursorError:
+            self._record_search_event(
+                query_fingerprint,
+                started,
+                0,
+                0,
+                0,
+                0,
+                0,
+                False,
+                "wiki_search_cursor_expired",
+                no_answer=True,
+                cursor_expired=True,
+            )
+            raise
         candidate_limit = max(page_limit * 10, 50)
         try:
             vector = (await self._embedder.embed_documents([normalized]))[0]
@@ -301,9 +320,13 @@ class WikiIndependentRetrievalService:
             page_limit=page_limit,
             claim_limit=claim_limit,
         )
-        last = selected_units[min(len(selected_units), page_limit) - 1] if pages else None
+        last = self._cursor_boundary_after_pages(ordered, pages)
         next_cursor = None
-        if last is not None and len(ordered) > len(selected_units[:page_limit]):
+        if last is not None:
+            boundary_index = max(index for index, item in enumerate(ordered) if item is last)
+        else:
+            boundary_index = -1
+        if last is not None and boundary_index + 1 < len(ordered):
             next_cursor = encode_cursor(
                 SearchCursor(
                     query_fingerprint=query_fingerprint,
@@ -659,7 +682,28 @@ class WikiIndependentRetrievalService:
         )
 
     @staticmethod
+    def _cursor_boundary_after_pages(
+        ordered: list[_Accepted],
+        pages: tuple[WikiMatchedPage, ...],
+    ) -> _Accepted | None:
+        returned_page_ids = {page.id for page in pages}
+        boundary = None
+        for item in ordered:
+            if item.claim.page_id in returned_page_ids:
+                # 搜索分页按页面返回，cursor 必须越过已返回页面的所有候选，避免下一页重复页面。
+                boundary = item
+        return boundary
+
+    def _index_backlog_count(self) -> int:
+        if self._index_backlog_provider is None:
+            return 0
+        try:
+            return max(0, int(self._index_backlog_provider()))
+        except Exception:
+            return 0
+
     def _record_search_event(
+        self,
         query_fingerprint: str,
         started: float,
         dense_count: int,
@@ -671,6 +715,7 @@ class WikiIndependentRetrievalService:
         degradation_reason: str | None,
         *,
         no_answer: bool,
+        cursor_expired: bool = False,
     ) -> None:
         record_wiki_search(
             query_fingerprint=query_fingerprint,
@@ -683,6 +728,8 @@ class WikiIndependentRetrievalService:
             threshold_filtered_count=threshold_filtered_count,
             reranker_degraded=degraded and degradation_reason == "reranker_unavailable",
             degradation_reason=degradation_reason,
+            index_backlog_count=self._index_backlog_count(),
+            cursor_expired=cursor_expired,
         )
 
 

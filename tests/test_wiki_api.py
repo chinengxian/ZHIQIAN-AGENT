@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import logging
 from uuid import UUID, uuid4
 
 import httpx
+import pytest
 from fastapi import FastAPI
 
 from agent_api.knowledge.application.citations import Source
@@ -13,6 +16,7 @@ from agent_api.knowledge.wiki.api import (
     get_wiki_retrieval,
     router,
 )
+from agent_api.knowledge.wiki.cursor import WikiCursorError
 from agent_api.knowledge.wiki.retrieval import (
     WikiMatchedClaim,
     WikiMatchedPage,
@@ -109,6 +113,10 @@ class FakeWikiRetrieval:
 
 
 class FakeWikiService:
+    async def get_page(self, knowledge_base_id, page_id, *, claim_cursor=None, claim_limit=20):
+        del knowledge_base_id, page_id, claim_cursor, claim_limit
+        raise WikiCursorError("wiki_page_cursor_expired")
+
     async def rebuild_aggregation_pages(self, knowledge_base_id):
         return {
             "knowledge_base_id": knowledge_base_id,
@@ -174,10 +182,13 @@ async def test_wiki_search_api_returns_ranked_claims_and_sources() -> None:
     }
 
 
-async def test_wiki_search_api_maps_expired_cursor_to_conflict() -> None:
+async def test_wiki_search_api_maps_expired_cursor_to_conflict(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     base_id = uuid4()
     service = FakeWikiRetrieval()
     service.raise_cursor_error = True
+    caplog.set_level(logging.INFO, logger="agent_api.knowledge")
     transport = httpx.ASGITransport(app=_app(service))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(
@@ -187,6 +198,32 @@ async def test_wiki_search_api_maps_expired_cursor_to_conflict() -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "wiki_search_cursor_expired"
+    events = [json.loads(record.getMessage()) for record in caplog.records]
+    search_event = next(event for event in events if event["event"] == "wiki_search")
+    assert search_event["cursor_expired"] is True
+    assert "认证" not in caplog.text
+
+
+async def test_wiki_page_api_records_expired_claim_cursor(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    base_id = uuid4()
+    page_id = uuid4()
+    app = _app(FakeWikiRetrieval())
+    app.state.wiki_service = FakeWikiService()
+    caplog.set_level(logging.INFO, logger="agent_api.knowledge")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            f"/api/v1/knowledge-bases/{base_id}/wiki/pages/{page_id}",
+            params={"claim_cursor": "expired"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "wiki_page_cursor_expired"
+    events = [json.loads(record.getMessage()) for record in caplog.records]
+    cursor_event = next(event for event in events if event["event"] == "wiki_cursor_expired")
+    assert cursor_event["cursor_type"] == "page_claim"
 
 
 async def test_wiki_search_api_validates_options() -> None:

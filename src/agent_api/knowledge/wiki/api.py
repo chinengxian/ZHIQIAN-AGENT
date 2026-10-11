@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime
+from hashlib import sha256
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
+from agent_api.knowledge.infrastructure.observability.events import (
+    record_wiki_cursor_expired,
+    record_wiki_search,
+)
 from agent_api.knowledge.wiki.cursor import WikiCursorError
 from agent_api.knowledge.wiki.retrieval import WikiRetrievalError, WikiRetrievalService
 from agent_api.knowledge.wiki.service import WikiError, WikiService
@@ -303,6 +308,7 @@ async def get_page(
             claim_limit=claim_limit,
         )
     except WikiCursorError:
+        record_wiki_cursor_expired(cursor_type="page_claim")
         raise HTTPException(
             status_code=409,
             detail={"code": "wiki_page_cursor_expired", "message": "Wiki page cursor expired"},
@@ -440,6 +446,19 @@ async def search_pages(
             cursor=cursor,
         )
     except WikiCursorError:
+        record_wiki_search(
+            query_fingerprint=sha256(q.casefold().strip().encode("utf-8")).hexdigest()[:16],
+            latency_ms=0.0,
+            dense_hit_count=0,
+            keyword_hit_count=0,
+            alias_hit_count=0,
+            page_count=0,
+            no_answer=True,
+            threshold_filtered_count=0,
+            reranker_degraded=False,
+            degradation_reason="wiki_search_cursor_expired",
+            cursor_expired=True,
+        )
         raise HTTPException(
             status_code=409,
             detail={"code": "wiki_search_cursor_expired", "message": "Wiki search cursor expired"},

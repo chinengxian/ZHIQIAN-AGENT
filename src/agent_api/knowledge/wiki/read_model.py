@@ -58,7 +58,7 @@ class VerifiedWikiSource:
 class WikiMetadataHit:
     page_id: UUID
     exact: bool
-    matched_field: Literal["title", "alias", "slug"]
+    matched_field: Literal["title", "alias"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,7 +297,6 @@ class WikiReadModel:
         normalized = _normalize_metadata(query)
         if not normalized:
             return ()
-        slug_query = normalized.replace(" ", "-")
         rows = list(
             (await self._session.execute(_metadata_statement(query, scope_ids, limit))).all()
         )
@@ -307,13 +306,10 @@ class WikiReadModel:
             candidates: list[WikiMetadataHit] = []
             title = _normalize_metadata(row.title)
             alias = _normalize_metadata(row.alias) if row.alias else ""
-            slug = row.slug.casefold()
             if title == normalized:
                 candidates.append(WikiMetadataHit(page_id, True, "title"))
             if alias == normalized:
                 candidates.append(WikiMetadataHit(page_id, True, "alias"))
-            if slug.startswith(slug_query):
-                candidates.append(WikiMetadataHit(page_id, False, "slug"))
             if title.startswith(normalized):
                 candidates.append(WikiMetadataHit(page_id, False, "title"))
             if alias.startswith(normalized):
@@ -420,5 +416,5 @@ def _source_invalid_reason(
 
 
 def _metadata_sort_key(hit: WikiMetadataHit) -> tuple[int, int, str]:
-    field_priority = {"slug": 0, "title": 1, "alias": 2}
+    field_priority = {"title": 0, "alias": 1}
     return (-int(hit.exact), field_priority[hit.matched_field], str(hit.page_id))

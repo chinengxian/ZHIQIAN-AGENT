@@ -95,6 +95,20 @@ def record_wiki_search(
     logger.info(json.dumps(fields, separators=(",", ":")))
 
 
+def record_wiki_cursor_expired(*, cursor_type: Literal["page_claim"]) -> None:
+    """记录固定 cursor 失效事件，不接收查询原文、页面正文或 cursor token。"""
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "wiki_cursor_expired",
+                "cursor_type": cursor_type,
+            },
+            separators=(",", ":"),
+        )
+    )
+
+
 def record_wiki_shadow_diff(metrics: WikiShadowMetricsLike) -> None:
     """记录 shadow 对比差异，只输出指纹、ID、耗时和降级状态。"""
 

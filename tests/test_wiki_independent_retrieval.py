@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import replace
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -8,6 +10,7 @@ import pytest
 
 from agent_api.core.config import WikiSearchBackend
 from agent_api.knowledge.infrastructure.milvus.wiki_index import WikiIndexHit
+from agent_api.knowledge.wiki.cursor import WikiCursorError
 from agent_api.knowledge.wiki.independent_retrieval import WikiIndependentRetrievalService
 from agent_api.knowledge.wiki.read_model import (
     VerifiedWikiClaim,
@@ -181,7 +184,11 @@ def _service(
     metadata_hits: tuple[WikiMetadataHit, ...] = (),
     metadata_claims: dict[UUID, tuple[UUID, ...]] | None = None,
     scorer: FakeScorer | None = None,
+    index_backlog_provider: object | None = None,
 ) -> WikiIndependentRetrievalService:
+    extra_kwargs: dict[str, object] = {}
+    if index_backlog_provider is not None:
+        extra_kwargs["index_backlog_provider"] = index_backlog_provider
     return WikiIndependentRetrievalService(
         index=FakeIndex(dense_hits, keyword_hits),
         embedder=FakeEmbedder(),
@@ -191,6 +198,7 @@ def _service(
         rerank_threshold=0.5,
         keyword_coverage_threshold=0.5,
         scorer=scorer,
+        **extra_kwargs,
     )
 
 
@@ -241,6 +249,80 @@ async def test_independent_search_uses_seek_cursor_without_repeating_pages() -> 
 
     assert first_page.next_cursor is not None
     assert second_page.pages[0].id not in {page.id for page in first_page.pages}
+
+
+async def test_independent_search_cursor_skips_returned_page_claims() -> None:
+    page_id = _uuid(1001)
+    version_id = _uuid(1002)
+    claims: dict[UUID, VerifiedWikiClaim] = {}
+    hits: list[WikiIndexHit] = []
+    for index in range(13):
+        claim = _claim(
+            _uuid(1100 + index),
+            page_id,
+            version_id,
+            f"MFA 同页第 {index} 条要求",
+            page_title="身份认证",
+            position=index,
+        )
+        claims[claim.claim_id] = claim
+        hits.append(_hit(_uuid(1200 + index), claim, score=0.99 - index * 0.01, channel="dense"))
+    next_claim = _claim(
+        _uuid(1301),
+        _uuid(1302),
+        _uuid(1303),
+        "MFA 其他页面要求",
+        page_title="访问控制",
+        position=0,
+    )
+    claims[next_claim.claim_id] = next_claim
+    hits.append(_hit(_uuid(1304), next_claim, score=0.7, channel="dense"))
+    service = _service(dense_hits=hits, keyword_hits=[], claims=claims)
+
+    first_page = await service.search("MFA", (BASE_ID,), page_limit=1, claim_limit=12)
+    second_page = await service.search(
+        "MFA", (BASE_ID,), page_limit=1, claim_limit=12, cursor=first_page.next_cursor
+    )
+
+    assert first_page.next_cursor is not None
+    assert [page.id for page in first_page.pages] == [page_id]
+    assert [page.id for page in second_page.pages] == [next_claim.page_id]
+    first_claim_ids = {claim.id for page in first_page.pages for claim in page.matched_claims}
+    second_claim_ids = {claim.id for page in second_page.pages for claim in page.matched_claims}
+    assert first_claim_ids.isdisjoint(second_claim_ids)
+
+
+async def test_independent_search_records_backlog_metric(caplog: pytest.LogCaptureFixture) -> None:
+    claim = _claim(_uuid(1401), _uuid(1402), _uuid(1403), "MFA 必须启用")
+    caplog.set_level(logging.INFO, logger="agent_api.knowledge")
+
+    await _service(
+        dense_hits=[_hit(_uuid(1404), claim, score=0.9, channel="dense")],
+        keyword_hits=[],
+        claims={claim.claim_id: claim},
+        index_backlog_provider=lambda: 7,
+    ).search("MFA", (BASE_ID,), page_limit=5, claim_limit=3)
+
+    events = [json.loads(record.getMessage()) for record in caplog.records]
+    search_event = next(event for event in events if event["event"] == "wiki_search")
+    assert search_event["index_backlog_count"] == 7
+    assert "MFA" not in caplog.text
+
+
+async def test_independent_search_records_expired_cursor_without_query_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="agent_api.knowledge")
+    service = _service(dense_hits=[], keyword_hits=[], claims={})
+
+    with pytest.raises(WikiCursorError):
+        await service.search("MFA", (BASE_ID,), cursor="expired")
+
+    events = [json.loads(record.getMessage()) for record in caplog.records]
+    search_event = next(event for event in events if event["event"] == "wiki_search")
+    assert search_event["cursor_expired"] is True
+    assert search_event["index_backlog_count"] == 0
+    assert "MFA" not in caplog.text
 
 
 @pytest.mark.parametrize(

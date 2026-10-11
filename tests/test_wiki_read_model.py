@@ -409,10 +409,10 @@ async def test_search_metadata_uses_exact_and_prefix_fields_without_similarity()
 
     assert [(hit.page_id, hit.exact, hit.matched_field) for hit in hits] == [
         (exact_id, True, "title"),
-        (slug_id, False, "slug"),
         (title_prefix_id, False, "title"),
         (alias_prefix_id, False, "alias"),
     ]
+    assert slug_id not in {hit.page_id for hit in hits}
 
 
 def test_metadata_statement_does_not_filter_title_or_alias_before_normalization() -> None:

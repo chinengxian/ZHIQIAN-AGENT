@@ -102,8 +102,15 @@ def _hit(
 
 
 class FakeEmbedder:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[list[str]] = []
+
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         assert texts == ["mfa"]
+        self.calls.append(texts)
+        if self.fail:
+            raise RuntimeError("embedding_unavailable")
         return [[0.1, 0.2]]
 
 
@@ -115,10 +122,13 @@ class FakeIndex:
     ) -> None:
         self.dense_hits = dense_hits
         self.keyword_hits = keyword_hits
+        self.dense_calls = 0
+        self.keyword_calls = 0
 
     async def search_dense(
         self, vector: list[float], scope_ids: tuple[UUID, ...], limit: int
     ) -> list[WikiIndexHit]:
+        self.dense_calls += 1
         assert vector == [0.1, 0.2]
         assert scope_ids == (BASE_ID,)
         assert limit == 50
@@ -127,6 +137,7 @@ class FakeIndex:
     async def search_keyword(
         self, query: str, scope_ids: tuple[UUID, ...], limit: int
     ) -> list[WikiIndexHit]:
+        self.keyword_calls += 1
         assert query == "mfa"
         assert scope_ids == (BASE_ID,)
         assert limit == 50
@@ -171,8 +182,13 @@ class FakeReadModel:
 
 
 class FakeScorer:
+    def __init__(self, scores: list[float] | None = None) -> None:
+        self.scores = scores
+
     async def score(self, query: str, texts: list[str]) -> list[float]:
         del query
+        if self.scores is not None:
+            return self.scores
         return [0.9 if "MFA" in text else 0.1 for text in texts]
 
 
@@ -185,13 +201,15 @@ def _service(
     metadata_claims: dict[UUID, tuple[UUID, ...]] | None = None,
     scorer: FakeScorer | None = None,
     index_backlog_provider: object | None = None,
+    index: FakeIndex | None = None,
+    embedder: FakeEmbedder | None = None,
 ) -> WikiIndependentRetrievalService:
     extra_kwargs: dict[str, object] = {}
     if index_backlog_provider is not None:
         extra_kwargs["index_backlog_provider"] = index_backlog_provider
     return WikiIndependentRetrievalService(
-        index=FakeIndex(dense_hits, keyword_hits),
-        embedder=FakeEmbedder(),
+        index=index or FakeIndex(dense_hits, keyword_hits),
+        embedder=embedder or FakeEmbedder(),
         read_model=FakeReadModel(claims, metadata_hits, metadata_claims),
         collection_version="wiki_units_v1",
         dense_threshold=0.55,
@@ -225,6 +243,43 @@ async def test_independent_search_fuses_dense_keyword_alias_and_rejects_low_rele
     assert result.no_answer is True
     assert result.no_answer_reason == "below_relevance_threshold"
     assert result.pages == ()
+
+
+async def test_keyword_mode_skips_embedding_and_dense_search() -> None:
+    claim = _claim(_uuid(1601), _uuid(1602), _uuid(1603), "MFA 关键字命中")
+    index = FakeIndex([], [_hit(_uuid(1604), claim, score=4.0, channel="keyword")])
+    embedder = FakeEmbedder(fail=True)
+
+    result = await _service(
+        dense_hits=[],
+        keyword_hits=[],
+        claims={claim.claim_id: claim},
+        index=index,
+        embedder=embedder,
+    ).search("MFA", (BASE_ID,), mode="keyword")
+
+    assert [page.id for page in result.pages] == [claim.page_id]
+    assert result.pages[0].matched_fields == ("keyword",)
+    assert embedder.calls == []
+    assert index.dense_calls == 0
+    assert index.keyword_calls == 1
+
+
+async def test_semantic_mode_does_not_return_keyword_only_hits() -> None:
+    claim = _claim(_uuid(1611), _uuid(1612), _uuid(1613), "MFA 关键字命中")
+    index = FakeIndex([], [_hit(_uuid(1614), claim, score=4.0, channel="keyword")])
+
+    result = await _service(
+        dense_hits=[],
+        keyword_hits=[],
+        claims={claim.claim_id: claim},
+        index=index,
+    ).search("MFA", (BASE_ID,), mode="semantic")
+
+    assert result.pages == ()
+    assert result.no_answer is True
+    assert index.dense_calls == 1
+    assert index.keyword_calls == 0
 
 
 async def test_independent_search_uses_seek_cursor_without_repeating_pages() -> None:
@@ -349,6 +404,21 @@ async def test_independent_search_records_backlog_metric(caplog: pytest.LogCaptu
     assert "MFA" not in caplog.text
 
 
+async def test_independent_search_degrades_on_non_finite_reranker_score() -> None:
+    claim = _claim(_uuid(1701), _uuid(1702), _uuid(1703), "MFA 必须启用")
+
+    result = await _service(
+        dense_hits=[_hit(_uuid(1704), claim, score=0.9, channel="dense")],
+        keyword_hits=[],
+        claims={claim.claim_id: claim},
+        scorer=FakeScorer([float("nan")]),
+    ).search("MFA", (BASE_ID,), page_limit=5, claim_limit=3)
+
+    assert result.degraded is True
+    assert result.degradation_reason == "reranker_unavailable"
+    assert [page.id for page in result.pages] == [claim.page_id]
+
+
 async def test_independent_search_rejects_expired_cursor_without_logging(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -359,6 +429,66 @@ async def test_independent_search_rejects_expired_cursor_without_logging(
         await service.search("MFA", (BASE_ID,), cursor="expired")
 
     assert caplog.records == []
+
+
+class _Rows:
+    def __init__(self, rows: list[object]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[object]:
+        return self._rows
+
+
+class _MetadataSession:
+    def __init__(self, high_page_id: UUID, high_claim_id: UUID, low_page_id: UUID) -> None:
+        self.high_page_id = high_page_id
+        self.high_claim_id = high_claim_id
+        self.low_page_id = low_page_id
+        self.page_queries = 0
+
+    async def execute(self, statement: object) -> _Rows:
+        sql = str(statement)
+        if "wiki_pages.id IN" in sql:
+            return _Rows([(self.low_page_id, _uuid(1801)), (self.low_page_id, _uuid(1802))])
+        self.page_queries += 1
+        if self.page_queries == 1:
+            return _Rows([(self.high_page_id, self.high_claim_id)])
+        return _Rows([(self.low_page_id, _uuid(1801))])
+
+
+class _MetadataSessionContext:
+    def __init__(self, session: _MetadataSession) -> None:
+        self._session = session
+
+    async def __aenter__(self) -> _MetadataSession:
+        return self._session
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
+async def test_metadata_claim_expansion_preserves_metadata_hit_priority() -> None:
+    high_page_id = _uuid(1811)
+    low_page_id = _uuid(1812)
+    high_claim_id = _uuid(1813)
+    session = _MetadataSession(high_page_id, high_claim_id, low_page_id)
+    service = WikiIndependentRetrievalService(
+        index=FakeIndex([], []),
+        embedder=FakeEmbedder(),
+        sessions=lambda: _MetadataSessionContext(session),  # type: ignore[arg-type]
+        collection_version="wiki_units_v1",
+        dense_threshold=0.55,
+        rerank_threshold=0.5,
+        keyword_coverage_threshold=0.5,
+    )
+
+    by_page = await service._metadata_claim_ids(  # noqa: SLF001
+        (high_page_id, low_page_id),
+        (BASE_ID,),
+        candidate_limit=2,
+    )
+
+    assert by_page[high_page_id] == (high_claim_id,)
 
 
 @pytest.mark.parametrize(

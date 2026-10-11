@@ -26,6 +26,7 @@ from agent_api.knowledge.infrastructure.database.models import (
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.wiki.read_model import (
     WikiReadModel,
+    _main_claim_statement,
     _metadata_statement,
     build_source_excerpt,
 )
@@ -388,6 +389,17 @@ async def test_load_verified_claims_uses_fixed_batches_for_many_claims() -> None
     assert len(claims) == 20
     assert all(claim.valid for claim in claims)
     assert session.execute_count == 2
+
+
+def test_main_claim_statement_filters_enabled_workspace_and_wiki_config() -> None:
+    statement = _main_claim_statement((uuid4(),), (uuid4(),))
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+
+    assert "JOIN knowledge_bases" in sql
+    assert "JOIN wiki_configs" in sql
+    assert "knowledge_bases.workspace_id" in sql
+    assert "knowledge_bases.enabled IS true" in sql
+    assert "wiki_configs.enabled IS true" in sql
 
 
 async def test_search_metadata_uses_exact_and_prefix_fields_without_similarity() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import unicodedata
 from collections import defaultdict
@@ -222,23 +223,26 @@ class WikiIndependentRetrievalService:
         )
         candidate_limit = max(page_limit * 10, 50)
         try:
-            vector = (await self._embedder.embed_documents([normalized]))[0]
             read_model = self._read_model
             if read_model is not None:
-                dense_hits, keyword_hits, metadata_hits = await asyncio.gather(
-                    self._index.search_dense(vector, scope_ids, candidate_limit),
-                    self._index.search_keyword(normalized, scope_ids, candidate_limit),
-                    read_model.search_metadata(normalized, scope_ids, candidate_limit),
+                dense_hits, keyword_hits, metadata_hits = await self._recall_candidates(
+                    normalized,
+                    scope_ids,
+                    mode,
+                    candidate_limit,
+                    read_model,
                 )
             else:
                 if self._sessions is None:
                     raise RuntimeError("wiki_read_model_unavailable")
                 async with self._sessions() as session:
                     read_model = WikiReadModel(session)
-                    dense_hits, keyword_hits, metadata_hits = await asyncio.gather(
-                        self._index.search_dense(vector, scope_ids, candidate_limit),
-                        self._index.search_keyword(normalized, scope_ids, candidate_limit),
-                        read_model.search_metadata(normalized, scope_ids, candidate_limit),
+                    dense_hits, keyword_hits, metadata_hits = await self._recall_candidates(
+                        normalized,
+                        scope_ids,
+                        mode,
+                        candidate_limit,
+                        read_model,
                     )
         except WikiCursorError:
             raise
@@ -363,6 +367,33 @@ class WikiIndependentRetrievalService:
             collection_version=self._collection_version,
         )
 
+    async def _recall_candidates(
+        self,
+        query: str,
+        scope_ids: tuple[UUID, ...],
+        mode: str,
+        candidate_limit: int,
+        read_model: WikiReadModelLike,
+    ) -> tuple[list[WikiIndexHit], list[WikiIndexHit], tuple[WikiMetadataHit, ...]]:
+        metadata_task = asyncio.create_task(
+            read_model.search_metadata(query, scope_ids, candidate_limit)
+        )
+        keyword_task = (
+            asyncio.create_task(self._index.search_keyword(query, scope_ids, candidate_limit))
+            if mode in {"hybrid", "keyword"}
+            else None
+        )
+        dense_task = None
+        if mode in {"hybrid", "semantic"}:
+            vector = (await self._embedder.embed_documents([query]))[0]
+            dense_task = asyncio.create_task(
+                self._index.search_dense(vector, scope_ids, candidate_limit)
+            )
+        dense_hits = await dense_task if dense_task is not None else []
+        keyword_hits = await keyword_task if keyword_task is not None else []
+        metadata_hits = await metadata_task
+        return dense_hits, keyword_hits, tuple(metadata_hits)
+
     async def _build_candidates(
         self,
         query: str,
@@ -462,30 +493,41 @@ class WikiIndependentRetrievalService:
     ) -> dict[UUID, tuple[UUID, ...]]:
         if self._sessions is None or not page_ids:
             return {}
-        async with self._sessions() as session:
-            rows = list(
-                (
-                    await session.execute(
-                        select(WikiPage.id, WikiClaim.id)
-                        .join(WikiPageVersion, WikiPage.current_version_id == WikiPageVersion.id)
-                        .join(WikiClaim, WikiClaim.page_version_id == WikiPageVersion.id)
-                        .where(
-                            WikiPage.id.in_(page_ids),
-                            WikiPage.knowledge_base_id.in_(scope_ids),
-                            WikiPage.deleted_at.is_(None),
-                            WikiPage.page_type != "index",
-                            WikiPageVersion.index_state == "ready",
-                            WikiClaim.trust_state == "verified",
-                            WikiClaim.claim_type.in_(RETRIEVABLE_CLAIM_TYPES),
-                        )
-                        .order_by(WikiPage.id, WikiClaim.position, WikiClaim.id)
-                        .limit(candidate_limit)
-                    )
-                ).all()
-            )
+        per_page_limit = max(1, candidate_limit // len(page_ids))
+        remaining = candidate_limit
         grouped: dict[UUID, list[UUID]] = defaultdict(list)
-        for page_id, claim_id in rows:
-            grouped[page_id].append(claim_id)
+        async with self._sessions() as session:
+            for page_id in page_ids:
+                if remaining <= 0:
+                    break
+                rows = list(
+                    (
+                        await session.execute(
+                            select(WikiPage.id, WikiClaim.id)
+                            .join(
+                                WikiPageVersion,
+                                WikiPage.current_version_id == WikiPageVersion.id,
+                            )
+                            .join(WikiClaim, WikiClaim.page_version_id == WikiPageVersion.id)
+                            .where(
+                                WikiPage.id == page_id,
+                                WikiPage.knowledge_base_id.in_(scope_ids),
+                                WikiPage.deleted_at.is_(None),
+                                WikiPage.page_type != "index",
+                                WikiPageVersion.index_state == "ready",
+                                WikiClaim.trust_state == "verified",
+                                WikiClaim.claim_type.in_(RETRIEVABLE_CLAIM_TYPES),
+                            )
+                            .order_by(WikiClaim.position, WikiClaim.id)
+                            .limit(min(per_page_limit, remaining))
+                        )
+                    ).all()
+                )
+                for matched_page_id, claim_id in rows:
+                    grouped[matched_page_id].append(claim_id)
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
         return {page_id: tuple(claim_ids) for page_id, claim_ids in grouped.items()}
 
     async def _load_claims(
@@ -539,10 +581,15 @@ class WikiIndependentRetrievalService:
                 scores = await self._scorer.score(query, [claim.text for _, claim in valid_pairs])
                 if len(scores) != len(valid_pairs):
                     raise ValueError("invalid_rerank_score_count")
-                rerank_scores = [float(score) for score in scores]
+                normalized_scores = [float(score) for score in scores]
+                if not all(math.isfinite(score) for score in normalized_scores):
+                    raise ValueError("invalid_rerank_score")
+                for index, score in enumerate(normalized_scores):
+                    rerank_scores[index] = score
             except Exception:
                 degraded = True
                 degradation_reason = "reranker_unavailable"
+                rerank_scores = [None] * len(valid_pairs)
         accepted: list[_Accepted] = []
         filtered_count = 0
         for index, (candidate, claim) in enumerate(valid_pairs):

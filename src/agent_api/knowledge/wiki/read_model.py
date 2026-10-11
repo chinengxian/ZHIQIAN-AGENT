@@ -143,6 +143,8 @@ def _main_claim_statement(
         select(WikiPage, WikiPageVersion, WikiClaim, WikiClaimSource, Document, Chunk)
         .join(WikiPageVersion, WikiClaim.page_version_id == WikiPageVersion.id)
         .join(WikiPage, WikiPageVersion.page_id == WikiPage.id)
+        .join(KnowledgeBase, KnowledgeBase.id == WikiPage.knowledge_base_id)
+        .join(WikiConfig, WikiConfig.knowledge_base_id == KnowledgeBase.id)
         .outerjoin(WikiClaimSource, WikiClaimSource.claim_id == WikiClaim.id)
         .outerjoin(Document, Document.id == WikiClaimSource.document_id)
         .outerjoin(Chunk, chunk_match)
@@ -150,6 +152,9 @@ def _main_claim_statement(
             WikiClaim.id.in_(claim_ids),
             WikiPage.knowledge_base_id.in_(scope_ids),
             WikiPage.deleted_at.is_(None),
+            KnowledgeBase.workspace_id == DEFAULT_WORKSPACE_ID,
+            KnowledgeBase.enabled.is_(True),
+            WikiConfig.enabled.is_(True),
         )
         .order_by(WikiClaim.position, WikiClaim.id, WikiClaimSource.id)
     )

@@ -7,6 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
+from agent_api.knowledge.wiki.cursor import WikiCursorError
 from agent_api.knowledge.wiki.retrieval import WikiRetrievalError, WikiRetrievalService
 from agent_api.knowledge.wiki.service import WikiError, WikiService
 
@@ -92,6 +93,7 @@ class WikiPageResponse(WikiPageSummary):
     summary_sections: list[WikiSummarySectionResponse]
     metadata: list[WikiMetadataResponse]
     claims: list[WikiClaimResponse]
+    claims_next_cursor: str | None = None
 
 
 class WikiVersionResponse(BaseModel):
@@ -177,6 +179,7 @@ class WikiMatchedClaimResponse(BaseModel):
     claim_type: Literal["summary_fact", "topic_fact", "source_excerpt", "manual"]
     score: float
     sources: list[WikiSearchSourceResponse]
+    also_in_pages: list[WikiPageSummary] = Field(default_factory=list)
 
 
 class WikiMatchedPageResponse(BaseModel):
@@ -196,6 +199,10 @@ class WikiSearchResponse(BaseModel):
     degraded: bool
     degradation_reason: str | None
     truncation_reason: str | None
+    no_answer: bool = False
+    no_answer_reason: str | None = None
+    next_cursor: str | None = None
+    collection_version: str | None = None
 
 
 def get_wiki_service(request: Request) -> WikiService:
@@ -281,9 +288,25 @@ async def rebuild_aggregation(knowledge_base_id: UUID, service: WikiServiceDepen
 
 
 @router.get("/pages/{page_id}", response_model=WikiPageResponse)
-async def get_page(knowledge_base_id: UUID, page_id: UUID, service: WikiServiceDependency) -> Any:
+async def get_page(
+    knowledge_base_id: UUID,
+    page_id: UUID,
+    service: WikiServiceDependency,
+    claim_cursor: str | None = None,
+    claim_limit: int = Query(default=20, ge=1, le=50),
+) -> Any:
     try:
-        return await service.get_page(knowledge_base_id, page_id)
+        return await service.get_page(
+            knowledge_base_id,
+            page_id,
+            claim_cursor=claim_cursor,
+            claim_limit=claim_limit,
+        )
+    except WikiCursorError:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "wiki_page_cursor_expired", "message": "Wiki page cursor expired"},
+        ) from None
     except WikiError as error:
         _raise_http_error(error)
 
@@ -405,6 +428,7 @@ async def search_pages(
     mode: Literal["hybrid", "semantic", "keyword"] = "hybrid",
     limit: int = Query(default=5, ge=1, le=20),
     claim_limit: int = Query(default=12, ge=1, le=50),
+    cursor: str | None = None,
 ) -> Any:
     try:
         return await service.search(
@@ -413,7 +437,13 @@ async def search_pages(
             mode=mode,
             page_limit=limit,
             claim_limit=claim_limit,
+            cursor=cursor,
         )
+    except WikiCursorError:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "wiki_search_cursor_expired", "message": "Wiki search cursor expired"},
+        ) from None
     except ValueError:
         raise HTTPException(
             status_code=422,

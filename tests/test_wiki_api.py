@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import FastAPI
@@ -16,6 +16,7 @@ from agent_api.knowledge.wiki.api import (
 from agent_api.knowledge.wiki.retrieval import (
     WikiMatchedClaim,
     WikiMatchedPage,
+    WikiMatchedPageSummary,
     WikiSearchResult,
 )
 from agent_api.knowledge.wiki.service import WikiError
@@ -24,16 +25,22 @@ from agent_api.knowledge.wiki.service import WikiError
 class FakeWikiRetrieval:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.raise_cursor_error = False
 
     async def search(
         self,
         query: str,
-        scope_ids: tuple,
+        scope_ids: tuple[UUID, ...],
         *,
         mode: str,
         page_limit: int,
         claim_limit: int,
+        cursor: str | None = None,
     ) -> WikiSearchResult:
+        if self.raise_cursor_error:
+            from agent_api.knowledge.wiki.cursor import WikiCursorError
+
+            raise WikiCursorError("wiki_search_cursor_expired")
         self.calls.append(
             {
                 "query": query,
@@ -41,6 +48,7 @@ class FakeWikiRetrieval:
                 "mode": mode,
                 "page_limit": page_limit,
                 "claim_limit": claim_limit,
+                "cursor": cursor,
             }
         )
         source = Source(
@@ -67,6 +75,16 @@ class FakeWikiRetrieval:
             claim_type="summary_fact",
             score=1.4,
             sources=(source,),
+            also_in_pages=(
+                WikiMatchedPageSummary(
+                    id=uuid4(),
+                    knowledge_base_id=scope_ids[0],
+                    slug="topic/auth-copy",
+                    title="认证镜像",
+                    page_type="topic",
+                    current_version_id=uuid4(),
+                ),
+            ),
         )
         page = WikiMatchedPage(
             id=uuid4(),
@@ -79,7 +97,15 @@ class FakeWikiRetrieval:
             matched_claims=(claim,),
             omitted_claim_count=2,
         )
-        return WikiSearchResult((page,), False, None, None)
+        return WikiSearchResult(
+            (page,),
+            False,
+            None,
+            None,
+            no_answer=False,
+            next_cursor="cursor-2",
+            collection_version="wiki_units_v1",
+        )
 
 
 class FakeWikiService:
@@ -118,6 +144,7 @@ async def test_wiki_search_api_returns_ranked_claims_and_sources() -> None:
                 "mode": "hybrid",
                 "limit": 5,
                 "claim_limit": 12,
+                "cursor": "cursor-1",
             },
         )
 
@@ -126,6 +153,7 @@ async def test_wiki_search_api_returns_ranked_claims_and_sources() -> None:
     assert payload["pages"][0]["matched_fields"] == ["alias", "source_chunk"]
     assert payload["pages"][0]["matched_claims"][0]["position"] == 9
     source = payload["pages"][0]["matched_claims"][0]["sources"][0]
+    assert payload["pages"][0]["matched_claims"][0]["also_in_pages"][0]["title"] == "认证镜像"
     assert source["chunk_id"]
     assert source["parent_chunk_id"]
     assert source["excerpt"] == "需要两个独立认证因素"
@@ -133,13 +161,32 @@ async def test_wiki_search_api_returns_ranked_claims_and_sources() -> None:
     assert source["focus_end"] == 12
     assert source["invalid_reason"] is None
     assert payload["degraded"] is False
+    assert payload["no_answer"] is False
+    assert payload["next_cursor"] == "cursor-2"
+    assert payload["collection_version"] == "wiki_units_v1"
     assert service.calls[0] == {
         "query": "双因素校验",
         "scope_ids": (base_id,),
         "mode": "hybrid",
         "page_limit": 5,
         "claim_limit": 12,
+        "cursor": "cursor-1",
     }
+
+
+async def test_wiki_search_api_maps_expired_cursor_to_conflict() -> None:
+    base_id = uuid4()
+    service = FakeWikiRetrieval()
+    service.raise_cursor_error = True
+    transport = httpx.ASGITransport(app=_app(service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            f"/api/v1/knowledge-bases/{base_id}/wiki/search",
+            params={"q": "认证", "cursor": "expired"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "wiki_search_cursor_expired"
 
 
 async def test_wiki_search_api_validates_options() -> None:
@@ -228,6 +275,7 @@ def test_page_response_exposes_sections_and_metadata_separately_from_claims() ->
             ],
             "metadata": [{"key": "version", "label": "版本", "value": "3.0"}],
             "claims": [],
+            "claims_next_cursor": None,
         }
     )
 

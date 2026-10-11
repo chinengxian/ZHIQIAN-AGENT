@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from hashlib import sha256
 from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,7 +12,7 @@ from sqlalchemy.dialects import postgresql
 from agent_api.knowledge.application.citations import Source
 from agent_api.knowledge.infrastructure.database.models import Chunk
 from agent_api.knowledge.wiki.retrieval import (
-    WikiRetrievalService,
+    LegacyWikiRetrievalService,
     _build_metadata_statement,
     _ClaimRecord,
     _escape_like_pattern,
@@ -66,7 +67,7 @@ class FailingReranker:
         raise RuntimeError("reranker offline")
 
 
-class StubWikiRetrieval(WikiRetrievalService):
+class StubWikiRetrieval(LegacyWikiRetrievalService):
     def __init__(
         self,
         pages: dict[UUID, _PageRecord],
@@ -336,9 +337,10 @@ async def test_hydrate_pages_uses_precise_parent_excerpt_for_legacy_sources() ->
         batches=[[(page, version)], [], [main_row], [(parent,)]],
         claim_ids=[claim.id],
     )
-    retrieval = WikiRetrievalService(
-        lambda: _HydrateSessionContext(session), FakeSourceRetrieval([])
-    )  # type: ignore[arg-type]
+    retrieval = LegacyWikiRetrievalService(
+        cast(Any, lambda: _HydrateSessionContext(session)),
+        cast(Any, FakeSourceRetrieval([])),
+    )
 
     records = await retrieval._hydrate_pages([page_id], (base_id,))
 
@@ -414,9 +416,10 @@ async def test_hydrate_pages_filters_cross_scope_document_sources_for_legacy_sea
         batches=[[(page, version)], [], [main_row], []],
         claim_ids=[claim.id],
     )
-    retrieval = WikiRetrievalService(
-        lambda: _HydrateSessionContext(session), FakeSourceRetrieval([])
-    )  # type: ignore[arg-type]
+    retrieval = LegacyWikiRetrievalService(
+        cast(Any, lambda: _HydrateSessionContext(session)),
+        cast(Any, FakeSourceRetrieval([])),
+    )
 
     records = await retrieval._hydrate_pages([page_id], (base_id,))
 

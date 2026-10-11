@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import unicodedata
@@ -7,12 +8,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from time import perf_counter
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent_api.core.config import WikiSearchBackend
 from agent_api.knowledge.application.citations import Source
 from agent_api.knowledge.application.management import DEFAULT_WORKSPACE_ID
 from agent_api.knowledge.infrastructure.database.models import (
@@ -26,6 +28,8 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiPageAlias,
     WikiPageVersion,
 )
+from agent_api.knowledge.infrastructure.observability.events import record_wiki_shadow_diff
+from agent_api.knowledge.wiki.cursor import WikiCursorError
 from agent_api.knowledge.wiki.ranking import reciprocal_rank_fusion, select_mmr
 from agent_api.knowledge.wiki.read_model import VerifiedWikiClaim, WikiReadModel
 
@@ -53,6 +57,31 @@ class WikiRetrievalError(RuntimeError):
     """Wiki 检索无法安全降级时返回稳定错误码。"""
 
 
+class WikiIndependentRetrieval(Protocol):
+    async def search(
+        self,
+        query: str,
+        scope_ids: tuple[UUID, ...],
+        *,
+        mode: str = "hybrid",
+        page_limit: int = 5,
+        claim_limit: int = 12,
+        cursor: str | None = None,
+    ) -> WikiSearchResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class WikiMatchedPageSummary:
+    id: UUID
+    knowledge_base_id: UUID
+    slug: str
+    title: str
+    page_type: str
+    current_version_id: UUID | None = None
+    index_state: str = "not_required"
+    index_error_code: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class WikiMatchedClaim:
     id: UUID
@@ -61,6 +90,7 @@ class WikiMatchedClaim:
     claim_type: str
     score: float
     sources: tuple[Source, ...]
+    also_in_pages: tuple[WikiMatchedPageSummary, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +112,24 @@ class WikiSearchResult:
     degraded: bool
     degradation_reason: str | None
     truncation_reason: str | None
+    no_answer: bool = False
+    no_answer_reason: str | None = None
+    next_cursor: str | None = None
+    collection_version: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WikiShadowMetrics:
+    query_fingerprint: str
+    legacy_page_ids: tuple[UUID, ...]
+    independent_page_ids: tuple[UUID, ...]
+    legacy_claim_ids: tuple[UUID, ...]
+    independent_claim_ids: tuple[UUID, ...]
+    legacy_elapsed_ms: float | None
+    independent_elapsed_ms: float | None
+    legacy_no_answer: bool
+    independent_no_answer: bool | None
+    independent_degradation_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,7 +264,7 @@ def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
     )
 
 
-class WikiRetrievalService:
+class LegacyWikiRetrievalService:
     """融合页面元数据和原文 chunk 命中，返回当前且可追溯的 Wiki 事实。"""
 
     def __init__(
@@ -651,3 +699,185 @@ class WikiRetrievalService:
             degradation_reason,
             elapsed_ms,
         )
+
+
+class WikiRetrievalService:
+    """按配置在 legacy、独立检索和 shadow 模式之间路由。"""
+
+    def __init__(
+        self,
+        legacy: LegacyWikiRetrievalService | async_sessionmaker[AsyncSession],
+        independent: WikiIndependentRetrieval | SourceRetrieval | None = None,
+        reranker: WikiReranker | None = None,
+        *,
+        backend: WikiSearchBackend = WikiSearchBackend.LEGACY,
+    ) -> None:
+        # 兼容旧测试和旧调用方：传 sessions/source_retrieval 时自动包成 legacy。
+        if isinstance(legacy, LegacyWikiRetrievalService) or (
+            hasattr(legacy, "search") and not callable(legacy)
+        ):
+            self._legacy = legacy
+            self._independent = (
+                cast(WikiIndependentRetrieval, independent) if independent is not None else None
+            )
+        else:
+            if independent is None:
+                raise TypeError("legacy source retrieval is required")
+            self._legacy = LegacyWikiRetrievalService(
+                legacy,
+                cast(SourceRetrieval, independent),
+                reranker,
+            )
+            self._independent = None
+        self._backend = backend
+        self.last_shadow_metrics: WikiShadowMetrics | None = None
+
+    async def search(
+        self,
+        query: str,
+        scope_ids: tuple[UUID, ...],
+        *,
+        mode: str = "hybrid",
+        page_limit: int = 5,
+        claim_limit: int = 12,
+        cursor: str | None = None,
+        character_budget: int = 12_000,
+    ) -> WikiSearchResult:
+        if self._backend is WikiSearchBackend.LEGACY:
+            if cursor is not None:
+                raise WikiCursorError("wiki_search_cursor_expired")
+            return await self._legacy.search(
+                query,
+                scope_ids,
+                mode=mode,
+                page_limit=page_limit,
+                claim_limit=claim_limit,
+                character_budget=character_budget,
+            )
+        if self._backend is WikiSearchBackend.INDEPENDENT:
+            if self._independent is None:
+                raise WikiRetrievalError("wiki_retrieval_unavailable")
+            return await self._independent.search(
+                query,
+                scope_ids,
+                mode=mode,
+                page_limit=page_limit,
+                claim_limit=claim_limit,
+                cursor=cursor,
+            )
+        if self._independent is None:
+            return await self._legacy.search(
+                query,
+                scope_ids,
+                mode=mode,
+                page_limit=page_limit,
+                claim_limit=claim_limit,
+                character_budget=character_budget,
+            )
+        if cursor is not None:
+            raise WikiCursorError("wiki_search_cursor_expired")
+        legacy_started = perf_counter()
+        legacy_task = self._legacy.search(
+            query,
+            scope_ids,
+            mode=mode,
+            page_limit=page_limit,
+            claim_limit=claim_limit,
+            character_budget=character_budget,
+        )
+        independent_started = perf_counter()
+        independent_task = self._independent.search(
+            query,
+            scope_ids,
+            mode=mode,
+            page_limit=page_limit,
+            claim_limit=claim_limit,
+            cursor=None,
+        )
+        gathered: tuple[WikiSearchResult | BaseException, WikiSearchResult | BaseException]
+        gathered = await asyncio.gather(
+            legacy_task,
+            independent_task,
+            return_exceptions=True,
+        )
+        legacy_result, independent_result = gathered
+        legacy_elapsed = round((perf_counter() - legacy_started) * 1000, 2)
+        independent_elapsed = round((perf_counter() - independent_started) * 1000, 2)
+        if isinstance(legacy_result, BaseException):
+            raise legacy_result
+        self._log_shadow_diff(
+            query,
+            legacy_result,
+            independent_result,
+            legacy_elapsed,
+            independent_elapsed,
+        )
+        return legacy_result
+
+    async def read_page(
+        self,
+        knowledge_base_id: UUID,
+        page_id: UUID,
+        *,
+        query: str = "",
+        cursor: int = 0,
+        limit: int = 20,
+    ) -> dict[str, Any] | None:
+        return await self._legacy.read_page(
+            knowledge_base_id,
+            page_id,
+            query=query,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    def rank_page_claims(
+        self,
+        query: str,
+        claims: Sequence[_ClaimRecord],
+        source_ranks: dict[UUID, int] | None = None,
+    ) -> list[tuple[_ClaimRecord, float]]:
+        return self._legacy.rank_page_claims(query, claims, source_ranks)
+
+    def _log_shadow_diff(
+        self,
+        query: str,
+        legacy_result: WikiSearchResult,
+        independent_result: WikiSearchResult | BaseException,
+        legacy_elapsed_ms: float | None,
+        independent_elapsed_ms: float | None,
+    ) -> None:
+        fingerprint = sha256(_normalize_query(query).encode()).hexdigest()[:16]
+        legacy_page_ids = tuple(page.id for page in legacy_result.pages)
+        legacy_claim_ids = tuple(
+            claim.id for page in legacy_result.pages for claim in page.matched_claims
+        )
+        if isinstance(independent_result, BaseException):
+            self.last_shadow_metrics = WikiShadowMetrics(
+                query_fingerprint=fingerprint,
+                legacy_page_ids=legacy_page_ids,
+                independent_page_ids=(),
+                legacy_claim_ids=legacy_claim_ids,
+                independent_claim_ids=(),
+                legacy_elapsed_ms=legacy_elapsed_ms,
+                independent_elapsed_ms=independent_elapsed_ms,
+                legacy_no_answer=legacy_result.no_answer,
+                independent_no_answer=None,
+                independent_degradation_reason=type(independent_result).__name__,
+            )
+        else:
+            self.last_shadow_metrics = WikiShadowMetrics(
+                query_fingerprint=fingerprint,
+                legacy_page_ids=legacy_page_ids,
+                independent_page_ids=tuple(page.id for page in independent_result.pages),
+                legacy_claim_ids=legacy_claim_ids,
+                independent_claim_ids=tuple(
+                    claim.id for page in independent_result.pages for claim in page.matched_claims
+                ),
+                legacy_elapsed_ms=legacy_elapsed_ms,
+                independent_elapsed_ms=independent_elapsed_ms,
+                legacy_no_answer=legacy_result.no_answer,
+                independent_no_answer=independent_result.no_answer,
+                independent_degradation_reason=independent_result.degradation_reason,
+            )
+        record_wiki_shadow_diff(self.last_shadow_metrics)

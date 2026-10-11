@@ -11,14 +11,16 @@ from agent_api.knowledge.application.retrieval import KnowledgeRetrievalService
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.infrastructure.embedding.embedding import create_embedding_adapter
 from agent_api.knowledge.infrastructure.milvus.index import MilvusChunkIndex
+from agent_api.knowledge.infrastructure.milvus.wiki_index import MilvusWikiIndex
 from agent_api.knowledge.infrastructure.rerank.bge import LocalBGEReranker
 from agent_api.knowledge.infrastructure.startup import (
     KnowledgeStartupFactory,
     create_knowledge_startup,
 )
 from agent_api.knowledge.tools.readonly import create_knowledge_tools
+from agent_api.knowledge.wiki.independent_retrieval import WikiIndependentRetrievalService
 from agent_api.knowledge.wiki.indexing import embedding_fingerprint
-from agent_api.knowledge.wiki.retrieval import WikiRetrievalService
+from agent_api.knowledge.wiki.retrieval import LegacyWikiRetrievalService, WikiRetrievalService
 from agent_api.knowledge.wiki.service import WikiService
 from agent_api.llm.agent import LangChainAgentStream
 from agent_api.llm.protocol import StreamAgent
@@ -86,10 +88,30 @@ def create_lifespan(
                     create_embedding_adapter(settings),
                     reranker,
                 )
+                wiki_independent = None
+                if settings.wiki_index_enabled:
+                    wiki_independent = WikiIndependentRetrievalService(
+                        sessions=knowledge_database.session_factory,
+                        index=MilvusWikiIndex(
+                            knowledge_milvus,
+                            search_collection=settings.wiki_milvus_collection_alias,
+                            write_collection=settings.wiki_milvus_collection_version,
+                        ),
+                        embedder=create_embedding_adapter(settings),
+                        scorer=reranker,
+                        collection_version=settings.wiki_milvus_collection_version,
+                        dense_threshold=settings.wiki_dense_threshold,
+                        rerank_threshold=settings.wiki_rerank_threshold,
+                        keyword_coverage_threshold=settings.wiki_keyword_coverage_threshold,
+                    )
                 wiki_retrieval = WikiRetrievalService(
-                    knowledge_database.session_factory,
-                    knowledge_retrieval,
-                    reranker,
+                    LegacyWikiRetrievalService(
+                        knowledge_database.session_factory,
+                        knowledge_retrieval,
+                        reranker,
+                    ),
+                    wiki_independent,
+                    backend=settings.wiki_search_backend,
                 )
             chat_agent = agent_factory(settings)
             if settings.knowledge_enabled and isinstance(chat_agent, LangChainAgentStream):

@@ -20,6 +20,12 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiPageVersion,
     WikiTokenUsage,
 )
+from agent_api.knowledge.wiki.cursor import (
+    PageClaimCursor,
+    WikiCursorError,
+    decode_page_claim_cursor,
+    encode_page_claim_cursor,
+)
 from agent_api.knowledge.wiki.index_jobs import (
     retry_page_index_job,
     schedule_current_page_indexes,
@@ -212,7 +218,16 @@ class WikiService:
             "summary_pages": sum(page["page_type"] == "summary" for page in pages),
         }
 
-    async def get_page(self, knowledge_base_id: UUID, page_id: UUID) -> dict[str, Any]:
+    async def get_page(
+        self,
+        knowledge_base_id: UUID,
+        page_id: UUID,
+        *,
+        claim_cursor: str | None = None,
+        claim_limit: int = 20,
+    ) -> dict[str, Any]:
+        if not 1 <= claim_limit <= 50:
+            raise ValueError("invalid_wiki_cursor")
         async with self._sessions() as session:
             await self._base(session, knowledge_base_id)
             page = await self._page(session, knowledge_base_id, page_id)
@@ -224,7 +239,19 @@ class WikiService:
             all_claims = await self._claims_response(session, version.id, knowledge_base_id)
             summary_sections = self._summary_sections_response(version, all_claims)
             claims = [claim for claim in all_claims if claim["claim_type"] != "summary_section"]
-            return self._page_response(page, version, claims, summary_sections)
+            selected_claims, next_cursor = self._paginate_claims(
+                claims,
+                version.id,
+                claim_cursor,
+                claim_limit,
+            )
+            return self._page_response(
+                page,
+                version,
+                selected_claims,
+                summary_sections,
+                next_cursor,
+            )
 
     @staticmethod
     def _page_response(
@@ -232,6 +259,7 @@ class WikiService:
         version: WikiPageVersion,
         claims: list[dict[str, Any]],
         summary_sections: list[dict[str, Any]] | None = None,
+        claims_next_cursor: str | None = None,
     ) -> dict[str, Any]:
         return {
             "id": page.id,
@@ -249,7 +277,39 @@ class WikiService:
             "summary_sections": summary_sections or [],
             "metadata": WikiService._metadata_response(version),
             "claims": claims,
+            "claims_next_cursor": claims_next_cursor,
         }
+
+    @staticmethod
+    def _paginate_claims(
+        claims: list[dict[str, Any]],
+        page_version_id: UUID,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        ordered = sorted(claims, key=lambda item: (item["position"], item["id"]))
+        if cursor is not None:
+            try:
+                decoded = decode_page_claim_cursor(cursor, page_version_id=page_version_id)
+            except WikiCursorError:
+                raise WikiCursorError("wiki_page_cursor_expired") from None
+            ordered = [
+                claim
+                for claim in ordered
+                if (claim["position"], claim["id"]) > (decoded.last_position, decoded.last_claim_id)
+            ]
+        selected = ordered[:limit]
+        if len(ordered) <= limit or not selected:
+            return selected, None
+        last = selected[-1]
+        next_cursor = encode_page_claim_cursor(
+            PageClaimCursor(
+                page_version_id=page_version_id,
+                last_position=last["position"],
+                last_claim_id=last["id"],
+            )
+        )
+        return selected, next_cursor
 
     @staticmethod
     def _metadata_response(version: WikiPageVersion) -> list[dict[str, str]]:

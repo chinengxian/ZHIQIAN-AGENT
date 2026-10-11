@@ -1,4 +1,5 @@
 import json
+from typing import Any, cast
 from uuid import UUID
 
 from agent_api.knowledge.application.citations import Source
@@ -73,6 +74,7 @@ class FakeWikiRetrieval:
     def __init__(self) -> None:
         self.search_scopes: list[tuple[UUID, ...]] = []
         self.read_calls: list[dict[str, object]] = []
+        self.no_answer = False
 
     @staticmethod
     def _source() -> Source:
@@ -97,8 +99,19 @@ class FakeWikiRetrieval:
         scope_ids: tuple[UUID, ...],
         **options: object,
     ) -> WikiSearchResult:
-        del query, options
+        del query
+        assert options.get("cursor") in {None, "cursor-1"}
         self.search_scopes.append(scope_ids)
+        if self.no_answer:
+            return WikiSearchResult(
+                (),
+                False,
+                None,
+                None,
+                no_answer=True,
+                no_answer_reason="below_relevance_threshold",
+                next_cursor=None,
+            )
         claim = WikiMatchedClaim(
             id=UUID(int=30),
             text="第九条但最相关的结论",
@@ -118,7 +131,7 @@ class FakeWikiRetrieval:
             matched_claims=(claim,),
             omitted_claim_count=2,
         )
-        return WikiSearchResult((page,), False, None, "claim_limit")
+        return WikiSearchResult((page,), False, None, "claim_limit", next_cursor="cursor-2")
 
     async def read_page(
         self,
@@ -201,8 +214,10 @@ async def test_wiki_tools_enforce_scope_and_only_register_valid_sources() -> Non
     wiki_retrieval = FakeWikiRetrieval()
     tools = {
         item.name: item
-        for item in create_knowledge_tools(  # type: ignore[arg-type]
-            FakeRetrieval(), wiki, wiki_retrieval
+        for item in create_knowledge_tools(
+            cast(Any, FakeRetrieval()),
+            cast(Any, wiki),
+            cast(Any, wiki_retrieval),
         )
     }
     token = current_turn.set(TurnKnowledgeState((BASE_ID,)))
@@ -225,8 +240,13 @@ async def test_wiki_tools_enforce_scope_and_only_register_valid_sources() -> Non
         ]
         assert found["pages"][0]["matched_fields"] == ["source_chunk"]
         assert found["pages"][0]["omitted_claim_count"] == 2
+        assert found["next_cursor"] == "cursor-2"
         assert found["degraded"] is False
-        assert wiki_retrieval.search_scopes == [(BASE_ID,)]
+        paged = json.loads(
+            await tools["wiki_search"].ainvoke({"query": "指南", "cursor": "cursor-1"})
+        )
+        assert paged["next_cursor"] == "cursor-2"
+        assert wiki_retrieval.search_scopes == [(BASE_ID,), (BASE_ID,)]
         read = json.loads(
             await tools["wiki_read_page"].ainvoke(
                 {
@@ -241,5 +261,29 @@ async def test_wiki_tools_enforce_scope_and_only_register_valid_sources() -> Non
         assert read["pages"][0]["claims"][0]["text"] == "有效结论"
         assert read["pages"][0]["next_cursor"] == 20
         assert len(current_turn.get().sources) == 1  # type: ignore[union-attr]
+    finally:
+        current_turn.reset(token)
+
+
+async def test_wiki_tool_no_answer_does_not_register_low_score_candidates() -> None:
+    wiki = FakeWiki()
+    wiki_retrieval = FakeWikiRetrieval()
+    wiki_retrieval.no_answer = True
+    tools = {
+        item.name: item
+        for item in create_knowledge_tools(
+            cast(Any, FakeRetrieval()),
+            cast(Any, wiki),
+            cast(Any, wiki_retrieval),
+        )
+    }
+    token = current_turn.set(TurnKnowledgeState((BASE_ID,)))
+    try:
+        result = json.loads(await tools["wiki_search"].ainvoke({"query": "不存在"}))
+
+        assert result["status"] == "no_relevant_knowledge"
+        assert result["message"] == "Wiki 中没有足够相关且可核验的知识"
+        assert result["pages"] == []
+        assert len(current_turn.get().sources) == 0  # type: ignore[union-attr]
     finally:
         current_turn.reset(token)

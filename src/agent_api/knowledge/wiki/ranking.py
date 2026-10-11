@@ -48,28 +48,21 @@ def deduplicate_scored_candidates(
 ) -> list[WikiScoredCandidate]:
     """按事实指纹去重；同事实保留相关性最高且 ID 稳定最小的候选。"""
 
-    best_by_fingerprint: dict[str, tuple[int, WikiScoredCandidate]] = {}
-    for index, candidate in enumerate(candidates):
+    best_by_fingerprint: dict[str, WikiScoredCandidate] = {}
+    for candidate in candidates:
         fingerprint = fact_fingerprints[candidate.unit_id]
         current = best_by_fingerprint.get(fingerprint)
         if current is None:
-            best_by_fingerprint[fingerprint] = (index, candidate)
+            best_by_fingerprint[fingerprint] = candidate
             continue
-        current_index, current_candidate = current
-        candidate_key = (
-            _candidate_rank_score(candidate),
-            -index,
-            str(candidate.unit_id),
-        )
-        current_key = (
-            _candidate_rank_score(current_candidate),
-            -current_index,
-            str(current_candidate.unit_id),
-        )
-        if candidate_key > current_key:
-            best_by_fingerprint[fingerprint] = (index, candidate)
+        candidate_score = _candidate_rank_score(candidate)
+        current_score = _candidate_rank_score(current)
+        if candidate_score > current_score or (
+            candidate_score == current_score and str(candidate.unit_id) < str(current.unit_id)
+        ):
+            best_by_fingerprint[fingerprint] = candidate
     ordered = sorted(
-        (item[1] for item in best_by_fingerprint.values()),
+        best_by_fingerprint.values(),
         key=lambda candidate: (-_candidate_rank_score(candidate), str(candidate.unit_id)),
     )
     return ordered

@@ -85,3 +85,40 @@ def test_deduplicates_scored_candidates_by_fact_fingerprint() -> None:
     )
 
     assert deduplicated == [high_duplicate]
+
+
+def test_deduplicate_tie_break_uses_stable_unit_id_not_input_order() -> None:
+    small_unit = UUID("00000000-0000-0000-0000-000000000001")
+    large_unit = UUID("00000000-0000-0000-0000-000000000002")
+    small = WikiScoredCandidate(
+        unit_id=small_unit,
+        page_id=UUID("10000000-0000-0000-0000-000000000001"),
+        claim_id=UUID("20000000-0000-0000-0000-000000000001"),
+        rrf_score=0.7,
+        dense_score=0.7,
+        keyword_score=0.7,
+        keyword_coverage=0.7,
+        rerank_score=None,
+        exact_metadata_match=False,
+    )
+    large = WikiScoredCandidate(
+        unit_id=large_unit,
+        page_id=UUID("10000000-0000-0000-0000-000000000002"),
+        claim_id=UUID("20000000-0000-0000-0000-000000000002"),
+        rrf_score=0.7,
+        dense_score=0.7,
+        keyword_score=0.7,
+        keyword_coverage=0.7,
+        rerank_score=None,
+        exact_metadata_match=False,
+    )
+    fingerprints = {
+        small.unit_id: "same-fact",
+        large.unit_id: "same-fact",
+    }
+
+    forward = deduplicate_scored_candidates([small, large], fact_fingerprints=fingerprints)
+    reversed_order = deduplicate_scored_candidates([large, small], fact_fingerprints=fingerprints)
+
+    assert forward == [small]
+    assert reversed_order == [small]

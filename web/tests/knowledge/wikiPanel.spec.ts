@@ -8,6 +8,8 @@ const api = vi.hoisted(() => ({
   listWikiJobs: vi.fn(),
   searchWiki: vi.fn(),
   rebuildWikiAggregation: vi.fn(),
+  retryWikiIndex: vi.fn(),
+  backfillWikiIndex: vi.fn(),
   getWikiPage: vi.fn(),
   listWikiVersions: vi.fn(),
 }))
@@ -33,6 +35,8 @@ beforeEach(() => {
   api.listWikiPages.mockResolvedValue([])
   api.listWikiJobs.mockResolvedValue([])
   api.rebuildWikiAggregation.mockResolvedValue({ topic_pages: 1, summary_pages: 1 })
+  api.retryWikiIndex.mockResolvedValue({ id: 'job-retry' })
+  api.backfillWikiIndex.mockResolvedValue({ created_jobs: 1, existing_jobs: 0, skipped_versions: 0 })
   api.searchWiki.mockResolvedValue({
     pages: [{
       id: 'page-auth',
@@ -41,7 +45,7 @@ beforeEach(() => {
       title: '身份认证',
       page_type: 'topic',
       score: 0.91,
-      matched_fields: ['source_chunk'],
+      matched_fields: ['dense', 'keyword'],
       matched_claims: [{
         id: 'claim-auth',
         text: '普通员工需要两个独立认证因素。',
@@ -49,12 +53,17 @@ beforeEach(() => {
         claim_type: 'topic_fact',
         score: 0.88,
         sources: [],
+        also_in_pages: [],
       }],
       omitted_claim_count: 0,
     }],
+    no_answer: false,
+    no_answer_reason: null,
     degraded: false,
     degradation_reason: null,
     truncation_reason: null,
+    next_cursor: 'cursor-2',
+    collection_version: 'wiki_units_v1',
   })
   api.getWikiPage.mockResolvedValue({
     id: 'page-auth',
@@ -79,6 +88,7 @@ beforeEach(() => {
       reason: null,
       sources: [],
     }],
+    claims_next_cursor: 'claim-cursor-2',
   })
   api.listWikiVersions.mockResolvedValue([])
 })
@@ -98,20 +108,59 @@ it('按主题与来源语义搜索 Wiki，并显示命中的结论', async () =>
   })
   expect(wrapper.text()).toContain('身份认证')
   expect(wrapper.text()).toContain('普通员工需要两个独立认证因素。')
-  expect(wrapper.text()).toContain('语义来源命中')
+  expect(wrapper.text()).toContain('语义命中')
+  expect(wrapper.text()).toContain('关键词命中')
+
+  await wrapper.get('button[aria-label="加载更多 Wiki 搜索结果"]').trigger('click')
+  await flushPromises()
+  expect(api.searchWiki).toHaveBeenLastCalledWith('base', '登录安全要求', expect.objectContaining({ cursor: 'cursor-2' }))
 
   await wrapper.get('[data-search-page-id="page-auth"]').trigger('click')
   await flushPromises()
-  expect(api.getWikiPage).toHaveBeenCalledWith('base', 'page-auth')
+  expect(api.getWikiPage).toHaveBeenCalledWith('base', 'page-auth', { claimLimit: 20 })
   expect(wrapper.get('[data-claim-id="claim-auth"]').classes()).toContain('claim-highlight')
+
+  api.getWikiPage.mockResolvedValueOnce({
+    id: 'page-auth',
+    knowledge_base_id: 'base',
+    slug: 'topic/authentication',
+    title: '身份认证',
+    page_type: 'topic',
+    current_version_id: 'version-auth',
+    version_no: 1,
+    content: '# 身份认证',
+    summary: '认证要求',
+    origin: 'pipeline',
+    summary_sections: [],
+    metadata: [],
+    claims: [{
+      id: 'claim-auth-more',
+      claim_key: 'authentication-more',
+      text: '管理员登录需要 MFA。',
+      position: 1,
+      claim_type: 'topic_fact',
+      trust_state: 'verified',
+      reason: null,
+      sources: [],
+    }],
+    claims_next_cursor: null,
+  })
+  await wrapper.get('button[aria-label="加载更多 Wiki 事实"]').trigger('click')
+  await flushPromises()
+  expect(api.getWikiPage).toHaveBeenLastCalledWith('base', 'page-auth', expect.objectContaining({ claimCursor: 'claim-cursor-2' }))
+  expect(wrapper.text()).toContain('管理员登录需要 MFA。')
 })
 
 it('明确显示语义检索降级状态', async () => {
   api.searchWiki.mockResolvedValueOnce({
     pages: [],
+    no_answer: false,
+    no_answer_reason: null,
     degraded: true,
     degradation_reason: 'embedding_unavailable',
     truncation_reason: null,
+    next_cursor: null,
+    collection_version: null,
   })
   const wrapper = mountPanel()
   await flushPromises()
@@ -122,6 +171,38 @@ it('明确显示语义检索降级状态', async () => {
 
   expect(wrapper.text()).toContain('语义检索暂不可用，当前结果已降级')
   expect(wrapper.text()).toContain('没有找到相关 Wiki 页面')
+})
+
+it('无可核验答案时显示拒答状态且不展示低相关候选', async () => {
+  api.searchWiki.mockResolvedValueOnce({
+    pages: [{
+      id: 'page-vpn',
+      knowledge_base_id: 'base',
+      slug: 'topic/vpn',
+      title: 'VPN 账号安全',
+      page_type: 'topic',
+      score: 0.12,
+      matched_fields: ['keyword'],
+      matched_claims: [],
+      omitted_claim_count: 0,
+    }],
+    no_answer: true,
+    no_answer_reason: 'below_relevance_threshold',
+    degraded: false,
+    degradation_reason: null,
+    truncation_reason: null,
+    next_cursor: null,
+    collection_version: 'wiki_units_v1',
+  })
+  const wrapper = mountPanel()
+  await flushPromises()
+
+  await wrapper.get('input[aria-label="搜索 Wiki"]').setValue('认证')
+  await wrapper.get('form[aria-label="Wiki 搜索"]').trigger('submit')
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('没有找到足够相关且可核验的 Wiki 内容')
+  expect(wrapper.text()).not.toContain('VPN 账号安全')
 })
 
 it('搜索失败后可清除查询并恢复目录', async () => {
@@ -291,4 +372,45 @@ it('可从面板触发不调用模型的聚合页重建', async () => {
 
   expect(api.rebuildWikiAggregation).toHaveBeenCalledWith('base')
   expect(wrapper.text()).toContain('聚合页已重建：1 个主题、1 个文档摘要')
+})
+
+it('显示索引状态并允许重试失败页面索引', async () => {
+  api.listWikiPages.mockResolvedValueOnce([{
+    id: 'page-auth',
+    knowledge_base_id: 'base',
+    slug: 'topic/authentication',
+    page_type: 'topic',
+    title: '身份认证',
+    current_version_id: 'version-auth',
+    index_state: 'failed',
+    index_error_code: 'embedding_failed',
+  }])
+  const wrapper = mountPanel()
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('索引失败')
+  const retryButton = wrapper.findAll('button').find((item) => item.text() === '重试索引')
+  expect(retryButton).toBeDefined()
+  await retryButton!.trigger('click')
+  await flushPromises()
+
+  expect(api.retryWikiIndex).toHaveBeenCalledWith('base', 'page-auth')
+})
+
+it('可回填 Wiki 索引，并在已有重建任务运行时提示冲突', async () => {
+  const wrapper = mountPanel()
+  await flushPromises()
+
+  const backfillButton = wrapper.findAll('button').find((item) => item.text() === '回填 Wiki 索引')
+  expect(backfillButton).toBeDefined()
+  await backfillButton!.trigger('click')
+  await flushPromises()
+  expect(api.backfillWikiIndex).toHaveBeenCalledWith('base')
+  expect(wrapper.text()).toContain('Wiki 索引回填已启动')
+
+  api.backfillWikiIndex.mockRejectedValueOnce(Object.assign(new Error('conflict'), { code: 'wiki_index_rebuild_in_progress' }))
+  await backfillButton!.trigger('click')
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('已有 Wiki 索引重建任务运行')
 })

@@ -21,7 +21,10 @@ const searchQuery = ref('')
 const searching = ref(false)
 const searchResult = ref<WikiSearchResult | null>(null)
 const searchError = ref('')
+const loadingMoreSearch = ref(false)
 const highlightClaimId = ref<string | null>(null)
+const loadingMoreClaims = ref(false)
+const retryingIndexPageId = ref<string | null>(null)
 const expandedSectionSources = ref<Set<string>>(new Set())
 let searchRequestToken = 0
 let highlightTimer: number | null = null
@@ -38,7 +41,9 @@ const matchedFieldLabels: Record<string, string> = {
   slug: '路径命中',
   summary: '摘要命中',
   alias: '别名命中',
-  source_chunk: '语义来源命中',
+  dense: '语义命中',
+  source_chunk: '语义命中',
+  keyword: '关键词命中',
 }
 
 function pageTypeLabel(pageType: WikiPageSummary['page_type']) {
@@ -47,6 +52,46 @@ function pageTypeLabel(pageType: WikiPageSummary['page_type']) {
 
 function matchedFieldLabel(field: string) {
   return matchedFieldLabels[field] ?? field
+}
+
+function indexStateLabel(item: WikiPageSummary) {
+  if (item.index_state === 'pending') return '索引排队中'
+  if (item.index_state === 'indexing') return '索引中'
+  if (item.index_state === 'failed') return '索引失败'
+  return ''
+}
+
+function hasErrorCode(error: unknown, code: string) {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === code
+}
+
+function mergeSearchResult(current: WikiSearchResult, next: WikiSearchResult): WikiSearchResult {
+  const mergedPages = [...current.pages]
+  for (const nextPage of next.pages) {
+    const existing = mergedPages.find((item) => item.id === nextPage.id)
+    if (!existing) {
+      mergedPages.push(nextPage)
+      continue
+    }
+    existing.matched_fields = Array.from(new Set([...existing.matched_fields, ...nextPage.matched_fields]))
+    const seenClaims = new Set(existing.matched_claims.map((claim) => claim.id))
+    existing.matched_claims.push(...nextPage.matched_claims.filter((claim) => !seenClaims.has(claim.id)))
+    existing.omitted_claim_count = nextPage.omitted_claim_count
+    existing.score = Math.max(existing.score, nextPage.score)
+  }
+  return {
+    ...next,
+    pages: mergedPages,
+    no_answer: current.no_answer || next.no_answer,
+  }
+}
+
+function mergePageClaims(current: WikiPage, next: WikiPage): WikiPage {
+  const seen = new Set(current.claims.map((claim) => claim.id))
+  return {
+    ...next,
+    claims: [...current.claims, ...next.claims.filter((claim) => !seen.has(claim.id))],
+  }
 }
 
 async function load() {
@@ -75,7 +120,7 @@ async function openPage(pageId: string) {
   error.value = ''
   try {
     const [detail, history] = await Promise.all([
-      knowledgeApi.getWikiPage(props.knowledgeBaseId, pageId),
+      knowledgeApi.getWikiPage(props.knowledgeBaseId, pageId, { claimLimit: 20 }),
       knowledgeApi.listWikiVersions(props.knowledgeBaseId, pageId),
     ])
     page.value = detail
@@ -111,12 +156,38 @@ async function search() {
   }
 }
 
+async function loadMoreSearch() {
+  const query = searchQuery.value.trim()
+  if (!query || !searchResult.value?.next_cursor) return
+  const requestToken = ++searchRequestToken
+  loadingMoreSearch.value = true
+  searchError.value = ''
+  try {
+    const result = await knowledgeApi.searchWiki(props.knowledgeBaseId, query, {
+      mode: 'hybrid',
+      limit: 5,
+      claimLimit: 12,
+      cursor: searchResult.value.next_cursor,
+    })
+    if (requestToken === searchRequestToken && searchResult.value) searchResult.value = mergeSearchResult(searchResult.value, result)
+  } catch (caught) {
+    if (requestToken !== searchRequestToken) return
+    if (hasErrorCode(caught, 'wiki_search_cursor_expired')) {
+      loadingMoreSearch.value = false
+      await search()
+    } else searchError.value = 'Wiki 搜索失败，请重试'
+  } finally {
+    if (requestToken === searchRequestToken) loadingMoreSearch.value = false
+  }
+}
+
 function clearSearch() {
   searchRequestToken += 1
   searchQuery.value = ''
   searchResult.value = null
   searchError.value = ''
   searching.value = false
+  loadingMoreSearch.value = false
 }
 
 async function openSearchResult(pageId: string, claimId?: string) {
@@ -127,6 +198,25 @@ async function openSearchResult(pageId: string, claimId?: string) {
   document.querySelector<HTMLElement>(`[data-claim-id="${claimId}"]`)?.scrollIntoView?.({ behavior: 'smooth', block: 'center' })
   if (highlightTimer !== null) window.clearTimeout(highlightTimer)
   highlightTimer = window.setTimeout(() => { highlightClaimId.value = null }, 2400)
+}
+
+async function loadMoreClaims() {
+  if (!page.value?.claims_next_cursor || loadingMoreClaims.value) return
+  const currentPage = page.value
+  loadingMoreClaims.value = true
+  error.value = ''
+  try {
+    const detail = await knowledgeApi.getWikiPage(props.knowledgeBaseId, currentPage.id, {
+      claimCursor: currentPage.claims_next_cursor,
+      claimLimit: 20,
+    })
+    page.value = detail.current_version_id !== currentPage.current_version_id ? detail : mergePageClaims(currentPage, detail)
+  } catch (caught) {
+    if (hasErrorCode(caught, 'wiki_page_cursor_expired')) await openPage(currentPage.id)
+    else error.value = '事实加载失败，请重试'
+  } finally {
+    loadingMoreClaims.value = false
+  }
 }
 
 async function saveConfig(changes: Partial<Pick<WikiConfig, 'enabled' | 'token_limit'>>) {
@@ -148,6 +238,27 @@ async function rebuildAggregation() {
     await load()
   } catch { error.value = '聚合页重建失败，请检查服务状态后重试' }
   finally { busy.value = false }
+}
+
+async function backfillIndex() {
+  busy.value = true; error.value = ''; message.value = ''
+  try {
+    await knowledgeApi.backfillWikiIndex(props.knowledgeBaseId)
+    message.value = 'Wiki 索引回填已启动'
+    await load()
+  } catch (caught) {
+    error.value = hasErrorCode(caught, 'wiki_index_rebuild_in_progress') ? '已有 Wiki 索引重建任务运行' : 'Wiki 索引回填失败，请检查服务状态后重试'
+  } finally { busy.value = false }
+}
+
+async function retryIndex(item: WikiPageSummary) {
+  retryingIndexPageId.value = item.id; error.value = ''; message.value = ''
+  try {
+    await knowledgeApi.retryWikiIndex(props.knowledgeBaseId, item.id)
+    message.value = 'Wiki 页面索引重试已提交'
+    await load()
+  } catch { error.value = '索引重试失败，请稍后再试' }
+  finally { retryingIndexPageId.value = null }
 }
 
 async function saveEdit() {
@@ -244,6 +355,14 @@ watch(() => props.knowledgeBaseId, () => {
   void load()
 }, { immediate: true })
 
+watch(searchQuery, () => {
+  searchRequestToken += 1
+  searchResult.value = null
+  searchError.value = ''
+  searching.value = false
+  loadingMoreSearch.value = false
+})
+
 onBeforeUnmount(() => {
   searchRequestToken += 1
   if (highlightTimer !== null) window.clearTimeout(highlightTimer)
@@ -317,6 +436,14 @@ onBeforeUnmount(() => {
         </button>
       </div>
       <p>已用 {{ config.tokens_charged.toLocaleString() }} · 预留预计 {{ config.tokens_reserved.toLocaleString() }} · 可用 {{ estimate.toLocaleString() }}</p>
+      <button
+        type="button"
+        class="quiet"
+        :disabled="busy"
+        @click="backfillIndex"
+      >
+        回填 Wiki 索引
+      </button>
       <p
         v-if="paused"
         class="wiki-error"
@@ -383,28 +510,52 @@ onBeforeUnmount(() => {
             >
               语义检索暂不可用，当前结果已降级
             </p><p
-              v-if="!searchResult.pages.length"
+              v-if="searchResult.no_answer"
+              class="empty"
+            >
+              没有找到足够相关且可核验的 Wiki 内容
+            </p><p
+              v-else-if="!searchResult.pages.length"
               class="empty"
             >
               没有找到相关 Wiki 页面
-            </p><button
-              v-for="resultPage in searchResult.pages"
-              :key="resultPage.id"
-              type="button"
-              class="search-result"
-              :class="{ active: page?.id === resultPage.id }"
-              :data-search-page-id="resultPage.id"
-              @click="openSearchResult(resultPage.id, resultPage.matched_claims[0]?.id)"
-            >
-              <span class="search-result-heading"><small>{{ pageTypeLabel(resultPage.page_type) }}</small><strong>{{ resultPage.title }}</strong></span><span class="match-fields">{{ resultPage.matched_fields.map(matchedFieldLabel).join(' · ') }}</span><span
-                v-for="claim in resultPage.matched_claims"
-                :key="claim.id"
-                class="matched-claim"
-              >{{ claim.text }}</span><span
-                v-if="resultPage.omitted_claim_count"
-                class="omitted-claims"
-              >另有 {{ resultPage.omitted_claim_count }} 条相关结论</span>
-            </button>
+            </p><template v-if="!searchResult.no_answer">
+              <button
+                v-for="resultPage in searchResult.pages"
+                :key="resultPage.id"
+                type="button"
+                class="search-result"
+                :class="{ active: page?.id === resultPage.id }"
+                :data-search-page-id="resultPage.id"
+                @click="openSearchResult(resultPage.id, resultPage.matched_claims[0]?.id)"
+              >
+                <span class="search-result-heading"><small>{{ pageTypeLabel(resultPage.page_type) }}</small><strong>{{ resultPage.title }}</strong></span><span class="match-fields">{{ resultPage.matched_fields.map(matchedFieldLabel).join(' · ') }}</span><span
+                  v-for="claim in resultPage.matched_claims"
+                  :key="claim.id"
+                  class="matched-claim"
+                >{{ claim.text }}</span><span
+                  v-if="resultPage.omitted_claim_count"
+                  class="omitted-claims"
+                >另有 {{ resultPage.omitted_claim_count }} 条相关结论</span>
+                <span
+                  v-for="claim in resultPage.matched_claims"
+                  :key="`${claim.id}-also`"
+                  class="omitted-claims"
+                >
+                  <template v-if="claim.also_in_pages.length">同一事实还出现在 {{ claim.also_in_pages.map((item) => item.title).join('、') }}</template>
+                </span>
+              </button>
+              <button
+                v-if="searchResult.next_cursor"
+                type="button"
+                class="quiet load-more"
+                aria-label="加载更多 Wiki 搜索结果"
+                :disabled="loadingMoreSearch"
+                @click="loadMoreSearch"
+              >
+                {{ loadingMoreSearch ? '加载中…' : '加载更多' }}
+              </button>
+            </template>
           </template>
         </template><template v-else>
           <h4>页面</h4><p
@@ -412,16 +563,28 @@ onBeforeUnmount(() => {
             class="empty"
           >
             还没有页面。开启 Wiki 后会从就绪文档生成。
-          </p><button
+          </p><div
             v-for="item in pages"
             :key="item.id"
-            :data-page-id="item.id"
-            type="button"
-            :class="{ active: page?.id === item.id }"
-            @click="openPage(item.id)"
+            class="wiki-page-row"
           >
-            <small>{{ pageTypeLabel(item.page_type) }}</small>{{ item.title }}
-          </button>
+            <button
+              :data-page-id="item.id"
+              type="button"
+              :class="{ active: page?.id === item.id }"
+              @click="openPage(item.id)"
+            >
+              <small>{{ pageTypeLabel(item.page_type) }}<template v-if="indexStateLabel(item)"> · {{ indexStateLabel(item) }}</template></small>{{ item.title }}
+            </button><button
+              v-if="item.index_state === 'failed'"
+              type="button"
+              class="quiet"
+              :disabled="retryingIndexPageId === item.id"
+              @click="retryIndex(item)"
+            >
+              {{ retryingIndexPageId === item.id ? '提交中…' : '重试索引' }}
+            </button>
+          </div>
         </template>
       </nav>
       <article
@@ -546,11 +709,15 @@ onBeforeUnmount(() => {
             v-else
             class="page-body"
           >{{ legacyDisplayContent(page.content) }}</pre><component
-            v-if="page.claims.length"
             :is="page.page_type === 'topic' ? 'details' : 'section'"
+            v-if="page.claims.length"
             class="claims"
           >
-            <summary v-if="page.page_type === 'topic'">全部已核实事实（{{ page.claims.length }}）</summary><h4 v-else>关键事实</h4><div
+            <summary v-if="page.page_type === 'topic'">
+              全部已核实事实（{{ page.claims.length }}）
+            </summary><h4 v-else>
+              关键事实
+            </h4><div
               v-for="claim in page.claims"
               :key="claim.id"
               class="claim"
@@ -569,6 +736,16 @@ onBeforeUnmount(() => {
                 </RouterLink><small>文档版本 {{ source.document_version_id }} · 分块 {{ source.chunk_id || '无' }} · {{ source.heading_path.join(' / ') || '正文' }}<template v-if="source.page_start"> · 第 {{ source.page_start }} 页</template> · {{ source.valid ? '来源有效' : '来源失效' }}</small>
               </div>
             </div>
+            <button
+              v-if="page.claims_next_cursor"
+              type="button"
+              class="quiet load-more"
+              aria-label="加载更多 Wiki 事实"
+              :disabled="loadingMoreClaims"
+              @click="loadMoreClaims"
+            >
+              {{ loadingMoreClaims ? '加载中…' : '加载更多事实' }}
+            </button>
           </component>
         </template>
         <section class="history">

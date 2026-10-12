@@ -99,6 +99,8 @@ export interface WikiPageSummary {
   page_type: 'summary' | 'topic' | 'index'
   title: string
   current_version_id: string | null
+  index_state: 'not_required' | 'pending' | 'indexing' | 'ready' | 'failed'
+  index_error_code: string | null
 }
 
 export interface WikiClaim {
@@ -147,6 +149,7 @@ export interface WikiPage extends WikiPageSummary {
   summary_sections: WikiSummarySection[]
   metadata: WikiMetadataItem[]
   claims: WikiClaim[]
+  claims_next_cursor: string | null
 }
 
 export interface WikiVersion {
@@ -196,6 +199,7 @@ export interface WikiSearchClaim {
   claim_type: 'summary_fact' | 'topic_fact' | 'source_excerpt' | 'manual'
   score: number
   sources: WikiSearchSource[]
+  also_in_pages: WikiPageSummary[]
 }
 
 export interface WikiSearchPage {
@@ -212,7 +216,11 @@ export interface WikiSearchPage {
 
 export interface WikiSearchResult {
   pages: WikiSearchPage[]
+  no_answer: boolean
+  no_answer_reason: string | null
   degraded: boolean
   degradation_reason: string | null
   truncation_reason: string | null
+  next_cursor: string | null
+  collection_version: string | null
 }

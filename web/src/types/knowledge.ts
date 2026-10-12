@@ -118,11 +118,16 @@ export interface WikiPresentationSource {
   document_id: string
   document_version_id: string
   chunk_id: string | null
+  parent_chunk_id: string | null
   document_title: string
   heading_path: string[]
   page_start: number | null
   page_end: number | null
+  excerpt: string
+  focus_start: number | null
+  focus_end: number | null
   valid: boolean
+  invalid_reason: string | null
 }
 
 export interface WikiSummarySection {
@@ -180,6 +185,7 @@ export interface WikiJob {
 
 export interface WikiSearchSource {
   chunk_id: string | null
+  parent_chunk_id: string | null
   document_id: string
   document_version_id: string
   title: string
@@ -188,6 +194,10 @@ export interface WikiSearchSource {
   page_end: number | null
   heading_path: string[]
   excerpt: string
+  focus_start: number | null
+  focus_end: number | null
+  valid: boolean
+  invalid_reason: string | null
   score: number
   rank: number
 }

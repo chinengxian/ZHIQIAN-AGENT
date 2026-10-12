@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { KnowledgeApiError, knowledgeApi } from '../../services/knowledgeApi'
 import type { DocumentDetail, DocumentPreviewChunk, DocumentVersion } from '../../types/knowledge'
-import { previewChunkLabel } from './documentPreview'
+import { previewChunkLabel, splitFocusedText } from './documentPreview'
 
 const props = defineProps<{ knowledgeBaseId: string; documentId: string }>()
 const route = useRoute()
@@ -75,6 +75,11 @@ async function loadPreview(currentRequest: number, cursor: string | null, append
     chunks.value = append ? [...chunks.value, ...preview.items] : preview.items
     nextCursor.value = preview.next_cursor
     unavailableReason.value = preview.preview_unavailable_reason
+    if (!append && requestedChunk.value) {
+      // 来源深链会返回父块和相对父块的高亮坐标，加载完成后把命中的父块滚到视口中间。
+      await nextTick()
+      document.querySelector<HTMLElement>('.document-detail-panel .chunk-card.focused')?.scrollIntoView?.({ block: 'center' })
+    }
   } catch (cause) {
     if (currentRequest !== requestId) return
     if (cause instanceof KnowledgeApiError && ['document_chunk_not_found', 'document_version_not_found'].includes(cause.code)) {
@@ -118,6 +123,10 @@ async function selectVersion(versionId: string) {
     path: `/knowledge/${props.knowledgeBaseId}/documents/${props.documentId}`,
     query: { version: versionId },
   })
+}
+
+function focusedTextParts(chunk: DocumentPreviewChunk) {
+  return splitFocusedText(chunk.content, chunk.focus_start, chunk.focus_end)
 }
 
 watch(
@@ -220,7 +229,7 @@ watch(
             <span>{{ chunk.heading_path.join(' / ') || '正文' }}</span>
             <span>{{ previewChunkLabel(chunk) }}</span>
           </div>
-          <pre>{{ chunk.content }}</pre>
+          <pre><template v-if="focusedTextParts(chunk).focus"><span>{{ focusedTextParts(chunk).before }}</span><mark>{{ focusedTextParts(chunk).focus }}</mark><span>{{ focusedTextParts(chunk).after }}</span></template><template v-else>{{ chunk.content }}</template></pre>
         </article>
         <button
           v-if="nextCursor"
@@ -262,6 +271,7 @@ watch(
 .chunk-meta { display:flex; justify-content:space-between; gap:10px; margin-bottom:8px; color:#666; font-size:11px; }
 .chunk-meta span:first-child { overflow-wrap:anywhere; }
 .chunk-card pre { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; color:#25252c; font:13px/1.7 inherit; }
+.chunk-card mark { border-radius:3px; padding:0 2px; background:#fff1a8; color:inherit; }
 .load-more { margin-top:10px; border:1px solid #d8d8e0; background:#fff; color:#454299; padding:8px 12px; border-radius:6px; font-size:12px; }
 .detail-empty, .detail-error { color:#777; font-size:13px; padding:22px 0; }
 .detail-error { color:#a22920; }

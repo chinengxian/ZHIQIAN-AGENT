@@ -422,11 +422,16 @@ it('展示结构化摘要、信息卡与可展开的来源链接', async () => {
         document_id: 'doc1',
         document_version_id: 'ver1',
         chunk_id: 'chunk1',
+        parent_chunk_id: 'parent1',
         document_title: '身份与访问控制规范',
         heading_path: ['身份分类'],
         page_start: null,
         page_end: null,
+        excerpt: '原文写明：每名使用者必须使用唯一身份。',
+        focus_start: 5,
+        focus_end: 21,
         valid: true,
+        invalid_reason: null,
       }],
     }],
     claims: [],
@@ -445,12 +450,15 @@ it('展示结构化摘要、信息卡与可展开的来源链接', async () => {
   expect(wrapper.text()).toContain('3.0')
   expect(wrapper.text()).toContain('本规范覆盖企业身份与访问控制。')
   expect(wrapper.text()).toContain('查看 1 个来源')
+  expect(wrapper.text()).not.toContain('原文写明：每名使用者必须使用唯一身份。')
   expect(wrapper.text()).not.toContain('[^claim-')
 
   await wrapper.get('[data-summary-section-id="section-overview"] button').trigger('click')
   const link = wrapper.get('[data-summary-section-id="section-overview"] a')
   expect(link.text()).toContain('身份与访问控制规范')
   expect(link.attributes('data-route')).toContain('/knowledge/base/documents/doc1')
+  expect(link.attributes('data-route')).toContain('chunk1')
+  expect(wrapper.text()).toContain('原文写明：每名使用者必须使用唯一身份。')
 })
 
 it('为旧页面清理 Markdown 展示符号', async () => {

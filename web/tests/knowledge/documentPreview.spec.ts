@@ -37,6 +37,12 @@ describe('splitFocusedText', () => {
     expect(parts.after).toBe('认证要求')
   })
 
+  it('按后端 Python 字符坐标处理 emoji 前缀，避免 UTF-16 下标错位', () => {
+    const parts = splitFocusedText('🔐必须启用 MFA', 1, 5)
+
+    expect(parts).toEqual({ before: '🔐', focus: '必须启用', after: ' MFA' })
+  })
+
   it('坐标无效时回退为普通文本', () => {
     expect(splitFocusedText('认证要求', 5, 1)).toEqual({ before: '认证要求', focus: '', after: '' })
   })

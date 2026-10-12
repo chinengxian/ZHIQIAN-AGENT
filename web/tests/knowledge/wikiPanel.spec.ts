@@ -151,6 +151,76 @@ it('按主题与来源语义搜索 Wiki，并显示命中的结论', async () =>
   expect(wrapper.text()).toContain('管理员登录需要 MFA。')
 })
 
+it('事实分页遇到页面版本变化时重新加载第一页', async () => {
+  const wrapper = mountPanel()
+  await flushPromises()
+
+  await wrapper.get('input[aria-label="搜索 Wiki"]').setValue('登录安全要求')
+  await wrapper.get('form[aria-label="Wiki 搜索"]').trigger('submit')
+  await flushPromises()
+  await wrapper.get('[data-search-page-id="page-auth"]').trigger('click')
+  await flushPromises()
+
+  api.getWikiPage
+    .mockResolvedValueOnce({
+      id: 'page-auth',
+      knowledge_base_id: 'base',
+      slug: 'topic/authentication',
+      title: '身份认证',
+      page_type: 'topic',
+      current_version_id: 'version-auth-new',
+      version_no: 2,
+      content: '# 身份认证',
+      summary: '认证要求',
+      origin: 'pipeline',
+      summary_sections: [],
+      metadata: [],
+      claims: [{
+        id: 'claim-old-cursor-slice',
+        claim_key: 'old-cursor-slice',
+        text: '旧游标后的非第一页事实。',
+        position: 21,
+        claim_type: 'topic_fact',
+        trust_state: 'verified',
+        reason: null,
+        sources: [],
+      }],
+      claims_next_cursor: null,
+    })
+    .mockResolvedValueOnce({
+      id: 'page-auth',
+      knowledge_base_id: 'base',
+      slug: 'topic/authentication',
+      title: '身份认证',
+      page_type: 'topic',
+      current_version_id: 'version-auth-new',
+      version_no: 2,
+      content: '# 身份认证',
+      summary: '认证要求',
+      origin: 'pipeline',
+      summary_sections: [],
+      metadata: [],
+      claims: [{
+        id: 'claim-new-first-page',
+        claim_key: 'new-first-page',
+        text: '新版第一页事实。',
+        position: 0,
+        claim_type: 'topic_fact',
+        trust_state: 'verified',
+        reason: null,
+        sources: [],
+      }],
+      claims_next_cursor: null,
+    })
+
+  await wrapper.get('button[aria-label="加载更多 Wiki 事实"]').trigger('click')
+  await flushPromises()
+
+  expect(api.getWikiPage).toHaveBeenLastCalledWith('base', 'page-auth', { claimLimit: 20 })
+  expect(wrapper.text()).toContain('新版第一页事实。')
+  expect(wrapper.text()).not.toContain('旧游标后的非第一页事实。')
+})
+
 it('明确显示语义检索降级状态', async () => {
   api.searchWiki.mockResolvedValueOnce({
     pages: [],

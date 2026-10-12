@@ -210,7 +210,8 @@ async function loadMoreClaims() {
       claimCursor: currentPage.claims_next_cursor,
       claimLimit: 20,
     })
-    page.value = detail.current_version_id !== currentPage.current_version_id ? detail : mergePageClaims(currentPage, detail)
+    if (detail.current_version_id !== currentPage.current_version_id) await openPage(currentPage.id)
+    else page.value = mergePageClaims(currentPage, detail)
   } catch (caught) {
     if (hasErrorCode(caught, 'wiki_page_cursor_expired')) await openPage(currentPage.id)
     else error.value = '事实加载失败，请重试'

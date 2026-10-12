@@ -177,7 +177,7 @@
       ],
       "expected_documents": ["02-identity-access-control.md", "07-security-incident-response.md"],
       "expected_terms": ["证据移交", "双人签字", "应急账号", "不能推断所有事件工单"],
-      "forbidden_terms": ["所有事件工单都需要两人签字"],
+      "forbidden_terms": ["所有事件工单必须双人签字"],
       "answerable": true
     },
     {

@@ -11,6 +11,7 @@ import pytest
 from pymilvus import MilvusClient  # type: ignore[import-untyped]
 from sqlalchemy import select
 
+from agent_api.core.config import WikiSearchBackend
 from agent_api.knowledge.application.ingestion import IngestionPipeline, ParentChildChunker
 from agent_api.knowledge.application.management import SqlAlchemyKnowledgeManagementService
 from agent_api.knowledge.application.retrieval import KnowledgeRetrievalService
@@ -20,20 +21,30 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiClaim,
     WikiClaimSource,
     WikiJob,
+    WikiPage,
+    WikiPageVersion,
 )
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
 from agent_api.knowledge.infrastructure.docling.parser import DoclingParser
 from agent_api.knowledge.infrastructure.jobs.repository import SqlAlchemyIngestionRepository
 from agent_api.knowledge.infrastructure.milvus.index import MilvusChunkIndex
-from agent_api.knowledge.infrastructure.startup import MilvusStartupCheck
+from agent_api.knowledge.infrastructure.milvus.wiki_index import MilvusWikiIndex
+from agent_api.knowledge.infrastructure.startup import MilvusStartupCheck, WikiMilvusStartupCheck
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
 from agent_api.knowledge.wiki.generator import (
     WikiGeneratedClaim,
     WikiGeneratedSection,
     WikiGeneration,
 )
+from agent_api.knowledge.wiki.independent_retrieval import WikiIndependentRetrievalService
+from agent_api.knowledge.wiki.index_jobs import SqlAlchemyWikiIndexRepository
+from agent_api.knowledge.wiki.indexing import WikiIndexService, embedding_fingerprint
 from agent_api.knowledge.wiki.processor import WikiProcessor
-from agent_api.knowledge.wiki.retrieval import WikiRetrievalService, WikiSearchResult
+from agent_api.knowledge.wiki.retrieval import (
+    LegacyWikiRetrievalService,
+    WikiRetrievalService,
+    WikiSearchResult,
+)
 from agent_api.knowledge.wiki.service import WikiService
 from tests.test_ingestion_e2e_integration import DeterministicEmbedding, settings_for_e2e
 from tests.test_knowledge_management_integration import cleanup_knowledge_base
@@ -71,15 +82,16 @@ def test_wiki_eval_cases_cover_all_approved_questions() -> None:
     payload = json.loads(CASES_PATH.read_text(encoding="utf-8"))
     cases = payload["cases"]
 
-    assert [case["id"] for case in cases] == [f"Q{index:02d}" for index in range(1, 17)]
+    assert [case["id"] for case in cases] == [f"Q{index:02d}" for index in range(1, 19)]
     assert all(len(case["queries"]) >= 3 for case in cases)
     assert all(
         {"expected_documents", "expected_terms", "forbidden_terms", "answerable"}
         <= case.keys()
         for case in cases
     )
-    assert cases[-1]["answerable"] is False
-    assert cases[-1]["expected_documents"] == []
+    no_answer_cases = [case for case in cases if case["answerable"] is False]
+    assert len(no_answer_cases) >= 3
+    assert all(case["expected_documents"] == [] for case in no_answer_cases)
 
 
 def _contains(text: str, term: str) -> bool:
@@ -118,14 +130,33 @@ def _pairwise_consistency(document_sets: list[set[str]]) -> float:
 
 async def _count_source_leaks(
     database: DatabaseRuntime, claim_ids: set[UUID]
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     if not claim_ids:
-        return 0, 0
+        return 0, 0, 0
     async with database.session_factory() as session:
         claims = list(
             await session.scalars(select(WikiClaim).where(WikiClaim.id.in_(claim_ids)))
         )
         needs_review = sum(claim.trust_state != "verified" for claim in claims)
+        # 独立索引命中必须在 PG 复核时回到页面当前版本，不能泄漏旧页面版本的 claim。
+        page_versions = {
+            page_version_id: current_version_id
+            for page_version_id, current_version_id in (
+                await session.execute(
+                    select(WikiClaim.page_version_id, WikiPage.current_version_id)
+                    .join(
+                        WikiPageVersion,
+                        WikiPageVersion.id == WikiClaim.page_version_id,
+                    )
+                    .join(WikiPage, WikiPage.id == WikiPageVersion.page_id)
+                    .where(WikiClaim.id.in_(claim_ids))
+                )
+            )
+        }
+        old_page_versions = sum(
+            page_versions.get(claim.page_version_id) != claim.page_version_id
+            for claim in claims
+        )
         sources = list(
             await session.scalars(
                 select(WikiClaimSource).where(WikiClaimSource.claim_id.in_(claim_ids))
@@ -146,7 +177,21 @@ async def _count_source_leaks(
                 or sha256(chunk.content.encode()).hexdigest() != source.content_sha256
             ):
                 invalid += 1
-    return needs_review, invalid
+    return needs_review, invalid, old_page_versions
+
+
+def _drop_alias(client: MilvusClient, alias: str) -> None:
+    """兼容不同 PyMilvus 版本的 alias 删除签名，避免清理测试 collection 时失败。"""
+
+    try:
+        client.drop_alias(alias=alias)
+    except TypeError:
+        try:
+            client.drop_alias(alias)
+        except Exception:
+            return
+    except Exception:
+        return
 
 
 @pytest.mark.knowledge_integration
@@ -158,9 +203,17 @@ async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
     payload: dict[str, list[dict[str, Any]]] = json.loads(
         CASES_PATH.read_text(encoding="utf-8")
     )
-    collection = f"wiki_eval_{uuid4().hex}"
+    source_collection = f"wiki_eval_source_{uuid4().hex}"
+    wiki_collection = f"wiki_eval_units_{uuid4().hex}"
+    wiki_alias = f"wiki_eval_alias_{uuid4().hex}"
     settings = settings_for_e2e(tmp_path / "wiki-eval-uploads").model_copy(
-        update={"milvus_collection": collection}
+        update={
+            "milvus_collection": source_collection,
+            "wiki_milvus_collection_alias": wiki_alias,
+            "wiki_milvus_collection_version": wiki_collection,
+            "wiki_index_enabled": True,
+            "wiki_search_backend": WikiSearchBackend.INDEPENDENT,
+        }
     )
     assert WIKI_DATABASE_URL is not None
     database = DatabaseRuntime(WIKI_DATABASE_URL)
@@ -171,12 +224,25 @@ async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
     startup_check = MilvusStartupCheck(
         uri=settings.milvus_uri,
         token=None,
-        collection=collection,
+        collection=source_collection,
+        embedding_dimension=settings.embedding_dimension,
+    )
+    wiki_startup_check = WikiMilvusStartupCheck(
+        uri=settings.milvus_uri,
+        token=None,
+        physical_collection=wiki_collection,
+        alias=wiki_alias,
         embedding_dimension=settings.embedding_dimension,
     )
     await startup_check.check()
+    await wiki_startup_check.check()
     milvus = MilvusClient(uri=settings.milvus_uri)
     index = MilvusChunkIndex(milvus, settings.milvus_collection)
+    wiki_index = MilvusWikiIndex(
+        milvus,
+        search_collection=wiki_alias,
+        write_collection=wiki_collection,
+    )
     embedder = DeterministicEmbedding()
     pipeline = IngestionPipeline(
         repository=SqlAlchemyIngestionRepository(database.session_factory, storage),
@@ -188,10 +254,40 @@ async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
     source_retrieval = KnowledgeRetrievalService(
         database.session_factory, index, embedder
     )
-    retrieval = WikiRetrievalService(database.session_factory, source_retrieval)
-    wiki = WikiService(database.session_factory)
+    independent_retrieval = WikiIndependentRetrievalService(
+        sessions=database.session_factory,
+        index=wiki_index,
+        embedder=embedder,
+        collection_version=wiki_collection,
+        dense_threshold=settings.wiki_dense_threshold,
+        rerank_threshold=settings.wiki_rerank_threshold,
+        keyword_coverage_threshold=settings.wiki_keyword_coverage_threshold,
+    )
+    retrieval = WikiRetrievalService(
+        LegacyWikiRetrievalService(database.session_factory, source_retrieval),
+        independent_retrieval,
+        backend=WikiSearchBackend.INDEPENDENT,
+    )
+    fingerprint = embedding_fingerprint(settings)
+    wiki = WikiService(
+        database.session_factory,
+        index_enabled=True,
+        embedding_fingerprint=fingerprint,
+    )
     processor = WikiProcessor(
-        database.session_factory, DeterministicGroundedWikiGenerator()
+        database.session_factory,
+        DeterministicGroundedWikiGenerator(),
+        index_enabled=True,
+        embedding_fingerprint=fingerprint,
+    )
+    index_service = WikiIndexService(
+        repository=SqlAlchemyWikiIndexRepository(
+            database.session_factory,
+            embedding_dimension=settings.embedding_dimension,
+        ),
+        embedder=embedder,
+        index=wiki_index,
+        embedding_dimension=settings.embedding_dimension,
     )
     knowledge_base_id: UUID | None = None
     version_ids: list[UUID] = []
@@ -225,6 +321,22 @@ async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
         assert len(jobs) == 8
         for job in jobs:
             await processor.run(job.id)
+        backfill = await wiki.backfill_index(knowledge_base_id)
+        assert backfill["created_jobs"] + backfill["existing_jobs"] >= 1
+        async with database.session_factory() as session:
+            index_jobs = list(
+                await session.scalars(
+                    select(WikiJob)
+                    .where(
+                        WikiJob.knowledge_base_id == knowledge_base_id,
+                        WikiJob.job_type == "page_index",
+                    )
+                    .order_by(WikiJob.created_at, WikiJob.id)
+                )
+            )
+        assert index_jobs
+        for job in index_jobs:
+            await index_service.run(job.id)
 
         page_recalls: list[float] = []
         claim_recalls: list[float] = []
@@ -277,9 +389,11 @@ async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
             if case["answerable"]:
                 consistency_scores.append(_pairwise_consistency(relevant_sets))
 
-        needs_review_leaks, invalid_source_leaks = await _count_source_leaks(
-            database, returned_claim_ids
-        )
+        (
+            needs_review_leaks,
+            invalid_source_leaks,
+            old_page_version_leaks,
+        ) = await _count_source_leaks(database, returned_claim_ids)
         page_recall_at_5 = sum(page_recalls) / len(page_recalls)
         claim_recall_at_8 = sum(claim_recalls) / len(claim_recalls)
         citation_precision = (
@@ -295,6 +409,9 @@ async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
             "no_answer_false_match_rate": no_answer_false_match_rate,
             "needs_review_leaks": needs_review_leaks,
             "invalid_source_leaks": invalid_source_leaks,
+            "old_page_version_leaks": old_page_version_leaks,
+            "collection": wiki_collection,
+            "embedding_fingerprint": fingerprint,
             "generator": "deterministic_grounded",
         }
         print("WIKI_EVAL " + json.dumps(metrics, ensure_ascii=False, sort_keys=True))
@@ -305,13 +422,17 @@ async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
         assert no_answer_false_match_rate <= 0.05
         assert needs_review_leaks == 0
         assert invalid_source_leaks == 0
+        assert old_page_version_leaks == 0
     finally:
         for version_id in version_ids:
             await index.delete_version(version_id)
         if knowledge_base_id is not None:
             await cleanup_knowledge_base(database, knowledge_base_id)
-        if milvus.has_collection(collection_name=collection):
-            milvus.drop_collection(collection_name=collection)
+        _drop_alias(milvus, wiki_alias)
+        for collection_name in (source_collection, wiki_collection):
+            if milvus.has_collection(collection_name=collection_name):
+                milvus.drop_collection(collection_name=collection_name)
         milvus.close()
         await startup_check.close()
+        await wiki_startup_check.close()
         await database.close()

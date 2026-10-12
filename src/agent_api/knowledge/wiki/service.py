@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_api.knowledge.application.management import DEFAULT_WORKSPACE_ID
 from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.infrastructure.database.models import (
+    Chunk,
     Document,
     KnowledgeBase,
     OutboxEvent,
@@ -29,6 +30,7 @@ from agent_api.knowledge.wiki.cursor import (
 from agent_api.knowledge.wiki.index_jobs import (
     retry_page_index_job,
     schedule_current_page_indexes,
+    source_matches_chunk,
     try_backfill_lock,
 )
 from agent_api.knowledge.wiki.jobs import schedule_document_wiki
@@ -429,6 +431,27 @@ class WikiService:
                 for source in verified.sources
             ],
         }
+
+    @staticmethod
+    async def _source_valid(session: AsyncSession, source: WikiClaimSource) -> bool:
+        """兼容旧调用点的来源复核：文档活动版本与 chunk 快照必须同时匹配。"""
+
+        document = await session.get(Document, source.document_id)
+        if (
+            document is None
+            or document.active_version_id != source.document_version_id
+            or document.status != "ready"
+            or document.deleted_at is not None
+        ):
+            return False
+        chunk = await session.scalar(
+            select(Chunk).where(
+                Chunk.document_version_id == source.document_version_id,
+                Chunk.kind == source.chunk_kind,
+                Chunk.ordinal == source.chunk_ordinal,
+            )
+        )
+        return chunk is not None and source_matches_chunk(source, chunk)
 
     async def list_versions(self, knowledge_base_id: UUID, page_id: UUID) -> list[dict[str, Any]]:
         async with self._sessions() as session:

@@ -1,4 +1,5 @@
 import { flushPromises, mount } from '@vue/test-utils'
+import { nextTick } from 'vue'
 import { beforeEach, vi } from 'vitest'
 import WikiPanel from '../../src/views/knowledge/WikiPanel.vue'
 
@@ -219,6 +220,105 @@ it('事实分页遇到页面版本变化时重新加载第一页', async () => {
   expect(api.getWikiPage).toHaveBeenLastCalledWith('base', 'page-auth', { claimLimit: 20 })
   expect(wrapper.text()).toContain('新版第一页事实。')
   expect(wrapper.text()).not.toContain('旧游标后的非第一页事实。')
+})
+
+it('事实分页慢响应不会覆盖用户后来打开的页面', async () => {
+  api.listWikiPages.mockResolvedValueOnce([
+    {
+      id: 'page-auth',
+      knowledge_base_id: 'base',
+      slug: 'topic/authentication',
+      page_type: 'topic',
+      title: '身份认证',
+      current_version_id: 'version-auth',
+      index_state: 'ready',
+      index_error_code: null,
+    },
+    {
+      id: 'page-other',
+      knowledge_base_id: 'base',
+      slug: 'topic/other',
+      page_type: 'topic',
+      title: '其他页面',
+      current_version_id: 'version-other',
+      index_state: 'ready',
+      index_error_code: null,
+    },
+  ])
+  const wrapper = mountPanel()
+  await flushPromises()
+
+  await wrapper.get('input[aria-label="搜索 Wiki"]').setValue('登录安全要求')
+  await wrapper.get('form[aria-label="Wiki 搜索"]').trigger('submit')
+  await flushPromises()
+  await wrapper.get('[data-search-page-id="page-auth"]').trigger('click')
+  await flushPromises()
+
+  let resolveMore: (value: unknown) => void = () => undefined
+  const slowMore = new Promise((resolve) => { resolveMore = resolve })
+  api.getWikiPage.mockImplementationOnce(() => slowMore)
+  wrapper.get('button[aria-label="加载更多 Wiki 事实"]').element.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  await nextTick()
+
+  api.getWikiPage.mockResolvedValueOnce({
+    id: 'page-other',
+    knowledge_base_id: 'base',
+    slug: 'topic/other',
+    title: '其他页面',
+    page_type: 'topic',
+    current_version_id: 'version-other',
+    version_no: 1,
+    content: '# 其他页面',
+    summary: '其他页面摘要',
+    origin: 'pipeline',
+    summary_sections: [],
+    metadata: [],
+    claims: [{
+      id: 'claim-other',
+      claim_key: 'other',
+      text: '这是后来打开页面的事实。',
+      position: 0,
+      claim_type: 'topic_fact',
+      trust_state: 'verified',
+      reason: null,
+      sources: [],
+    }],
+    claims_next_cursor: null,
+  })
+  await wrapper.get('button[aria-label="清除 Wiki 搜索"]').trigger('click')
+  await wrapper.get('[data-page-id="page-other"]').trigger('click')
+  await flushPromises()
+
+  resolveMore({
+    id: 'page-auth',
+    knowledge_base_id: 'base',
+    slug: 'topic/authentication',
+    title: '身份认证',
+    page_type: 'topic',
+    current_version_id: 'version-auth',
+    version_no: 1,
+    content: '# 身份认证',
+    summary: '认证要求',
+    origin: 'pipeline',
+    summary_sections: [],
+    metadata: [],
+    claims: [{
+      id: 'claim-stale',
+      claim_key: 'stale',
+      text: '这是旧页面慢响应返回的事实。',
+      position: 1,
+      claim_type: 'topic_fact',
+      trust_state: 'verified',
+      reason: null,
+      sources: [],
+    }],
+    claims_next_cursor: null,
+  })
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('其他页面')
+  expect(wrapper.text()).toContain('这是后来打开页面的事实。')
+  expect(wrapper.text()).not.toContain('这是旧页面慢响应返回的事实。')
 })
 
 it('明确显示语义检索降级状态', async () => {

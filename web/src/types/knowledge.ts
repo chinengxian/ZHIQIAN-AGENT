@@ -179,7 +179,7 @@ export interface WikiJob {
 }
 
 export interface WikiSearchSource {
-  chunk_id: string
+  chunk_id: string | null
   document_id: string
   document_version_id: string
   title: string

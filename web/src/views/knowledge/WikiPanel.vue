@@ -210,9 +210,16 @@ async function loadMoreClaims() {
       claimCursor: currentPage.claims_next_cursor,
       claimLimit: 20,
     })
-    if (detail.current_version_id !== currentPage.current_version_id) await openPage(currentPage.id)
-    else page.value = mergePageClaims(currentPage, detail)
+    // 分页请求可能慢于用户切换页面，写回前必须确认仍停留在同一页，避免旧响应覆盖新页面。
+    if (page.value?.id !== currentPage.id) return
+    if (detail.current_version_id !== currentPage.current_version_id) {
+      await openPage(currentPage.id)
+      return
+    }
+    if (page.value.current_version_id === currentPage.current_version_id) page.value = mergePageClaims(currentPage, detail)
   } catch (caught) {
+    // 用户已经切走时，旧分页错误不应污染当前页面的错误状态。
+    if (page.value?.id !== currentPage.id) return
     if (hasErrorCode(caught, 'wiki_page_cursor_expired')) await openPage(currentPage.id)
     else error.value = '事实加载失败，请重试'
   } finally {
@@ -543,7 +550,7 @@ onBeforeUnmount(() => {
                   :key="`${claim.id}-also`"
                   class="omitted-claims"
                 >
-                  <template v-if="claim.also_in_pages.length">同一事实还出现在 {{ claim.also_in_pages.map((item) => item.title).join('、') }}</template>
+                  <template v-if="(claim.also_in_pages ?? []).length">同一事实还出现在 {{ (claim.also_in_pages ?? []).map((item) => item.title).join('、') }}</template>
                 </span>
               </button>
               <button

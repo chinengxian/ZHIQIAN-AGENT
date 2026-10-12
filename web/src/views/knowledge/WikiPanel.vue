@@ -370,6 +370,10 @@ function summaryPageIdForSource(source: WikiPresentationSource) {
   return summaryPages.value.find((item) => item.slug === `summary/${source.document_id}`)?.id ?? null
 }
 
+function sourceRenderKey(source: WikiPresentationSource, index: number) {
+  return `${source.document_version_id}:${source.chunk_id ?? 'no-chunk'}:${index}`
+}
+
 async function openSummaryPage(source: WikiPresentationSource) {
   const pageId = summaryPageIdForSource(source)
   if (pageId) await openPage(pageId)
@@ -711,8 +715,8 @@ onBeforeUnmount(() => {
                 class="section-sources"
               >
                 <div
-                  v-for="source in section.sources"
-                  :key="source.document_version_id + source.chunk_id"
+                  v-for="(source, sourceIndex) in section.sources"
+                  :key="sourceRenderKey(source, sourceIndex)"
                 >
                   <RouterLink
                     class="source-link"
@@ -756,8 +760,8 @@ onBeforeUnmount(() => {
               :data-claim-id="claim.id"
             >
               <span :class="claim.trust_state">{{ claim.trust_state === 'verified' ? '已核实' : '待核实' }}</span><p>{{ claim.text }}</p><div
-                v-for="source in claim.sources"
-                :key="source.document_version_id + source.chunk_id"
+                v-for="(source, sourceIndex) in claim.sources"
+                :key="sourceRenderKey(source, sourceIndex)"
               >
                 <RouterLink
                   class="source-link"

@@ -15,6 +15,7 @@ web/coverage/
 web/playwright-report/
 web/test-results/
 web/test-results-real/
+artifacts/
 .superpowers/
 .idea/
 docs/

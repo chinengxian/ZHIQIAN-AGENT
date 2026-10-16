@@ -28,6 +28,9 @@ dependencies = [
   "uvicorn[standard]>=0.35,<1",
 ]
 
+[project.scripts]
+wiki-quality = "agent_api.quality.wiki:main"
+
 [project.optional-dependencies]
 dev = [
   "asgi-lifespan>=2.1,<3",

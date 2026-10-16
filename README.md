@@ -116,6 +116,21 @@ data: {}
 .\.venv\Scripts\python.exe -m mypy src tests
 ```
 
+Wiki 轻量质量门适合日常开发和提交前检查：
+
+```powershell
+uv run --frozen wiki-quality light
+```
+
+完整质量门会追加 PostgreSQL、Milvus 真实检索评测。运行前需启动 `compose.yaml` 中的依赖，并提供名称以 `_test` 结尾的独立测试数据库：
+
+```powershell
+$env:AGENT_WIKI_TEST_DATABASE_URL = "postgresql+asyncpg://agent:agent@127.0.0.1:5432/agent_wiki_test"
+uv run --frozen wiki-quality full --report-path artifacts/wiki-eval-report.json
+```
+
+CI 会在 Wiki 相关变更进入 PR 或主分支时自动执行轻量门；完整质量门仅通过 GitHub Actions 手动触发，并始终上传评测报告。
+
 前端：
 
 ```powershell

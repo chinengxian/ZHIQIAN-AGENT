@@ -50,12 +50,16 @@ from agent_api.knowledge.wiki.retrieval import (
     WikiSearchResult,
 )
 from agent_api.knowledge.wiki.service import WikiService
+from tests.eval.wiki_eval_report import finalize_wiki_eval_report
 from tests.test_ingestion_e2e_integration import settings_for_e2e
 from tests.test_knowledge_management_integration import cleanup_knowledge_base
 
 CASES_PATH = Path(__file__).with_name("wiki_cases.json")
 FIXTURE_PATH = Path(__file__).parents[1] / "fixtures" / "wiki" / "enterprise-it-operations"
 WIKI_DATABASE_URL = os.getenv("AGENT_WIKI_TEST_DATABASE_URL")
+WIKI_EVAL_REPORT_PATH = Path(
+    os.getenv("WIKI_EVAL_REPORT_PATH", "artifacts/wiki-eval-report.json")
+)
 
 
 def _eval_features(text: str) -> set[str]:
@@ -637,14 +641,13 @@ async def test_wiki_hybrid_retrieval_quality(tmp_path: Path) -> None:
             + json.dumps(case_diagnostics, ensure_ascii=False, sort_keys=True)
         )
         print("WIKI_EVAL " + json.dumps(metrics, ensure_ascii=False, sort_keys=True))
-        assert page_recall_at_5 >= 0.90
-        assert claim_recall_at_8 >= 0.85
-        assert citation_precision >= 0.95
-        assert synonym_result_consistency >= 0.85
-        assert no_answer_false_match_rate <= 0.05
-        assert needs_review_leaks == 0
-        assert invalid_source_leaks == 0
-        assert old_page_version_leaks == 0
+        report = finalize_wiki_eval_report(
+            metrics=metrics,
+            case_diagnostics=case_diagnostics,
+            report_path=WIKI_EVAL_REPORT_PATH,
+        )
+        print(f"WIKI_EVAL_REPORT {WIKI_EVAL_REPORT_PATH}")
+        assert report["status"] == "passed"
     finally:
         for version_id in version_ids:
             await index.delete_version(version_id)

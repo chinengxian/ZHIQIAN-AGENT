@@ -18,7 +18,9 @@ def upgrade() -> None:
     op.create_check_constraint(
         "ck_wiki_claim_type",
         "wiki_claims",
-        "claim_type IN ('summary_section', 'summary_fact', 'topic_fact', 'source_excerpt', 'manual')",
+        "claim_type IN ("
+        "'summary_section', 'summary_fact', 'topic_fact', 'source_excerpt', 'manual'"
+        ")",
     )
 
 

@@ -26,7 +26,7 @@ class LocalBGEReranker:
         if not texts:
             return []
         if self._model is None:
-            from sentence_transformers import CrossEncoder  # type: ignore[import-not-found]
+            from sentence_transformers import CrossEncoder
 
             self._model = CrossEncoder(self._model_name, device=self._device)
         scores = self._model.predict([(query, text) for text in texts], batch_size=self._batch_size)

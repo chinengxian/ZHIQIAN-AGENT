@@ -25,7 +25,7 @@
 - Modify: `.github/workflows/wiki-quality.yml`
 - Modify: `tests/test_wiki_quality_workflow.py`
 
-- [ ] **Step 1：写入失败的工作流契约测试**
+- [x] **Step 1：写入失败的工作流契约测试**
 
 把 `tests/test_wiki_quality_workflow.py` 的主测试更新为：
 
@@ -50,7 +50,7 @@ def test_wiki_quality_workflow_separates_automatic_and_full_gates() -> None:
     assert "docker compose down" in workflow
 ```
 
-- [ ] **Step 2：运行测试并确认 RED**
+- [x] **Step 2：运行测试并确认 RED**
 
 Run：
 
@@ -60,14 +60,14 @@ uv run pytest tests/test_wiki_quality_workflow.py -q
 
 Expected：FAIL，至少缺少 `schedule:`、cron、定时任务条件或 `retention-days: 14`。
 
-- [ ] **Step 3：提交 RED 检查点**
+- [x] **Step 3：提交 RED 检查点**
 
 ```powershell
 git add tests/test_wiki_quality_workflow.py
 git commit -m "测试：锁定Wiki夜间完整质量门契约"
 ```
 
-- [ ] **Step 4：实现最小工作流变更**
+- [x] **Step 4：实现最小工作流变更**
 
 在 `.github/workflows/wiki-quality.yml` 的触发器中加入：
 
@@ -89,7 +89,7 @@ git commit -m "测试：锁定Wiki夜间完整质量门契约"
           retention-days: 14
 ```
 
-- [ ] **Step 5：运行测试并确认 GREEN**
+- [x] **Step 5：运行测试并确认 GREEN**
 
 Run：
 
@@ -99,7 +99,7 @@ uv run pytest tests/test_wiki_quality_workflow.py -q
 
 Expected：`1 passed`。
 
-- [ ] **Step 6：提交 GREEN 检查点**
+- [x] **Step 6：提交 GREEN 检查点**
 
 ```powershell
 git add .github/workflows/wiki-quality.yml
@@ -112,7 +112,7 @@ git commit -m "持续集成：增加Wiki夜间完整质量门"
 - Modify: `src/agent_api/quality/wiki.py`
 - Modify: `tests/test_wiki_quality_command.py`
 
-- [ ] **Step 1：写入失败的 Ruff 目标测试**
+- [x] **Step 1：写入失败的 Ruff 目标测试**
 
 在 `tests/test_wiki_quality_command.py` 的轻量计划测试中增加：
 
@@ -125,7 +125,7 @@ git commit -m "持续集成：增加Wiki夜间完整质量门"
     assert "src/agent_api/core/lifespan.py" in lint_targets
 ```
 
-- [ ] **Step 2：运行测试并确认 RED**
+- [x] **Step 2：运行测试并确认 RED**
 
 Run：
 
@@ -135,14 +135,14 @@ uv run pytest tests/test_wiki_quality_command.py::test_light_plan_runs_linter_be
 
 Expected：FAIL，提示 Wiki 生产目录或配置装配文件不在 Ruff 目标中。
 
-- [ ] **Step 3：提交 RED 检查点**
+- [x] **Step 3：提交 RED 检查点**
 
 ```powershell
 git add tests/test_wiki_quality_command.py
 git commit -m "测试：锁定Wiki轻量门生产代码覆盖"
 ```
 
-- [ ] **Step 4：扩展 `_LINT_FILES`**
+- [x] **Step 4：扩展 `_LINT_FILES`**
 
 把 `src/agent_api/quality/wiki.py` 中 `_LINT_FILES` 的开头调整为：
 
@@ -158,7 +158,7 @@ _LINT_FILES = (
 
 保留原有评测与质量门测试文件，避免缩小既有覆盖。
 
-- [ ] **Step 5：运行目标测试和轻量门并确认 GREEN**
+- [x] **Step 5：运行目标测试和轻量门并确认 GREEN**
 
 Run：
 
@@ -169,7 +169,7 @@ uv run wiki-quality light
 
 Expected：命令测试全部通过；轻量门输出 `49 passed, 1 deselected` 或更多通过项，且退出码为 0。
 
-- [ ] **Step 6：提交 GREEN 检查点**
+- [x] **Step 6：提交 GREEN 检查点**
 
 ```powershell
 git add src/agent_api/quality/wiki.py
@@ -182,7 +182,7 @@ git commit -m "持续集成：扩大Wiki轻量静态检查范围"
 - Modify: `docs/verification/VERIFY-005.md`
 - Create: `docs/testing/wiki-ci-quality-gate.tdd.md`
 
-- [ ] **Step 1：运行新鲜验证命令**
+- [x] **Step 1：运行新鲜验证命令**
 
 Run：
 
@@ -195,7 +195,7 @@ uv run wiki-quality light
 
 Expected：Ruff 与 mypy 退出码为 0；工作流和命令契约测试全部通过；轻量门退出码为 0。
 
-- [ ] **Step 2：核对工作流 diff**
+- [x] **Step 2：核对工作流 diff**
 
 Run：
 
@@ -205,7 +205,7 @@ git diff HEAD~4 -- .github/workflows/wiki-quality.yml src/agent_api/quality/wiki
 
 Expected：只包含夜间 cron、完整任务条件、报告保留期、Ruff 目标和对应测试；不包含供应商凭据、付费调用或业务检索逻辑。
 
-- [ ] **Step 3：写入 TDD 证据报告**
+- [x] **Step 3：写入 TDD 证据报告**
 
 创建 `docs/testing/wiki-ci-quality-gate.tdd.md`，内容必须包含：
 
@@ -228,7 +228,7 @@ Expected：只包含夜间 cron、完整任务条件、报告保留期、Ruff �
 
 把实际命令、退出码和测试计数补充到对应 GREEN 单元格，不记录凭据或文档正文。
 
-- [ ] **Step 4：更新 VERIFY-005**
+- [x] **Step 4：更新 VERIFY-005**
 
 在 `docs/verification/VERIFY-005.md` 顶部新增“2026-10-18 CI 分层质量门”章节，记录：
 
@@ -238,14 +238,14 @@ Expected：只包含夜间 cron、完整任务条件、报告保留期、Ruff �
 - 新鲜 Ruff、mypy、契约测试和轻量门结果；
 - GitHub 实际定时调度需在推送后由远端运行验证。
 
-- [ ] **Step 5：提交证据**
+- [x] **Step 5：提交证据**
 
 ```powershell
 git add -f docs/testing/wiki-ci-quality-gate.tdd.md docs/verification/VERIFY-005.md
 git commit -m "验证：记录Wiki持续质量门证据"
 ```
 
-- [ ] **Step 6：确认工作树状态**
+- [x] **Step 6：确认工作树状态**
 
 Run：
 

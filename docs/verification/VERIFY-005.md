@@ -1,9 +1,27 @@
 # VERIFY-005 知识库 Wiki 实施验证
 
 - 范围：REQ-006、TASK-027～TASK-031，以及 Wiki 来源驱动混合检索路线 B、独立语义索引路线 C
-- 日期：2026-09-22；路线 B 复验于 2026-10-06；路线 C 复验于 2026-10-16
+- 日期：2026-09-22；路线 B 复验于 2026-10-06；路线 C 复验于 2026-10-16；CI 分层门复验于 2026-10-18
 - 环境：Windows、Python 3.11、本地 Docker PostgreSQL/Redis/Milvus、Node.js 21.1.0
 - 状态：**真实数据库、Worker、浏览器和路线 C 固定检索集均已复验；检索质量门连续三次通过；真实付费模型质量未完成**
+
+## 2026-10-18 CI 分层质量门
+
+- 拉取请求和 `main` 相关路径变更继续运行 `wiki-quality light`，提供快速静态检查与确定性回归。
+- GitHub Actions 每天 UTC 18:30（北京时间次日 02:30）运行真实 PostgreSQL/Milvus 完整门，同时保留 `workflow_dispatch` 人工入口。
+- 完整评测报告在任务成功或失败时均尝试上传，并保留 14 天；容器在任务结束时始终清理。
+- 轻量 Ruff 范围已扩展到 Wiki 生产目录、Milvus Wiki 适配器、结构化观测、核心配置与装配入口，并保留既有评测文件。
+
+### 新鲜验证证据
+
+| 检查 | 结果 |
+| --- | --- |
+| `uv run ruff check .` | pass，`All checks passed!` |
+| `uv run mypy src` | pass，73 个源文件无问题 |
+| 工作流与质量命令契约测试 | pass，5 passed |
+| `uv run wiki-quality light` | pass，49 passed、1 deselected |
+
+GitHub 的实际定时调度必须在这些提交推送后由远端运行验证；本地证据只证明工作流静态契约和质量命令行为。完整 RED／GREEN 记录见 `docs/testing/wiki-ci-quality-gate.tdd.md`。
 
 ## 2026-10-16 路线 C 检索稳定性复验
 

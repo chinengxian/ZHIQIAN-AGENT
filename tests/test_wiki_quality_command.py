@@ -16,6 +16,12 @@ def test_light_plan_runs_linter_before_targeted_tests() -> None:
 
     assert [step.name for step in plan.steps] == ["静态检查", "轻量回归"]
     assert plan.steps[0].command[:3] == ("-m", "ruff", "check")
+    lint_targets = set(plan.steps[0].command[3:])
+    assert "src/agent_api/knowledge/wiki" in lint_targets
+    assert "src/agent_api/knowledge/infrastructure/milvus/wiki_index.py" in lint_targets
+    assert "src/agent_api/knowledge/infrastructure/observability/events.py" in lint_targets
+    assert "src/agent_api/core/config.py" in lint_targets
+    assert "src/agent_api/core/lifespan.py" in lint_targets
     assert "tests/eval/test_wiki_eval_report.py" in plan.steps[1].command
     assert "tests/test_wiki_independent_retrieval.py" in plan.steps[1].command
     assert plan.steps[1].command[-3:] == ("-m", "not knowledge_integration", "-q")

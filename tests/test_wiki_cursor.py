@@ -18,7 +18,7 @@ from agent_api.knowledge.wiki.cursor import (
 
 UNIT_ID = uuid4()
 PAGE_ID = uuid4()
-PAGE_SORT_KEY = (0, 0, 0, -0.8, str(PAGE_ID))
+PAGE_SORT_KEY = (0, 0, 0, -0.8, "topic/auth", str(PAGE_ID))
 
 
 def cursor_token(payload: dict[str, object]) -> str:
@@ -37,7 +37,12 @@ def test_cursor_rejects_query_or_collection_change() -> None:
 
 def test_search_cursor_round_trips_urlsafe_json_payload() -> None:
     page_id = UUID("00000000-0000-0000-0000-000000000001")
-    cursor = SearchCursor("query-a", "wiki_units_v1", (0, 0, 0, -0.8, str(page_id)), page_id)
+    cursor = SearchCursor(
+        "query-a",
+        "wiki_units_v1",
+        (0, 0, 0, -0.8, "topic/auth", str(page_id)),
+        page_id,
+    )
 
     token = encode_cursor(cursor)
 
@@ -68,7 +73,7 @@ def test_search_cursor_rejects_non_finite_page_sort_score(score: float) -> None:
         {
             "query_fingerprint": "query-a",
             "collection_version": "wiki_units_v1",
-            "last_page_sort_key": [0, 0, 0, score, str(PAGE_ID)],
+            "last_page_sort_key": [0, 0, 0, score, "topic/auth", str(PAGE_ID)],
             "last_page_id": str(PAGE_ID),
         }
     )
@@ -85,7 +90,12 @@ def test_search_cursor_rejects_non_string_token() -> None:
 def test_search_cursor_encoder_rejects_non_finite_score() -> None:
     with pytest.raises(ValueError):
         encode_cursor(
-            SearchCursor("query-a", "wiki_units_v1", (0, 0, 0, float("nan"), str(PAGE_ID)), PAGE_ID)
+            SearchCursor(
+                "query-a",
+                "wiki_units_v1",
+                (0, 0, 0, float("nan"), "topic/auth", str(PAGE_ID)),
+                PAGE_ID,
+            )
         )
 
 

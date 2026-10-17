@@ -10,13 +10,14 @@ from uuid import UUID
 
 MAX_CURSOR_BYTES = 2048
 CURSOR_ERROR = "wiki_search_cursor_expired"
+PageSortKey = tuple[int, int, int, float, str, str]
 
 
 @dataclass(frozen=True, slots=True)
 class SearchCursor:
     query_fingerprint: str
     collection_version: str
-    last_page_sort_key: tuple[int, int, int, float, str]
+    last_page_sort_key: PageSortKey
     last_page_id: UUID
 
 
@@ -147,10 +148,10 @@ def _parse_uuid(value: Any) -> UUID:
         raise WikiCursorError(CURSOR_ERROR) from None
 
 
-def _parse_page_sort_key(value: Any) -> tuple[int, int, int, float, str]:
-    if not isinstance(value, list) or len(value) != 5:
+def _parse_page_sort_key(value: Any) -> PageSortKey:
+    if not isinstance(value, list) or len(value) != 6:
         raise WikiCursorError(CURSOR_ERROR)
-    exact, multi_source, summary_page, score, page_id = value
+    exact, multi_source, summary_page, score, page_slug, page_id = value
     if (
         not isinstance(exact, int)
         or isinstance(exact, bool)
@@ -165,5 +166,14 @@ def _parse_page_sort_key(value: Any) -> tuple[int, int, int, float, str]:
     normalized_score = float(score)
     if not math.isfinite(normalized_score):
         raise WikiCursorError(CURSOR_ERROR)
+    if not isinstance(page_slug, str) or not page_slug:
+        raise WikiCursorError(CURSOR_ERROR)
     parsed_page_id = _parse_uuid(page_id)
-    return (exact, multi_source, summary_page, normalized_score, str(parsed_page_id))
+    return (
+        exact,
+        multi_source,
+        summary_page,
+        normalized_score,
+        page_slug,
+        str(parsed_page_id),
+    )

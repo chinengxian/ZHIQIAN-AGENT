@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -18,9 +19,9 @@ WIKI_EVAL_THRESHOLDS: dict[str, dict[str, float | str]] = {
 
 def _passes_threshold(actual: float | int, operator: str, threshold: float) -> bool:
     if operator == ">=":
-        return actual >= threshold
+        return actual >= threshold or math.isclose(actual, threshold, abs_tol=1e-12)
     if operator == "<=":
-        return actual <= threshold
+        return actual <= threshold or math.isclose(actual, threshold, abs_tol=1e-12)
     if operator == "==":
         return actual == threshold
     raise ValueError(f"不支持的 Wiki 评测比较符：{operator}")

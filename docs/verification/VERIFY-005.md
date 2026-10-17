@@ -1,9 +1,30 @@
 # VERIFY-005 知识库 Wiki 实施验证
 
-- 范围：REQ-006、TASK-027～TASK-031，以及 2026-10-06 Wiki 来源驱动混合检索路线 B
-- 日期：2026-09-22；路线 B 复验于 2026-10-06
+- 范围：REQ-006、TASK-027～TASK-031，以及 Wiki 来源驱动混合检索路线 B、独立语义索引路线 C
+- 日期：2026-09-22；路线 B 复验于 2026-10-06；路线 C 复验于 2026-10-16
 - 环境：Windows、Python 3.11、本地 Docker PostgreSQL/Redis/Milvus、Node.js 21.1.0
-- 状态：**真实数据库、Worker 与浏览器闭环已复验；固定检索集未达质量门，路线 C 触发；真实付费模型质量未完成**
+- 状态：**真实数据库、Worker、浏览器和路线 C 固定检索集均已复验；检索质量门连续三次通过；真实付费模型质量未完成**
+
+## 2026-10-16 路线 C 检索稳定性复验
+
+- 同分候选不再使用随机生成的 unit/page UUID 作为主要兜底，改用页面 slug、claim 位置、claim key 与事实指纹稳定排序；UUID 仅保留为最终唯一兜底。
+- 全局 claim 预算改为跨页面轮转分配，候选页先各获得一条最相关 claim，避免首个页面独占 `claim_limit` 后让相关页面消失。
+- Dense/BM25 候选池由固定下限 50 调整为动态 100～200，再执行可信复核和 reranker，避免同分候选在 Top-50 边界前被截断。
+- 质量门对浮点阈值使用 `1e-12` 的绝对容差，只消除 `0.8499999999999999` 与 `0.85` 的表示误差，不修改任何质量阈值。
+
+### 连续三次完整质量门
+
+命令使用独立 `agent_wiki_test` PostgreSQL 数据库、真实 Milvus、确定性 grounded generator，并在每轮创建全新的 collection、alias 和 UUID：
+
+| 轮次 | Page Recall@5 | Claim Recall@8 | Citation Precision | 同义一致性 | 无答案误匹配 | 三类泄漏 | 结果 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 0.9333 | 0.9130 | 0.9877 | 0.9185 | 0 | 0 | pass |
+| 2 | 0.9278 | 0.9130 | 0.9877 | 0.9074 | 0 | 0 | pass |
+| 3 | 0.9333 | 0.9130 | 0.9880 | 0.9185 | 0 | 0 | pass |
+
+门槛保持为 Page Recall@5 ≥ 0.90、Claim Recall@8 ≥ 0.85、Citation Precision ≥ 0.95、同义一致性 ≥ 0.85、无答案误匹配率 ≤ 0.05，且 `needs_review`、失效来源和旧页面版本泄漏均必须为 0。
+
+本次结果证明确定性生成语料下的 Wiki 检索、可信过滤和引用链路已闭环；它不等价于真实付费模型的摘要生成质量验收。
 
 ## 2026-10-06 路线 B 增量验证
 
@@ -74,7 +95,7 @@ WIKI_EVAL {"page_recall_at_5": 0.3537, "claim_recall_at_8": 0.5196,
 
 ### 路线 C 状态
 
-路线 C 为 `planned / not implemented`。仅当 Page Recall@5 未达 0.90、主题综合语义无法通过来源 chunk 召回，或反向连接无法满足延迟目标时启动。下一步从 Wiki 独立向量 schema、独立 Milvus collection 生命周期和当前页面版本原子可见性开始，不在本轮混入 GraphRAG。
+路线 C 为 `implemented / verified`。独立向量 schema、独立 Milvus collection 生命周期、当前页面版本原子可见性、可信复核、拒答和结构化质量报告均已落地；本轮未混入 GraphRAG。
 
 ## 已验证
 

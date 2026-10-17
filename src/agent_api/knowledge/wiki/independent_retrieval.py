@@ -20,6 +20,7 @@ from agent_api.knowledge.infrastructure.database.models import WikiClaim, WikiPa
 from agent_api.knowledge.infrastructure.milvus.wiki_index import WikiIndexHit
 from agent_api.knowledge.infrastructure.observability.events import record_wiki_search
 from agent_api.knowledge.wiki.cursor import (
+    PageSortKey,
     SearchCursor,
     WikiCursorError,
     decode_cursor,
@@ -221,7 +222,8 @@ class WikiIndependentRetrievalService:
             if cursor is not None
             else None
         )
-        candidate_limit = max(page_limit * 10, 50)
+        # 先扩大召回池再交给可信复核和重排，避免向量同分时相关页在 Top-K 边界前被截掉。
+        candidate_limit = min(200, max(page_limit * 20, claim_limit * 5, 100))
         try:
             read_model = self._read_model
             if read_model is not None:
@@ -626,7 +628,7 @@ class WikiIndependentRetrievalService:
                     ),
                 )
             )
-        accepted.sort(key=lambda item: (-item.score, str(item.candidate.unit_id)))
+        accepted.sort(key=self._accepted_sort_key)
         return accepted, degraded, degradation_reason, filtered_count
 
     def _deduplicate(self, accepted: list[_Accepted]) -> list[_Accepted]:
@@ -635,15 +637,28 @@ class WikiIndependentRetrievalService:
             grouped[item.fingerprint].append(item)
         output: list[_Accepted] = []
         for items in grouped.values():
-            items.sort(key=lambda item: (-item.score, str(item.candidate.unit_id)))
+            items.sort(key=self._accepted_sort_key)
             output.append(items[0])
-        output.sort(key=lambda item: (-item.score, str(item.candidate.unit_id)))
+        output.sort(key=self._accepted_sort_key)
         return output
+
+    @staticmethod
+    def _accepted_sort_key(item: _Accepted) -> tuple[float, str, int, str, str, str]:
+        """同分候选优先使用业务稳定字段，UUID 只作为最终唯一兜底。"""
+
+        return (
+            -item.score,
+            item.claim.page_slug.casefold(),
+            item.claim.position,
+            item.claim.claim_key,
+            item.fingerprint,
+            str(item.candidate.unit_id),
+        )
 
     def _page_items(
         self,
         ordered: list[_Accepted],
-    ) -> list[tuple[UUID, list[_Accepted], tuple[int, int, int, float, str]]]:
+    ) -> list[tuple[UUID, list[_Accepted], PageSortKey]]:
         by_page: dict[UUID, list[_Accepted]] = defaultdict(list)
         for item in ordered:
             by_page[item.claim.page_id].append(item)
@@ -654,20 +669,37 @@ class WikiIndependentRetrievalService:
 
     def _build_pages(
         self,
-        page_items: list[tuple[UUID, list[_Accepted], tuple[int, int, int, float, str]]],
+        page_items: list[tuple[UUID, list[_Accepted], PageSortKey]],
         all_accepted: list[_Accepted],
         scope_ids: tuple[UUID, ...],
         *,
         page_limit: int,
         claim_limit: int,
     ) -> tuple[WikiMatchedPage, ...]:
-        pages: list[WikiMatchedPage] = []
+        selected_page_items = page_items[: min(page_limit, claim_limit)]
+        allocated: dict[UUID, list[_Accepted]] = {
+            page_id: [] for page_id, _, _ in selected_page_items
+        }
         remaining_claims = claim_limit
-        for page_id, items, _ in page_items:
-            if len(pages) >= page_limit or remaining_claims <= 0:
+        claim_rank = 0
+        while remaining_claims > 0:
+            allocated_in_round = False
+            for page_id, items, _ in selected_page_items:
+                if remaining_claims <= 0:
+                    break
+                if claim_rank >= len(items):
+                    continue
+                allocated[page_id].append(items[claim_rank])
+                remaining_claims -= 1
+                allocated_in_round = True
+            if not allocated_in_round:
                 break
+            claim_rank += 1
+
+        pages: list[WikiMatchedPage] = []
+        for page_id, items, _ in selected_page_items:
             claims: list[WikiMatchedClaim] = []
-            for item in items[:remaining_claims]:
+            for item in allocated[page_id]:
                 also_in_pages = tuple(
                     self._page_summary(other.claim, scope_ids)
                     for other in all_accepted
@@ -707,7 +739,6 @@ class WikiIndependentRetrievalService:
                     omitted_claim_count=max(0, len(items) - len(claims)),
                 )
             )
-            remaining_claims -= len(claims)
         return tuple(pages)
 
     @staticmethod
@@ -726,7 +757,7 @@ class WikiIndependentRetrievalService:
         )
 
     @staticmethod
-    def _page_sort_key(items: list[_Accepted]) -> tuple[int, int, int, float, str]:
+    def _page_sort_key(items: list[_Accepted]) -> PageSortKey:
         first = items[0]
         exact = any(item.candidate.exact_metadata_match for item in items)
         multi_source = any(len(item.claim.sources) > 1 for item in items)
@@ -736,14 +767,15 @@ class WikiIndependentRetrievalService:
             -int(multi_source),
             int(summary_page),
             -max(item.score for item in items),
+            first.claim.page_slug.casefold(),
             str(first.claim.page_id),
         )
 
     @staticmethod
     def _cursor_boundary_after_pages(
-        page_items: list[tuple[UUID, list[_Accepted], tuple[int, int, int, float, str]]],
+        page_items: list[tuple[UUID, list[_Accepted], PageSortKey]],
         pages: tuple[WikiMatchedPage, ...],
-    ) -> tuple[UUID, list[_Accepted], tuple[int, int, int, float, str]] | None:
+    ) -> tuple[UUID, list[_Accepted], PageSortKey] | None:
         returned_page_ids = {page.id for page in pages}
         boundary = None
         for page_item in page_items:

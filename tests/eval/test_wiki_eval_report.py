@@ -51,6 +51,21 @@ def test_finalize_wiki_eval_report_writes_stable_passed_report(tmp_path: Path) -
     assert persisted["failures"] == []
 
 
+def test_finalize_wiki_eval_report_accepts_float_rounding_at_threshold(
+    tmp_path: Path,
+) -> None:
+    metrics = _passing_metrics()
+    metrics["synonym_result_consistency"] = 0.8499999999999999
+
+    report = finalize_wiki_eval_report(
+        metrics=metrics,
+        case_diagnostics=[],
+        report_path=tmp_path / "wiki-eval-report.json",
+    )
+
+    assert report["status"] == "passed"
+
+
 def test_finalize_wiki_eval_report_persists_failure_evidence_before_raising(
     tmp_path: Path,
 ) -> None:

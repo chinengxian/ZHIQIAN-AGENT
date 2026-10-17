@@ -131,7 +131,7 @@ class FakeIndex:
         self.dense_calls += 1
         assert vector == [0.1, 0.2]
         assert scope_ids == (BASE_ID,)
-        assert limit == 50
+        assert limit == 100
         return self.dense_hits
 
     async def search_keyword(
@@ -140,7 +140,7 @@ class FakeIndex:
         self.keyword_calls += 1
         assert query == "mfa"
         assert scope_ids == (BASE_ID,)
-        assert limit == 50
+        assert limit == 100
         return self.keyword_hits
 
 
@@ -385,6 +385,137 @@ async def test_independent_search_pages_after_promoted_exact_metadata_page() -> 
     assert first_page.next_cursor is not None
     assert [page.id for page in second_page.pages] == [high_score_claim.page_id]
     assert second_page.next_cursor is None
+
+
+async def test_independent_search_tie_break_is_stable_after_uuid_regeneration() -> None:
+    async def first_page_title(
+        *,
+        alpha_page_id: UUID,
+        beta_page_id: UUID,
+        alpha_unit_id: UUID,
+        beta_unit_id: UUID,
+    ) -> str:
+        alpha = replace(
+            _claim(
+                _uuid(1911),
+                alpha_page_id,
+                _uuid(1912),
+                "MFA 统一要求",
+                page_title="甲页面",
+            ),
+            page_slug="topic/alpha",
+            claim_key="stable-alpha",
+        )
+        beta = replace(
+            _claim(
+                _uuid(1921),
+                beta_page_id,
+                _uuid(1922),
+                "MFA 统一要求补充",
+                page_title="乙页面",
+            ),
+            page_slug="topic/beta",
+            claim_key="stable-beta",
+        )
+        result = await _service(
+            dense_hits=[
+                _hit(alpha_unit_id, alpha, score=0.9, channel="dense"),
+                _hit(beta_unit_id, beta, score=0.9, channel="dense"),
+            ],
+            keyword_hits=[],
+            claims={alpha.claim_id: alpha, beta.claim_id: beta},
+            scorer=FakeScorer([0.9, 0.9]),
+        ).search("MFA", (BASE_ID,), page_limit=1, claim_limit=2)
+        return result.pages[0].title
+
+    first_build = await first_page_title(
+        alpha_page_id=_uuid(2002),
+        beta_page_id=_uuid(2001),
+        alpha_unit_id=_uuid(2004),
+        beta_unit_id=_uuid(2003),
+    )
+    rebuilt = await first_page_title(
+        alpha_page_id=_uuid(2101),
+        beta_page_id=_uuid(2102),
+        alpha_unit_id=_uuid(2103),
+        beta_unit_id=_uuid(2104),
+    )
+
+    assert first_build == rebuilt == "甲页面"
+
+
+async def test_independent_search_distributes_claim_budget_across_pages() -> None:
+    crowded_page_id = _uuid(2201)
+    crowded_version_id = _uuid(2202)
+    claims: dict[UUID, VerifiedWikiClaim] = {}
+    hits: list[WikiIndexHit] = []
+    for index in range(8):
+        claim = replace(
+            _claim(
+                _uuid(2210 + index),
+                crowded_page_id,
+                crowded_version_id,
+                f"MFA 甲页面要求 {index}",
+                page_title="甲页面",
+                position=index,
+            ),
+            page_slug="topic/alpha",
+        )
+        claims[claim.claim_id] = claim
+        hits.append(
+            _hit(_uuid(2230 + index), claim, score=0.9, channel="dense")
+        )
+    second_page_claim = replace(
+        _claim(
+            _uuid(2251),
+            _uuid(2252),
+            _uuid(2253),
+            "MFA 乙页面补充要求",
+            page_title="乙页面",
+        ),
+        page_slug="topic/beta",
+    )
+    claims[second_page_claim.claim_id] = second_page_claim
+    hits.append(_hit(_uuid(2254), second_page_claim, score=0.9, channel="dense"))
+
+    result = await _service(
+        dense_hits=hits,
+        keyword_hits=[],
+        claims=claims,
+        scorer=FakeScorer([0.9] * len(hits)),
+    ).search("MFA", (BASE_ID,), page_limit=2, claim_limit=8)
+
+    assert [page.title for page in result.pages] == ["甲页面", "乙页面"]
+    assert sum(len(page.matched_claims) for page in result.pages) == 8
+
+
+async def test_independent_search_overfetches_candidates_before_reranking() -> None:
+    claim = _claim(_uuid(2301), _uuid(2302), _uuid(2303), "MFA 必须启用")
+
+    class LimitRecordingIndex(FakeIndex):
+        def __init__(self) -> None:
+            super().__init__([_hit(_uuid(2304), claim, score=0.9, channel="dense")], [])
+            self.requested_limit: int | None = None
+
+        async def search_dense(
+            self,
+            vector: list[float],
+            scope_ids: tuple[UUID, ...],
+            limit: int,
+        ) -> list[WikiIndexHit]:
+            del vector, scope_ids
+            self.requested_limit = limit
+            return self.dense_hits
+
+    index = LimitRecordingIndex()
+    await _service(
+        dense_hits=[],
+        keyword_hits=[],
+        claims={claim.claim_id: claim},
+        index=index,
+    ).search("MFA", (BASE_ID,), mode="semantic", page_limit=5, claim_limit=8)
+
+    assert index.requested_limit == 100
 
 
 async def test_independent_search_records_backlog_metric(caplog: pytest.LogCaptureFixture) -> None:

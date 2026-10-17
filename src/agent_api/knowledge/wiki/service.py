@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from hashlib import sha256
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -22,8 +21,21 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiPageVersion,
     WikiTokenUsage,
 )
+from agent_api.knowledge.wiki.cursor import (
+    PageClaimCursor,
+    WikiCursorError,
+    decode_page_claim_cursor,
+    encode_page_claim_cursor,
+)
+from agent_api.knowledge.wiki.index_jobs import (
+    retry_page_index_job,
+    schedule_current_page_indexes,
+    source_matches_chunk,
+    try_backfill_lock,
+)
 from agent_api.knowledge.wiki.jobs import schedule_document_wiki
 from agent_api.knowledge.wiki.processor import WikiProcessor
+from agent_api.knowledge.wiki.read_model import VerifiedWikiClaim, WikiReadModel
 
 
 class WikiError(RuntimeError):
@@ -38,8 +50,16 @@ class WikiError(RuntimeError):
 class WikiService:
     """负责 Wiki 配置、页面版本与可信来源的事务边界。"""
 
-    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        *,
+        index_enabled: bool = False,
+        embedding_fingerprint: str = "",
+    ) -> None:
         self._sessions = sessions
+        self._index_enabled = index_enabled
+        self._embedding_fingerprint = embedding_fingerprint
 
     async def _base(self, session: AsyncSession, knowledge_base_id: UUID) -> KnowledgeBase:
         base = await session.scalar(
@@ -154,16 +174,20 @@ class WikiService:
     ) -> list[dict[str, Any]]:
         async with self._sessions() as session:
             await self._base(session, knowledge_base_id)
-            query = select(WikiPage).where(
-                WikiPage.knowledge_base_id == knowledge_base_id,
-                WikiPage.deleted_at.is_(None),
-                WikiPage.current_version_id.is_not(None),
+            query = (
+                select(WikiPage, WikiPageVersion)
+                .join(WikiPageVersion, WikiPage.current_version_id == WikiPageVersion.id)
+                .where(
+                    WikiPage.knowledge_base_id == knowledge_base_id,
+                    WikiPage.deleted_at.is_(None),
+                    WikiPage.current_version_id.is_not(None),
+                )
             )
             if page_type is not None:
                 query = query.where(WikiPage.page_type == page_type)
             if cursor is not None:
                 query = query.where(WikiPage.slug > cursor)
-            pages = list(await session.scalars(query.order_by(WikiPage.slug).limit(limit)))
+            pages = list(await session.execute(query.order_by(WikiPage.slug).limit(limit)))
             return [
                 {
                     "id": page.id,
@@ -172,11 +196,40 @@ class WikiService:
                     "page_type": page.page_type,
                     "title": page.title,
                     "current_version_id": page.current_version_id,
+                    "index_state": version.index_state,
+                    "index_error_code": version.index_error_code,
                 }
-                for page in pages
+                for page, version in pages
             ]
 
-    async def get_page(self, knowledge_base_id: UUID, page_id: UUID) -> dict[str, Any]:
+    async def rebuild_aggregation_pages(self, knowledge_base_id: UUID) -> dict[str, Any]:
+        """基于现有摘要重建聚合页，不触发文档 Wiki 生成或模型计费。"""
+
+        async with self._sessions() as session:
+            await self._base(session, knowledge_base_id)
+        await WikiProcessor.rebuild_aggregation_pages(
+            self._sessions,
+            knowledge_base_id,
+            index_enabled=self._index_enabled,
+            embedding_fingerprint=self._embedding_fingerprint,
+        )
+        pages = await self.list_pages(knowledge_base_id)
+        return {
+            "knowledge_base_id": knowledge_base_id,
+            "topic_pages": sum(page["page_type"] == "topic" for page in pages),
+            "summary_pages": sum(page["page_type"] == "summary" for page in pages),
+        }
+
+    async def get_page(
+        self,
+        knowledge_base_id: UUID,
+        page_id: UUID,
+        *,
+        claim_cursor: str | None = None,
+        claim_limit: int = 20,
+    ) -> dict[str, Any]:
+        if not 1 <= claim_limit <= 50:
+            raise ValueError("invalid_wiki_cursor")
         async with self._sessions() as session:
             await self._base(session, knowledge_base_id)
             page = await self._page(session, knowledge_base_id, page_id)
@@ -185,12 +238,30 @@ class WikiService:
             version = await session.get(WikiPageVersion, page.current_version_id)
             if version is None:
                 raise WikiError("wiki_page_version_not_found", 404)
-            claims = await self._claims_response(session, version.id)
-            return self._page_response(page, version, claims)
+            all_claims = await self._claims_response(session, version.id, knowledge_base_id)
+            summary_sections = self._summary_sections_response(version, all_claims)
+            claims = [claim for claim in all_claims if claim["claim_type"] != "summary_section"]
+            selected_claims, next_cursor = self._paginate_claims(
+                claims,
+                version.id,
+                claim_cursor,
+                claim_limit,
+            )
+            return self._page_response(
+                page,
+                version,
+                selected_claims,
+                summary_sections,
+                next_cursor,
+            )
 
     @staticmethod
     def _page_response(
-        page: WikiPage, version: WikiPageVersion, claims: list[dict[str, Any]]
+        page: WikiPage,
+        version: WikiPageVersion,
+        claims: list[dict[str, Any]],
+        summary_sections: list[dict[str, Any]] | None = None,
+        claims_next_cursor: str | None = None,
     ) -> dict[str, Any]:
         return {
             "id": page.id,
@@ -199,15 +270,100 @@ class WikiService:
             "page_type": page.page_type,
             "title": page.title,
             "current_version_id": version.id,
+            "index_state": version.index_state,
+            "index_error_code": version.index_error_code,
             "version_no": version.version_no,
             "content": version.content,
             "summary": version.summary,
             "origin": version.origin,
+            "summary_sections": summary_sections or [],
+            "metadata": WikiService._metadata_response(version),
             "claims": claims,
+            "claims_next_cursor": claims_next_cursor,
         }
 
+    @staticmethod
+    def _paginate_claims(
+        claims: list[dict[str, Any]],
+        page_version_id: UUID,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        ordered = sorted(claims, key=lambda item: (item["position"], item["id"]))
+        if cursor is not None:
+            try:
+                decoded = decode_page_claim_cursor(cursor, page_version_id=page_version_id)
+            except WikiCursorError:
+                raise WikiCursorError("wiki_page_cursor_expired") from None
+            ordered = [
+                claim
+                for claim in ordered
+                if (claim["position"], claim["id"]) > (decoded.last_position, decoded.last_claim_id)
+            ]
+        selected = ordered[:limit]
+        if len(ordered) <= limit or not selected:
+            return selected, None
+        last = selected[-1]
+        next_cursor = encode_page_claim_cursor(
+            PageClaimCursor(
+                page_version_id=page_version_id,
+                last_position=last["position"],
+                last_claim_id=last["id"],
+            )
+        )
+        return selected, next_cursor
+
+    @staticmethod
+    def _metadata_response(version: WikiPageVersion) -> list[dict[str, str]]:
+        """仅向自动摘要页返回经过发布器白名单处理的信息卡数据。"""
+
+        if version.origin != "pipeline":
+            return []
+        raw_items = version.generation_metadata.get("presentation_metadata", [])
+        if not isinstance(raw_items, list):
+            return []
+        return [
+            {"key": item["key"], "label": item["label"], "value": item["value"]}
+            for item in raw_items
+            if isinstance(item, dict)
+            and all(isinstance(item.get(field), str) for field in ("key", "label", "value"))
+        ]
+
+    @staticmethod
+    def _summary_sections_response(
+        version: WikiPageVersion,
+        claims: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """把摘要段落标题从发布元数据与其可验证来源重新组合。"""
+
+        raw_sections = version.generation_metadata.get("summary_sections", [])
+        titles = (
+            {
+                item["claim_key"]: item["title"]
+                for item in raw_sections
+                if isinstance(item, dict)
+                and isinstance(item.get("claim_key"), str)
+                and isinstance(item.get("title"), str)
+            }
+            if isinstance(raw_sections, list)
+            else {}
+        )
+        return [
+            {
+                "id": claim["id"],
+                "title": titles.get(claim["claim_key"], "概述"),
+                "text": claim["text"],
+                "position": claim["position"],
+                "trust_state": claim["trust_state"],
+                "reason": claim["reason"],
+                "sources": claim["sources"],
+            }
+            for claim in claims
+            if claim["claim_type"] == "summary_section"
+        ]
+
     async def _claims_response(
-        self, session: AsyncSession, page_version_id: UUID
+        self, session: AsyncSession, page_version_id: UUID, knowledge_base_id: UUID
     ) -> list[dict[str, Any]]:
         claims = list(
             await session.scalars(
@@ -216,55 +372,76 @@ class WikiService:
                 .order_by(WikiClaim.position, WikiClaim.id)
             )
         )
-        output: list[dict[str, Any]] = []
-        for claim in claims:
-            sources = list(
-                await session.scalars(
-                    select(WikiClaimSource).where(WikiClaimSource.claim_id == claim.id)
-                )
-            )
-            rendered_sources = []
-            for source in sources:
-                valid = await self._source_valid(session, source)
-                rendered_sources.append(
-                    {
-                        "document_id": source.document_id,
-                        "document_version_id": source.document_version_id,
-                        "chunk_id": source.chunk_id,
-                        "document_title": source.document_title,
-                        "heading_path": source.heading_path,
-                        "page_start": source.page_start,
-                        "page_end": source.page_end,
-                        "valid": valid,
-                    }
-                )
-            trusted = (
-                claim.trust_state == "verified"
-                and bool(rendered_sources)
-                and all(item["valid"] for item in rendered_sources)
-            )
-            output.append(
+        if not claims:
+            return []
+        read_model = WikiReadModel(session)
+        loaded = await read_model.load_verified_claims(
+            tuple(claim.id for claim in claims),
+            scope_ids=(knowledge_base_id,),
+            require_index_ready=False,
+        )
+        by_id = {claim.claim_id: claim for claim in loaded}
+        return [self._claim_response(by_id.get(claim.id), claim) for claim in claims]
+
+    @staticmethod
+    def _claim_response(
+        verified: VerifiedWikiClaim | None,
+        fallback: WikiClaim,
+    ) -> dict[str, Any]:
+        if verified is None:
+            return {
+                "id": fallback.id,
+                "claim_key": fallback.claim_key,
+                "text": fallback.text,
+                "position": fallback.position,
+                "claim_type": fallback.claim_type,
+                "trust_state": "needs_review",
+                "reason": fallback.reason or "source_not_current",
+                "sources": [],
+            }
+        trusted = verified.valid and bool(verified.sources)
+        return {
+            "id": verified.claim_id,
+            "claim_key": verified.claim_key,
+            "text": verified.text,
+            "position": verified.position,
+            "claim_type": verified.claim_type,
+            "trust_state": "verified" if trusted else "needs_review",
+            "reason": (
+                verified.reason
+                if trusted
+                else verified.reason or verified.invalid_reason or "source_not_current"
+            ),
+            "sources": [
                 {
-                    "id": claim.id,
-                    "claim_key": claim.claim_key,
-                    "text": claim.text,
-                    "position": claim.position,
-                    "claim_type": claim.claim_type,
-                    "trust_state": "verified" if trusted else "needs_review",
-                    "reason": claim.reason if trusted else claim.reason or "source_not_current",
-                    "sources": rendered_sources,
+                    "document_id": source.document_id,
+                    "document_version_id": source.document_version_id,
+                    "chunk_id": source.chunk_id,
+                    "parent_chunk_id": source.parent_chunk_id,
+                    "document_title": source.document_title,
+                    "heading_path": list(source.heading_path),
+                    "page_start": source.page_start,
+                    "page_end": source.page_end,
+                    "excerpt": source.excerpt,
+                    "focus_start": source.focus_start,
+                    "focus_end": source.focus_end,
+                    "valid": source.valid,
+                    "invalid_reason": source.invalid_reason,
                 }
-            )
-        return output
+                for source in verified.sources
+            ],
+        }
 
     @staticmethod
     async def _source_valid(session: AsyncSession, source: WikiClaimSource) -> bool:
+        """兼容旧调用点的来源复核：文档活动版本与 chunk 快照必须同时匹配。"""
+
         document = await session.get(Document, source.document_id)
         if (
             document is None
-            or document.deleted_at is not None
-            or document.status != "ready"
             or document.active_version_id != source.document_version_id
+            or document.status != "ready"
+            or document.deleted_at is not None
         ):
             return False
         chunk = await session.scalar(
@@ -274,10 +451,7 @@ class WikiService:
                 Chunk.ordinal == source.chunk_ordinal,
             )
         )
-        return (
-            chunk is not None
-            and sha256(chunk.content.encode()).hexdigest() == source.content_sha256
-        )
+        return chunk is not None and source_matches_chunk(source, chunk)
 
     async def list_versions(self, knowledge_base_id: UUID, page_id: UUID) -> list[dict[str, Any]]:
         async with self._sessions() as session:
@@ -353,8 +527,14 @@ class WikiService:
             page.current_version_id = version.id
             await WikiProcessor._rebuild_topic_pages(session, knowledge_base_id)
             await WikiProcessor._rebuild_index(session, knowledge_base_id)
+            await schedule_current_page_indexes(
+                session,
+                knowledge_base_id=knowledge_base_id,
+                index_enabled=self._index_enabled,
+                fingerprint=self._embedding_fingerprint,
+            )
             return self._page_response(
-                page, version, await self._claims_response(session, version.id)
+                page, version, await self._claims_response(session, version.id, knowledge_base_id)
             )
 
     async def revert_page(
@@ -398,8 +578,14 @@ class WikiService:
             page.current_version_id = version.id
             await WikiProcessor._rebuild_topic_pages(session, knowledge_base_id)
             await WikiProcessor._rebuild_index(session, knowledge_base_id)
+            await schedule_current_page_indexes(
+                session,
+                knowledge_base_id=knowledge_base_id,
+                index_enabled=self._index_enabled,
+                fingerprint=self._embedding_fingerprint,
+            )
             return self._page_response(
-                page, version, await self._claims_response(session, version.id)
+                page, version, await self._claims_response(session, version.id, knowledge_base_id)
             )
 
     async def review_page(
@@ -438,7 +624,67 @@ class WikiService:
                 page.current_version_id = candidate.id
                 await WikiProcessor._rebuild_topic_pages(session, knowledge_base_id)
                 await WikiProcessor._rebuild_index(session, knowledge_base_id)
+                await schedule_current_page_indexes(
+                    session,
+                    knowledge_base_id=knowledge_base_id,
+                    index_enabled=self._index_enabled,
+                    fingerprint=self._embedding_fingerprint,
+                )
             return self._version_response(candidate)
+
+    async def retry_page_index(self, knowledge_base_id: UUID, page_id: UUID) -> dict[str, Any]:
+        """只允许显式重试当前失败版本，且不产生 Wiki 模型计费。"""
+
+        async with self._sessions() as session, session.begin():
+            await self._base(session, knowledge_base_id)
+            page = await self._page(session, knowledge_base_id, page_id, lock=True)
+            if page.current_version_id is None:
+                raise WikiError("wiki_index_retry_not_allowed", 409)
+            version = await session.get(
+                WikiPageVersion, page.current_version_id, with_for_update=True
+            )
+            if not self._index_enabled or version is None or version.index_state != "failed":
+                raise WikiError("wiki_index_retry_not_allowed", 409)
+            job = await session.scalar(
+                select(WikiJob)
+                .where(
+                    WikiJob.page_version_id == version.id,
+                    WikiJob.job_type == "page_index",
+                )
+                .order_by(WikiJob.created_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            job_id = await retry_page_index_job(
+                session,
+                knowledge_base_id=knowledge_base_id,
+                page_version_id=version.id,
+                fingerprint=self._embedding_fingerprint,
+                failed_job=job,
+            )
+            version.index_state = "pending"
+            version.embedding_fingerprint = self._embedding_fingerprint
+            version.index_error_code = None
+            return {"job_id": job_id, "page_version_id": version.id}
+
+    async def backfill_index(self, knowledge_base_id: UUID) -> dict[str, int]:
+        """无模型回填当前可信版本；不读取或修改 token 计数。"""
+
+        async with self._sessions() as session, session.begin():
+            await self._base(session, knowledge_base_id)
+            if not await try_backfill_lock(session, knowledge_base_id):
+                raise WikiError("wiki_index_rebuild_in_progress", 409)
+            created, existing, skipped = await schedule_current_page_indexes(
+                session,
+                knowledge_base_id=knowledge_base_id,
+                index_enabled=self._index_enabled,
+                fingerprint=self._embedding_fingerprint,
+            )
+            return {
+                "created_jobs": created,
+                "existing_jobs": existing,
+                "skipped_versions": skipped,
+            }
 
     @staticmethod
     async def _next_version_no(session: AsyncSession, page_id: UUID) -> int:
@@ -507,16 +753,21 @@ class WikiService:
                 usage = await session.scalar(
                     select(WikiTokenUsage).where(WikiTokenUsage.job_id == job.id)
                 )
-                output.append({
-                    "id": job.id,
-                    "job_type": job.job_type,
-                    "status": job.status,
-                    "stage": job.stage,
-                    "progress": job.progress,
-                    "error_code": job.error_code,
-                    "estimated_tokens": int(job.payload.get("estimated_tokens", 0)),
-                    "actual_tokens": usage.measured_tokens if usage else None,
-                    "charged_tokens": usage.charged_tokens if usage else 0,
-                    "created_at": job.created_at,
-                })
+                output.append(
+                    {
+                        "id": job.id,
+                        "job_type": job.job_type,
+                        "status": job.status,
+                        "stage": job.stage,
+                        "progress": job.progress,
+                        "error_code": job.error_code,
+                        "error_reference": job.error_reference,
+                        "page_version_id": job.page_version_id,
+                        "embedding_fingerprint": job.embedding_fingerprint,
+                        "estimated_tokens": int(job.payload.get("estimated_tokens", 0)),
+                        "actual_tokens": usage.measured_tokens if usage else None,
+                        "charged_tokens": usage.charged_tokens if usage else 0,
+                        "created_at": job.created_at,
+                    }
+                )
             return output

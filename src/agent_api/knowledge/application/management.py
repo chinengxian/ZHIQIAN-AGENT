@@ -20,6 +20,7 @@ from agent_api.knowledge.domain.statuses import (
     VersionStatus,
 )
 from agent_api.knowledge.infrastructure.database.models import (
+    Chunk,
     Document,
     DocumentVersion,
     IngestionJob,
@@ -30,6 +31,7 @@ from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
 from agent_api.knowledge.wiki.jobs import invalidate_document_claims
 
 DEFAULT_WORKSPACE_ID = UUID("00000000-0000-0000-0000-000000000001")
+MAX_PREVIEW_CHARACTERS = 12_000
 
 
 class KnowledgeManagementError(RuntimeError):
@@ -299,7 +301,153 @@ class SqlAlchemyKnowledgeManagementService:
     async def get_document(self, document_id: UUID) -> dict[str, Any]:
         async with self._sessions() as session:
             document = await self._get_document(session, document_id)
-            return await self._document_response(session, document)
+            return await self._document_detail_response(session, document)
+
+    async def list_document_versions(
+        self,
+        document_id: UUID,
+        *,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        limit = min(max(limit, 1), 50)
+        cursor_value = self._decode_cursor(cursor) if cursor else None
+        async with self._sessions() as session:
+            await self._get_document(session, document_id)
+            query = (
+                select(DocumentVersion)
+                .where(DocumentVersion.document_id == document_id)
+                .order_by(DocumentVersion.version_no.desc(), DocumentVersion.id.desc())
+                .limit(limit + 1)
+            )
+            if cursor_value is not None:
+                cursor_ordinal, cursor_id = cursor_value
+                query = query.where(
+                    tuple_(DocumentVersion.version_no, DocumentVersion.id)
+                    < (cursor_ordinal, cursor_id)
+                )
+            versions = list(await session.scalars(query))
+            page = versions[:limit]
+            next_cursor = (
+                self._encode_cursor(page[-1].version_no, page[-1].id)
+                if len(versions) > limit and page
+                else None
+            )
+            return {
+                "items": [self._version_response(version) for version in page],
+                "next_cursor": next_cursor,
+            }
+
+    async def preview_document(
+        self,
+        document_id: UUID,
+        *,
+        version_id: UUID | None = None,
+        cursor: str | None = None,
+        limit: int = 10,
+        anchor_chunk_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        limit = min(max(limit, 1), 30)
+        cursor_value = self._decode_cursor(cursor) if cursor else None
+        async with self._sessions() as session:
+            document = await self._get_document(session, document_id)
+            version = await self._resolve_preview_version(session, document, version_id)
+            if version is None:
+                return self._empty_preview(document.id, None, document.status)
+
+            anchor_context: Chunk | None = None
+            focus: dict[str, Any] = {}
+            if anchor_chunk_id is not None:
+                anchor = await self._get_version_chunk(session, version.id, anchor_chunk_id)
+                anchor_context = anchor
+                if anchor.parent_chunk_id is not None:
+                    anchor_context = await self._get_version_chunk(
+                        session, version.id, anchor.parent_chunk_id
+                    )
+                    focus = {
+                        "anchor_chunk_id": anchor.id,
+                        "focus_start": anchor.char_start,
+                        "focus_end": anchor.char_end,
+                    }
+                else:
+                    focus = {
+                        "anchor_chunk_id": anchor.id,
+                        "focus_start": anchor.char_start,
+                        "focus_end": anchor.char_end,
+                    }
+
+            # 先在完整父块集合中计算排名，再应用游标或锚点过滤，保证分页后的段号稳定。
+            ranked_parent_chunks = (
+                select(
+                    Chunk.id.label("chunk_id"),
+                    func.row_number()
+                    .over(order_by=(Chunk.ordinal, Chunk.id))
+                    .label("display_ordinal"),
+                )
+                .where(
+                    Chunk.document_version_id == version.id,
+                    Chunk.parent_chunk_id.is_(None),
+                )
+                .subquery()
+            )
+            context_query = (
+                select(Chunk, ranked_parent_chunks.c.display_ordinal)
+                .join(ranked_parent_chunks, ranked_parent_chunks.c.chunk_id == Chunk.id)
+                .order_by(Chunk.ordinal, Chunk.id)
+                .limit(limit + 1)
+            )
+            if cursor_value is not None:
+                cursor_ordinal, cursor_id = cursor_value
+                context_query = context_query.where(
+                    tuple_(Chunk.ordinal, Chunk.id) > (cursor_ordinal, cursor_id)
+                )
+            elif anchor_context is not None:
+                context_query = context_query.where(
+                    tuple_(Chunk.ordinal, Chunk.id) >= (anchor_context.ordinal, anchor_context.id)
+                )
+            rows = list((await session.execute(context_query)).all())
+            if not rows:
+                return self._empty_preview(document.id, version.id, version.status)
+
+            items: list[dict[str, Any]] = []
+            char_total = 0
+            has_more = len(rows) > limit
+            for chunk, display_ordinal in rows[:limit]:
+                next_total = char_total + len(chunk.content)
+                if items and next_total > MAX_PREVIEW_CHARACTERS:
+                    has_more = True
+                    break
+                char_total = next_total
+                chunk_focus = (
+                    focus if anchor_context is not None and chunk.id == anchor_context.id else {}
+                )
+                items.append(
+                    {
+                        "chunk_id": chunk.id,
+                        "ordinal": chunk.ordinal,
+                        "display_ordinal": int(display_ordinal),
+                        "content": chunk.content,
+                        "heading_path": chunk.heading_path,
+                        "page_start": chunk.page_start,
+                        "page_end": chunk.page_end,
+                        **chunk_focus,
+                    }
+                )
+
+            next_cursor = (
+                self._encode_cursor(items[-1]["ordinal"], items[-1]["chunk_id"])
+                if has_more and items
+                else None
+            )
+            return {
+                "document_id": document.id,
+                "version_id": version.id,
+                "items": items,
+                "next_cursor": next_cursor,
+                "preview_unavailable_reason": None
+                if items
+                else self._preview_reason(version.status),
+            }
 
     async def request_document_action(
         self,
@@ -362,7 +510,7 @@ class SqlAlchemyKnowledgeManagementService:
                     file_size=latest.file_size,
                     pipeline_version="knowledge-v1",
                     embedding_provider=self._settings.embedding_provider.value,
-                    delete_documentembedding_model=self._settings.embedding_model or "",
+                    embedding_model=self._settings.embedding_model or "",
                     embedding_dimension=self._settings.embedding_dimension,
                     embedding_fingerprint=self._embedding_fingerprint(),
                 )
@@ -622,13 +770,7 @@ class SqlAlchemyKnowledgeManagementService:
         session: AsyncSession,
         document: Document,
     ) -> dict[str, Any]:
-        job = await session.scalar(
-            select(IngestionJob)
-            .join(DocumentVersion, DocumentVersion.id == IngestionJob.document_version_id)
-            .where(DocumentVersion.document_id == document.id)
-            .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
-            .limit(1)
-        )
+        job = await self._latest_job(session, document.id)
         return {
             "id": document.id,
             "knowledge_base_id": document.knowledge_base_id,
@@ -637,19 +779,155 @@ class SqlAlchemyKnowledgeManagementService:
             "mime_type": document.mime_type,
             "status": document.status,
             "active_version_id": document.active_version_id,
-            "job": (
-                None
-                if job is None
-                else {
-                    "id": job.id,
-                    "stage": job.current_stage,
-                    "status": job.status,
-                    "progress": job.progress,
-                    "error_code": job.error_code,
-                    "error_reference": job.error_reference,
-                }
+            "job": self._job_response(job),
+        }
+
+    async def _document_detail_response(
+        self,
+        session: AsyncSession,
+        document: Document,
+    ) -> dict[str, Any]:
+        base = await self._document_response(session, document)
+        active_version = (
+            None
+            if document.active_version_id is None
+            else await session.get(DocumentVersion, document.active_version_id)
+        )
+        latest_job = await self._latest_job(session, document.id)
+        return {
+            **base,
+            "created_at": document.created_at,
+            "updated_at": document.updated_at,
+            "active_version": (
+                None if active_version is None else self._version_response(active_version)
+            ),
+            "latest_job": self._job_response(latest_job),
+        }
+
+    async def _latest_job(
+        self,
+        session: AsyncSession,
+        document_id: UUID,
+    ) -> IngestionJob | None:
+        job = await session.scalar(
+            select(IngestionJob)
+            .join(DocumentVersion, DocumentVersion.id == IngestionJob.document_version_id)
+            .where(DocumentVersion.document_id == document_id)
+            .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
+            .limit(1)
+        )
+        return job
+
+    @staticmethod
+    def _job_response(job: IngestionJob | None) -> dict[str, Any] | None:
+        if job is None:
+            return None
+        return {
+            "id": job.id,
+            "document_version_id": job.document_version_id,
+            "stage": job.current_stage,
+            "status": job.status,
+            "progress": job.progress,
+            "error_code": job.error_code,
+            "error_reference": job.error_reference,
+        }
+
+    @staticmethod
+    def _version_response(version: DocumentVersion) -> dict[str, Any]:
+        return {
+            "id": version.id,
+            "version_no": version.version_no,
+            "file_size": version.file_size,
+            "status": version.status,
+            "parser_name": version.parser_name,
+            "created_at": version.created_at,
+            "ready_at": version.ready_at,
+            "error_code": version.error_code,
+            "error_reference": version.error_reference,
+        }
+
+    async def _resolve_preview_version(
+        self,
+        session: AsyncSession,
+        document: Document,
+        version_id: UUID | None,
+    ) -> DocumentVersion | None:
+        if version_id is None:
+            if document.active_version_id is None:
+                return None
+            version_id = document.active_version_id
+        version = await session.scalar(
+            select(DocumentVersion).where(
+                DocumentVersion.id == version_id,
+                DocumentVersion.document_id == document.id,
+            )
+        )
+        if version is None:
+            raise KnowledgeNotFoundError("document_version_not_found")
+        return version
+
+    async def _get_version_chunk(
+        self,
+        session: AsyncSession,
+        version_id: UUID,
+        chunk_id: UUID,
+    ) -> Chunk:
+        chunk = await session.scalar(
+            select(Chunk).where(
+                Chunk.id == chunk_id,
+                Chunk.document_version_id == version_id,
+            )
+        )
+        if chunk is None:
+            raise KnowledgeNotFoundError("document_chunk_not_found")
+        return chunk
+
+    @staticmethod
+    def _empty_preview(
+        document_id: UUID,
+        version_id: UUID | None,
+        status_value: str,
+    ) -> dict[str, Any]:
+        return {
+            "document_id": document_id,
+            "version_id": version_id,
+            "items": [],
+            "next_cursor": None,
+            "preview_unavailable_reason": SqlAlchemyKnowledgeManagementService._preview_reason(
+                status_value
             ),
         }
+
+    @staticmethod
+    def _preview_reason(status_value: str) -> str:
+        if (
+            status_value == VersionStatus.FAILED.value
+            or status_value == DocumentStatus.FAILED.value
+        ):
+            return "failed"
+        if status_value in {
+            VersionStatus.PENDING.value,
+            VersionStatus.PARSING.value,
+            VersionStatus.CHUNKING.value,
+            VersionStatus.EMBEDDING.value,
+            VersionStatus.INDEXING.value,
+            DocumentStatus.PENDING.value,
+            DocumentStatus.PROCESSING.value,
+        }:
+            return "processing"
+        return "content_removed"
+
+    @staticmethod
+    def _encode_cursor(ordinal: int, item_id: UUID) -> str:
+        return f"{ordinal}:{item_id}"
+
+    @staticmethod
+    def _decode_cursor(cursor: str) -> tuple[int, UUID]:
+        try:
+            ordinal, raw_id = cursor.split(":", 1)
+            return int(ordinal), UUID(raw_id)
+        except (TypeError, ValueError):
+            raise KnowledgeManagementError("invalid_cursor") from None
 
 
 class PathSafeName:

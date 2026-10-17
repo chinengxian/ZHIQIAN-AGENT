@@ -8,5 +8,6 @@ export const router = createRouter({
     { path: '/', component: ChatView },
     { path: '/knowledge', component: KnowledgeView },
     { path: '/knowledge/:id', component: KnowledgeView },
+    { path: '/knowledge/:id/documents/:documentId', component: KnowledgeView },
   ],
 })

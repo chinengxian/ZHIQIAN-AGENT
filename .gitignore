@@ -15,6 +15,7 @@ web/coverage/
 web/playwright-report/
 web/test-results/
 web/test-results-real/
+artifacts/
 .superpowers/
 .idea/
 docs/
@@ -23,18 +24,24 @@ docs/*
 !docs/verification/
 docs/verification/*
 !docs/verification/VERIFY-004.md
+!docs/verification/VERIFY-006.md
 !docs/requirements/
 docs/requirements/*
 !docs/requirements/REQ-006.md
+!docs/requirements/REQ-007.md
 !docs/superpowers/
 docs/superpowers/*
 !docs/superpowers/specs/
 docs/superpowers/specs/*
 !docs/superpowers/specs/2026-09-22-wiki-synthesis-design.md
 !docs/superpowers/specs/2026-09-27-wiki-completion-design.md
+!docs/superpowers/specs/2026-10-05-document-inspection-design.md
+!docs/superpowers/specs/2026-10-07-wiki-independent-semantic-index-design.md
 !docs/superpowers/plans/
 docs/superpowers/plans/*
 !docs/superpowers/plans/2026-09-22-wiki-synthesis.md
+!docs/superpowers/plans/2026-10-07-wiki-independent-semantic-index.md
+!docs/superpowers/plans/2026-10-05-document-inspection.md
 !docs/tasks/
 docs/tasks/*
 !docs/tasks/TASK-027.md
@@ -42,3 +49,10 @@ docs/tasks/*
 !docs/tasks/TASK-029.md
 !docs/tasks/TASK-030.md
 !docs/tasks/TASK-031.md
+!docs/tasks/TASK-032.md
+!docs/tasks/TASK-033.md
+!docs/tasks/TASK-034.md
+!docs/tasks/TASK-035.md
+
+# Celery Beat 运行时调度状态，不属于源代码
+celerybeat-schedule.*

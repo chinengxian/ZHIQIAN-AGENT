@@ -9,6 +9,7 @@ export interface KnowledgeBase {
 
 export interface IngestionJob {
   id: string
+  document_version_id?: string | null
   stage: string
   status: string
   progress: number
@@ -25,6 +26,51 @@ export interface KnowledgeDocument {
   status: string
   active_version_id: string | null
   job: IngestionJob | null
+}
+
+export interface DocumentVersion {
+  id: string
+  version_no: number
+  file_size: number
+  status: string
+  parser_name: string | null
+  created_at: string
+  ready_at: string | null
+  error_code: string | null
+  error_reference: string | null
+}
+
+export interface DocumentDetail extends KnowledgeDocument {
+  created_at: string
+  updated_at: string
+  active_version: DocumentVersion | null
+  latest_job: IngestionJob | null
+}
+
+export interface DocumentVersionPage {
+  items: DocumentVersion[]
+  next_cursor: string | null
+}
+
+export interface DocumentPreviewChunk {
+  chunk_id: string
+  ordinal: number
+  display_ordinal: number
+  content: string
+  heading_path: string[]
+  page_start: number | null
+  page_end: number | null
+  anchor_chunk_id: string | null
+  focus_start: number | null
+  focus_end: number | null
+}
+
+export interface DocumentPreview {
+  document_id: string
+  version_id: string | null
+  items: DocumentPreviewChunk[]
+  next_cursor: string | null
+  preview_unavailable_reason: 'processing' | 'failed' | 'content_removed' | null
 }
 
 export interface DocumentProgress {
@@ -53,6 +99,8 @@ export interface WikiPageSummary {
   page_type: 'summary' | 'topic' | 'index'
   title: string
   current_version_id: string | null
+  index_state: 'not_required' | 'pending' | 'indexing' | 'ready' | 'failed'
+  index_error_code: string | null
 }
 
 export interface WikiClaim {
@@ -63,16 +111,39 @@ export interface WikiClaim {
   claim_type: 'summary_fact' | 'topic_fact' | 'source_excerpt' | 'manual'
   trust_state: 'verified' | 'needs_review'
   reason: string | null
-  sources: Array<{
-    document_id: string
-    document_version_id: string
-    chunk_id: string | null
-    document_title: string
-    heading_path: string[]
-    page_start: number | null
-    page_end: number | null
-    valid: boolean
-  }>
+  sources: WikiPresentationSource[]
+}
+
+export interface WikiPresentationSource {
+  document_id: string
+  document_version_id: string
+  chunk_id: string | null
+  parent_chunk_id: string | null
+  document_title: string
+  heading_path: string[]
+  page_start: number | null
+  page_end: number | null
+  excerpt: string
+  focus_start: number | null
+  focus_end: number | null
+  valid: boolean
+  invalid_reason: string | null
+}
+
+export interface WikiSummarySection {
+  id: string
+  title: string
+  text: string
+  position: number
+  trust_state: 'verified' | 'needs_review'
+  reason: string | null
+  sources: WikiPresentationSource[]
+}
+
+export interface WikiMetadataItem {
+  key: string
+  label: string
+  value: string
 }
 
 export interface WikiPage extends WikiPageSummary {
@@ -80,7 +151,10 @@ export interface WikiPage extends WikiPageSummary {
   content: string
   summary: string
   origin: 'pipeline' | 'user' | 'revert'
+  summary_sections: WikiSummarySection[]
+  metadata: WikiMetadataItem[]
   claims: WikiClaim[]
+  claims_next_cursor: string | null
 }
 
 export interface WikiVersion {
@@ -110,7 +184,8 @@ export interface WikiJob {
 }
 
 export interface WikiSearchSource {
-  chunk_id: string
+  chunk_id: string | null
+  parent_chunk_id: string | null
   document_id: string
   document_version_id: string
   title: string
@@ -119,6 +194,10 @@ export interface WikiSearchSource {
   page_end: number | null
   heading_path: string[]
   excerpt: string
+  focus_start: number | null
+  focus_end: number | null
+  valid: boolean
+  invalid_reason: string | null
   score: number
   rank: number
 }
@@ -130,6 +209,7 @@ export interface WikiSearchClaim {
   claim_type: 'summary_fact' | 'topic_fact' | 'source_excerpt' | 'manual'
   score: number
   sources: WikiSearchSource[]
+  also_in_pages: WikiPageSummary[]
 }
 
 export interface WikiSearchPage {
@@ -146,7 +226,11 @@ export interface WikiSearchPage {
 
 export interface WikiSearchResult {
   pages: WikiSearchPage[]
+  no_answer: boolean
+  no_answer_reason: string | null
   degraded: boolean
   degradation_reason: string | null
   truncation_reason: string | null
+  next_cursor: string | null
+  collection_version: string | null
 }

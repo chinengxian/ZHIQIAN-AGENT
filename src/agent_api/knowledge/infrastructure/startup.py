@@ -9,14 +9,22 @@ from pymilvus import (  # type: ignore[import-untyped]
     FunctionType,
     MilvusClient,
 )
+from pymilvus.client.types import LoadState  # type: ignore[import-untyped]
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from agent_api.core.config import Settings
+from agent_api.knowledge.infrastructure.milvus.wiki_index import (
+    build_wiki_milvus_indexes,
+    build_wiki_milvus_schema,
+    describe_alias_target,
+    validate_wiki_milvus_description,
+    validate_wiki_milvus_indexes,
+)
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
 
-EXPECTED_DATABASE_REVISION = "20261006_0003"
+EXPECTED_DATABASE_REVISION = "20261007_0005"
 _EXPECTED_MILVUS_FIELDS = {
     "chunk_id",
     "document_version_id",
@@ -153,8 +161,8 @@ class KnowledgeStartup:
             try:
                 await check.check()
             except Exception:
-                # 当前检查失败时，只关闭此前已经成功初始化的资源。
-                await self._close_initialized()
+                # 当前检查可能已创建部分资源；释放失败不得覆盖脱敏启动错误。
+                await self._close_after_failed_check(check)
                 raise StartupCheckError(check.name) from None
             self._initialized.append(check)
 
@@ -162,8 +170,34 @@ class KnowledgeStartup:
         await self._close_initialized()
 
     async def _close_initialized(self) -> None:
+        checks: list[StartupCheck] = []
         while self._initialized:
-            await self._initialized.pop().close()
+            # 先移出列表再释放，保证 close 失败后再次调用仍然幂等。
+            checks.append(self._initialized.pop())
+        await self._close_checks(checks, suppress_errors=False)
+
+    async def _close_after_failed_check(self, failed_check: StartupCheck) -> None:
+        checks = [failed_check]
+        while self._initialized:
+            checks.append(self._initialized.pop())
+        await self._close_checks(checks, suppress_errors=True)
+
+    @staticmethod
+    async def _close_checks(
+        checks: Sequence[StartupCheck],
+        *,
+        suppress_errors: bool,
+    ) -> None:
+        first_error: Exception | None = None
+        for check in checks:
+            try:
+                await check.close()
+            except Exception as error:
+                # 继续释放剩余资源；启动失败路径始终保留原检查名称。
+                if first_error is None:
+                    first_error = error
+        if first_error is not None and not suppress_errors:
+            raise first_error
 
 
 class DatabaseStartupCheck:
@@ -249,23 +283,123 @@ class MilvusStartupCheck:
             self._client = None
 
 
+class WikiMilvusStartupCheck:
+    """创建或校验 Wiki 物理 collection，并安全初始化搜索 alias。"""
+
+    name = "wiki_milvus"
+
+    def __init__(
+        self,
+        uri: str,
+        token: str | None,
+        physical_collection: str,
+        alias: str,
+        embedding_dimension: int,
+    ) -> None:
+        self._uri = uri
+        self._token = token
+        self._physical_collection = physical_collection
+        self._alias = alias
+        self._embedding_dimension = embedding_dimension
+        self._client: MilvusClient | None = None
+
+    async def check(self) -> None:
+        # PyMilvus 是同步客户端，启动检查放入线程避免阻塞事件循环。
+        await asyncio.to_thread(self._check_sync)
+
+    def _check_sync(self) -> None:
+        kwargs: dict[str, str] = {"uri": self._uri}
+        if self._token:
+            kwargs["token"] = self._token
+        client = MilvusClient(**kwargs)
+        self._client = client
+
+        physical_created = not client.has_collection(
+            collection_name=self._physical_collection
+        )
+        if physical_created:
+            # 只创建缺失的版本化 collection，绝不删除或覆盖已有 collection。
+            client.create_collection(
+                collection_name=self._physical_collection,
+                schema=build_wiki_milvus_schema(self._embedding_dimension),
+                index_params=build_wiki_milvus_indexes(),
+            )
+        physical_description = client.describe_collection(
+            collection_name=self._physical_collection
+        )
+        validate_wiki_milvus_description(
+            physical_description,
+            expected_dimension=self._embedding_dimension,
+        )
+        validate_wiki_milvus_indexes(client, self._physical_collection)
+
+        target_collection = describe_alias_target(client, self._alias)
+        if target_collection is None:
+            # 首次启动可以建立 alias；已有 alias 的切换必须走显式质量门流程。
+            client.create_alias(
+                collection_name=self._physical_collection,
+                alias=self._alias,
+            )
+            target_collection = self._physical_collection
+        elif not client.has_collection(collection_name=target_collection):
+            raise RuntimeError("Wiki Milvus alias target collection does not exist")
+        elif target_collection != self._physical_collection:
+            target_description = client.describe_collection(collection_name=target_collection)
+            validate_wiki_milvus_description(
+                target_description,
+                expected_dimension=self._embedding_dimension,
+            )
+            validate_wiki_milvus_indexes(client, target_collection)
+
+        # SDK 创建带索引 collection 时已自动 load；仅处理启动前已存在的集合。
+        collections_to_load = [] if physical_created else [self._physical_collection]
+        if target_collection != self._physical_collection:
+            collections_to_load.append(target_collection)
+        for collection_name in collections_to_load:
+            self._load_or_refresh(client, collection_name)
+
+    @staticmethod
+    def _load_or_refresh(client: MilvusClient, collection_name: str) -> None:
+        state = client.get_load_state(collection_name=collection_name).get("state")
+        if state == LoadState.Loaded:
+            client.refresh_load(collection_name=collection_name)
+            return
+        client.load_collection(collection_name=collection_name)
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await asyncio.to_thread(self._client.close)
+            self._client = None
+
+
 KnowledgeStartupFactory = Callable[[Settings], KnowledgeStartup]
 
 
 def create_knowledge_startup(settings: Settings) -> KnowledgeStartup:
-    """把已验证配置装配为存储、数据库、Redis、Milvus 四段启动链。"""
+    """装配知识基础设施检查；Wiki 索引开启时追加独立 Milvus 检查。"""
 
     token = settings.milvus_token.get_secret_value() if settings.milvus_token else None
-    return KnowledgeStartup(
-        LocalFileStorage(settings.storage_root),
-        (
-            DatabaseStartupCheck(settings.database_url.get_secret_value()),
-            RedisStartupCheck(settings.redis_url.get_secret_value()),
-            MilvusStartupCheck(
+    checks: list[StartupCheck] = [
+        DatabaseStartupCheck(settings.database_url.get_secret_value()),
+        RedisStartupCheck(settings.redis_url.get_secret_value()),
+        MilvusStartupCheck(
+            uri=settings.milvus_uri,
+            token=token,
+            collection=settings.milvus_collection,
+            embedding_dimension=settings.embedding_dimension,
+        ),
+    ]
+    if settings.wiki_index_enabled:
+        checks.append(
+            WikiMilvusStartupCheck(
                 uri=settings.milvus_uri,
                 token=token,
-                collection=settings.milvus_collection,
+                physical_collection=settings.wiki_milvus_collection_version,
+                alias=settings.wiki_milvus_collection_alias,
                 embedding_dimension=settings.embedding_dimension,
-            ),
-        ),
+            )
+        )
+    return KnowledgeStartup(
+        LocalFileStorage(settings.storage_root),
+        checks,
     )

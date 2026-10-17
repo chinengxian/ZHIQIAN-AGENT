@@ -13,6 +13,7 @@ import pytest
 from pydantic import AnyHttpUrl, SecretStr
 from pymilvus import MilvusClient
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import delete, func, select
 
 from agent_api.core.config import EmbeddingProvider, ModelProvider, Settings
@@ -24,6 +25,7 @@ from agent_api.knowledge.application.ingestion import (
 )
 from agent_api.knowledge.application.management import (
     KnowledgeConflictError,
+    KnowledgeNotFoundError,
     SqlAlchemyKnowledgeManagementService,
 )
 from agent_api.knowledge.domain.events import OutboxEventType
@@ -56,6 +58,21 @@ pytestmark = [
 ]
 
 DATABASE_URL = "postgresql+asyncpg://agent:agent@127.0.0.1:5432/agent"
+
+
+async def wait_for_redis_ready(redis: Redis, *, timeout_seconds: float = 30) -> None:
+    """等待 Redis 完成重启和数据加载，避免把进程存活误判为服务就绪。"""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        try:
+            if await redis.ping():
+                return
+        except RedisConnectionError:
+            pass
+        await asyncio.sleep(0.2)
+    pytest.fail(f"Redis 未在 {timeout_seconds:g} 秒内就绪")
 
 
 async def cleanup_knowledge_base(runtime: DatabaseRuntime, knowledge_base_id: UUID) -> None:
@@ -256,6 +273,233 @@ async def test_duplicate_upload_requires_explicit_new_version(tmp_path: Path) ->
             )
         assert [version.version_no for version in versions] == [1, 2]
         assert len(list(settings.storage_root.glob("*.txt"))) == 2
+    finally:
+        if knowledge_base_id is not None:
+            await cleanup_knowledge_base(runtime, knowledge_base_id)
+        await runtime.close()
+
+
+async def test_document_inspection_uses_safe_versions_preview_and_ownership(
+    tmp_path: Path,
+) -> None:
+    settings = knowledge_settings(tmp_path / "inspection-uploads")
+    runtime = DatabaseRuntime(DATABASE_URL)
+    storage = LocalFileStorage(settings.storage_root)
+    management = SqlAlchemyKnowledgeManagementService(runtime.session_factory, storage, settings)
+    knowledge_base_id: UUID | None = None
+    try:
+        created = await management.create_knowledge_base(name="文档查看集成", description="")
+        knowledge_base_id = created["id"]
+        document_id = uuid4()
+        other_document_id = uuid4()
+        version_ids = [uuid4(), uuid4()]
+        other_version_id = uuid4()
+        parent_chunk_ids = [uuid4(), uuid4(), uuid4()]
+        child_chunk_ids = [uuid4(), uuid4(), uuid4()]
+        other_chunk_id = uuid4()
+        async with runtime.session_factory() as session, session.begin():
+            document = Document(
+                id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                title="查看文档",
+                filename="inspection.md",
+                mime_type="text/markdown",
+                status="ready",
+            )
+            other_document = Document(
+                id=other_document_id,
+                knowledge_base_id=knowledge_base_id,
+                title="其他文档",
+                filename="other.md",
+                mime_type="text/markdown",
+                status="ready",
+            )
+            session.add_all((document, other_document))
+            await session.flush()
+            first_version = DocumentVersion(
+                id=version_ids[0],
+                document_id=document_id,
+                version_no=1,
+                file_path="secret-v1.md",
+                sha256="1" * 64,
+                file_size=100,
+                pipeline_version="test",
+                embedding_provider="test",
+                embedding_model="secret-model",
+                embedding_dimension=3,
+                embedding_fingerprint="secret-fingerprint",
+                status="ready",
+            )
+            active_version = DocumentVersion(
+                id=version_ids[1],
+                document_id=document_id,
+                version_no=2,
+                file_path="secret-v2.md",
+                sha256="2" * 64,
+                file_size=200,
+                parser_name="docling",
+                pipeline_version="test",
+                embedding_provider="test",
+                embedding_model="secret-model",
+                embedding_dimension=3,
+                embedding_fingerprint="secret-fingerprint",
+                status="ready",
+                ready_at=datetime.now(UTC),
+            )
+            other_version = DocumentVersion(
+                id=other_version_id,
+                document_id=other_document_id,
+                version_no=1,
+                file_path="other-secret.md",
+                sha256="3" * 64,
+                file_size=50,
+                pipeline_version="test",
+                embedding_provider="test",
+                embedding_model="secret-model",
+                embedding_dimension=3,
+                embedding_fingerprint="secret-fingerprint",
+                status="ready",
+            )
+            session.add_all((first_version, active_version, other_version))
+            await session.flush()
+            document.active_version_id = active_version.id
+            other_document.active_version_id = other_version.id
+            session.add(
+                IngestionJob(
+                    document_version_id=active_version.id,
+                    current_stage="ready",
+                    status="succeeded",
+                    progress=100,
+                    correlation_id=uuid4(),
+                    idempotency_key=f"inspection:{active_version.id}",
+                )
+            )
+            session.add_all(
+                (
+                    Chunk(
+                        id=parent_chunk_ids[0],
+                        document_version_id=active_version.id,
+                        ordinal=10,
+                        kind="parent",
+                        content="父块正文第一段。\n父块正文第二段。",
+                        heading_path=["一", "二"],
+                        page_start=3,
+                        page_end=4,
+                        token_count=30,
+                    ),
+                    Chunk(
+                        id=child_chunk_ids[0],
+                        document_version_id=active_version.id,
+                        parent_chunk_id=parent_chunk_ids[0],
+                        ordinal=11,
+                        kind="child",
+                        content="子块命中正文",
+                        char_start=4,
+                        char_end=10,
+                        token_count=10,
+                    ),
+                    Chunk(
+                        id=parent_chunk_ids[1],
+                        document_version_id=active_version.id,
+                        ordinal=20,
+                        kind="parent",
+                        content="父块正文第二节。",
+                        token_count=10,
+                    ),
+                    Chunk(
+                        id=child_chunk_ids[1],
+                        document_version_id=active_version.id,
+                        parent_chunk_id=parent_chunk_ids[1],
+                        ordinal=21,
+                        kind="child",
+                        content="第二节子块",
+                        char_start=0,
+                        char_end=5,
+                        token_count=5,
+                    ),
+                    Chunk(
+                        id=parent_chunk_ids[2],
+                        document_version_id=active_version.id,
+                        ordinal=30,
+                        kind="parent",
+                        content="父块正文第三节。",
+                        token_count=10,
+                    ),
+                    Chunk(
+                        id=child_chunk_ids[2],
+                        document_version_id=active_version.id,
+                        parent_chunk_id=parent_chunk_ids[2],
+                        ordinal=31,
+                        kind="child",
+                        content="第三节子块",
+                        char_start=1,
+                        char_end=6,
+                        token_count=5,
+                    ),
+                    Chunk(
+                        id=other_chunk_id,
+                        document_version_id=other_version.id,
+                        ordinal=1,
+                        kind="child",
+                        content="其他文档正文",
+                        token_count=10,
+                    ),
+                )
+            )
+
+        detail = await management.get_document(document_id)
+        assert detail["active_version"]["id"] == active_version.id
+        assert detail["active_version"]["file_size"] == 200
+        assert "file_path" not in detail["active_version"]
+        assert "sha256" not in detail["active_version"]
+        assert detail["latest_job"]["document_version_id"] == active_version.id
+
+        first_page = await management.list_document_versions(document_id, limit=1)
+        assert [item["version_no"] for item in first_page["items"]] == [2]
+        assert first_page["next_cursor"] is not None
+        second_page = await management.list_document_versions(
+            document_id, cursor=first_page["next_cursor"], limit=1
+        )
+        assert [item["version_no"] for item in second_page["items"]] == [1]
+
+        preview_first_page = await management.preview_document(
+            document_id,
+            version_id=active_version.id,
+            limit=1,
+        )
+        assert preview_first_page["items"][0]["ordinal"] == 10
+        assert preview_first_page["items"][0]["display_ordinal"] == 1
+        assert preview_first_page["next_cursor"] is not None
+
+        preview_second_page = await management.preview_document(
+            document_id,
+            version_id=active_version.id,
+            cursor=preview_first_page["next_cursor"],
+            limit=1,
+        )
+        assert preview_second_page["items"][0]["ordinal"] == 20
+        assert preview_second_page["items"][0]["display_ordinal"] == 2
+
+        anchored_preview = await management.preview_document(
+            document_id,
+            version_id=active_version.id,
+            anchor_chunk_id=child_chunk_ids[2],
+        )
+        assert anchored_preview["items"][0]["chunk_id"] == parent_chunk_ids[2]
+        assert anchored_preview["items"][0]["display_ordinal"] == 3
+        assert anchored_preview["items"][0]["anchor_chunk_id"] == child_chunk_ids[2]
+        assert anchored_preview["items"][0]["focus_start"] == 1
+        assert anchored_preview["items"][0]["focus_end"] == 6
+        assert anchored_preview["items"][0]["content"] == "父块正文第三节。"
+
+        with pytest.raises(KnowledgeNotFoundError, match="document_version_not_found"):
+            await management.preview_document(document_id, version_id=other_version_id)
+        with pytest.raises(KnowledgeNotFoundError, match="document_chunk_not_found"):
+            await management.preview_document(
+                document_id,
+                version_id=active_version.id,
+                anchor_chunk_id=other_chunk_id,
+            )
     finally:
         if knowledge_base_id is not None:
             await cleanup_knowledge_base(runtime, knowledge_base_id)
@@ -1049,6 +1293,7 @@ class LocalEmbeddingHandler(BaseHTTPRequestHandler):
 
 async def test_queued_upload_becomes_ready_after_worker_starts(tmp_path: Path) -> None:
     settings = knowledge_settings(tmp_path / "queued-uploads")
+    queue = f"knowledge-upload-{uuid4()}"
     runtime = DatabaseRuntime(DATABASE_URL)
     storage = LocalFileStorage(settings.storage_root)
     management = SqlAlchemyKnowledgeManagementService(runtime.session_factory, storage, settings)
@@ -1059,27 +1304,52 @@ async def test_queued_upload_becomes_ready_after_worker_starts(tmp_path: Path) -
     version_id: UUID | None = None
     worker: asyncio.subprocess.Process | None = None
     try:
-        created = await management.create_knowledge_base(name="队列上传集成", description="")
+        created = await management.create_knowledge_base(
+            name=f"队列上传集成-{uuid4()}",
+            description="",
+        )
         knowledge_base_id = created["id"]
         accepted = await management.upload_document(
             knowledge_base_id, "queued.txt", "text/plain", "队列启动后处理的正文".encode()
         )
-        async with runtime.session_factory() as session:
+        async with runtime.session_factory() as session, session.begin():
             version_id = await session.scalar(
                 select(DocumentVersion.id).where(
                     DocumentVersion.document_id == accepted["document_id"]
                 )
             )
+            outbox_event = await session.scalar(
+                select(OutboxEvent)
+                .where(
+                    OutboxEvent.aggregate_id == version_id,
+                    OutboxEvent.event_type
+                    == OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
+                )
+                .with_for_update()
+            )
+            assert outbox_event is not None
+            # 先租约领取数据库事件，避免本机正在运行的 Beat 把测试任务投到公共队列。
+            outbox_event.status = "processing"
+            outbox_event.available_at = datetime.now(UTC) + timedelta(minutes=2)
+            outbox_event_id = outbox_event.id
         assert version_id is not None
-        publisher = CeleryEventPublisher("redis://127.0.0.1:6379/0")
+        publisher = CeleryEventPublisher("redis://127.0.0.1:6379/0", queue=queue)
         await publisher.publish(
             PendingEvent(
-                id=uuid4(),
+                id=outbox_event_id,
                 event_type=OutboxEventType.DOCUMENT_INGESTION_REQUESTED,
                 aggregate_id=version_id,
                 payload={"job_id": str(accepted["job_id"])},
             )
         )
+        await SqlAlchemyOutboxRepository(runtime.session_factory).mark_published(
+            outbox_event_id
+        )
+        redis = Redis.from_url("redis://127.0.0.1:6379/0")
+        try:
+            assert await redis.llen(queue) == 1
+        finally:
+            await redis.aclose()
         # 重建 API 侧数据库连接和服务实例，确认任务状态不依赖进程内存。
         await runtime.close()
         runtime = DatabaseRuntime(DATABASE_URL)
@@ -1103,7 +1373,8 @@ async def test_queued_upload_becomes_ready_after_worker_starts(tmp_path: Path) -
         assert restart.returncode == 0, restart_error.decode(errors="replace")
         redis = Redis.from_url("redis://127.0.0.1:6379/0")
         try:
-            assert await redis.ping()
+            await wait_for_redis_ready(redis)
+            assert await redis.llen(queue) == 1
         finally:
             await redis.aclose()
         worker_env = os.environ.copy()
@@ -1121,6 +1392,8 @@ async def test_queued_upload_becomes_ready_after_worker_starts(tmp_path: Path) -
                 "AGENT_EMBEDDING_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
                 "AGENT_EMBEDDING_API_KEY": "test-embedding-key",
                 "AGENT_EMBEDDING_MODEL": "text-embedding-3-small",
+                "AGENT_EMBEDDING_DIMENSION": "1536",
+                "AGENT_MILVUS_COLLECTION": "knowledge_chunks",
             }
         )
         worker = await asyncio.create_subprocess_exec(
@@ -1132,7 +1405,7 @@ async def test_queued_upload_becomes_ready_after_worker_starts(tmp_path: Path) -
             "worker",
             "--pool=solo",
             "-Q",
-            "knowledge",
+            queue,
             "--loglevel=WARNING",
             "--without-gossip",
             "--without-mingle",

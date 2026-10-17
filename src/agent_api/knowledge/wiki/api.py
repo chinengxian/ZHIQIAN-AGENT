@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime
+from hashlib import sha256
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
+from agent_api.knowledge.infrastructure.observability.events import (
+    record_wiki_cursor_expired,
+    record_wiki_search,
+)
+from agent_api.knowledge.wiki.cursor import WikiCursorError
 from agent_api.knowledge.wiki.retrieval import WikiRetrievalError, WikiRetrievalService
 from agent_api.knowledge.wiki.service import WikiError, WikiService
 
@@ -31,17 +37,30 @@ class WikiPageSummary(BaseModel):
     page_type: Literal["summary", "topic", "index"]
     title: str
     current_version_id: UUID | None
+    index_state: Literal["not_required", "pending", "indexing", "ready", "failed"] = "not_required"
+    index_error_code: str | None = None
+
+
+class WikiAggregationRebuildResponse(BaseModel):
+    knowledge_base_id: UUID
+    topic_pages: int
+    summary_pages: int
 
 
 class WikiSourceResponse(BaseModel):
     document_id: UUID
     document_version_id: UUID
     chunk_id: UUID | None
+    parent_chunk_id: UUID | None = None
     document_title: str
     heading_path: list[str]
     page_start: int | None
     page_end: int | None
+    excerpt: str = ""
+    focus_start: int | None = None
+    focus_end: int | None = None
     valid: bool
+    invalid_reason: str | None = None
 
 
 class WikiClaimResponse(BaseModel):
@@ -55,12 +74,31 @@ class WikiClaimResponse(BaseModel):
     sources: list[WikiSourceResponse]
 
 
+class WikiSummarySectionResponse(BaseModel):
+    id: UUID
+    title: str
+    text: str
+    position: int
+    trust_state: Literal["verified", "needs_review"]
+    reason: str | None
+    sources: list[WikiSourceResponse]
+
+
+class WikiMetadataResponse(BaseModel):
+    key: str
+    label: str
+    value: str
+
+
 class WikiPageResponse(WikiPageSummary):
     version_no: int
     content: str
     summary: str
     origin: Literal["pipeline", "user", "revert"]
+    summary_sections: list[WikiSummarySectionResponse]
+    metadata: list[WikiMetadataResponse]
     claims: list[WikiClaimResponse]
+    claims_next_cursor: str | None = None
 
 
 class WikiVersionResponse(BaseModel):
@@ -100,14 +138,29 @@ class WikiJobResponse(BaseModel):
     stage: str
     progress: int
     error_code: str | None
+    error_reference: str | None = None
+    page_version_id: UUID | None = None
+    embedding_fingerprint: str | None = None
     estimated_tokens: int
     actual_tokens: int | None
     charged_tokens: int
     created_at: datetime
 
 
+class WikiIndexRetryResponse(BaseModel):
+    job_id: UUID
+    page_version_id: UUID
+
+
+class WikiIndexBackfillResponse(BaseModel):
+    created_jobs: int
+    existing_jobs: int
+    skipped_versions: int
+
+
 class WikiSearchSourceResponse(BaseModel):
-    chunk_id: UUID
+    chunk_id: UUID | None
+    parent_chunk_id: UUID | None = None
     document_id: UUID
     document_version_id: UUID
     title: str
@@ -116,6 +169,10 @@ class WikiSearchSourceResponse(BaseModel):
     page_end: int | None
     heading_path: tuple[str, ...]
     excerpt: str
+    focus_start: int | None = None
+    focus_end: int | None = None
+    valid: bool = True
+    invalid_reason: str | None = None
     score: float
     rank: int
 
@@ -127,6 +184,7 @@ class WikiMatchedClaimResponse(BaseModel):
     claim_type: Literal["summary_fact", "topic_fact", "source_excerpt", "manual"]
     score: float
     sources: list[WikiSearchSourceResponse]
+    also_in_pages: list[WikiPageSummary] = Field(default_factory=list)
 
 
 class WikiMatchedPageResponse(BaseModel):
@@ -146,6 +204,10 @@ class WikiSearchResponse(BaseModel):
     degraded: bool
     degradation_reason: str | None
     truncation_reason: str | None
+    no_answer: bool = False
+    no_answer_reason: str | None = None
+    next_cursor: str | None = None
+    collection_version: str | None = None
 
 
 def get_wiki_service(request: Request) -> WikiService:
@@ -222,10 +284,35 @@ async def list_pages(
         _raise_http_error(error)
 
 
-@router.get("/pages/{page_id}", response_model=WikiPageResponse)
-async def get_page(knowledge_base_id: UUID, page_id: UUID, service: WikiServiceDependency) -> Any:
+@router.post("/rebuild-aggregation", response_model=WikiAggregationRebuildResponse)
+async def rebuild_aggregation(knowledge_base_id: UUID, service: WikiServiceDependency) -> Any:
     try:
-        return await service.get_page(knowledge_base_id, page_id)
+        return await service.rebuild_aggregation_pages(knowledge_base_id)
+    except WikiError as error:
+        _raise_http_error(error)
+
+
+@router.get("/pages/{page_id}", response_model=WikiPageResponse)
+async def get_page(
+    knowledge_base_id: UUID,
+    page_id: UUID,
+    service: WikiServiceDependency,
+    claim_cursor: str | None = None,
+    claim_limit: int = Query(default=20, ge=1, le=50),
+) -> Any:
+    try:
+        return await service.get_page(
+            knowledge_base_id,
+            page_id,
+            claim_cursor=claim_cursor,
+            claim_limit=claim_limit,
+        )
+    except WikiCursorError:
+        record_wiki_cursor_expired(cursor_type="page_claim")
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "wiki_page_cursor_expired", "message": "Wiki page cursor expired"},
+        ) from None
     except WikiError as error:
         _raise_http_error(error)
 
@@ -296,6 +383,37 @@ async def review_page(
         _raise_http_error(error)
 
 
+@router.post(
+    "/pages/{page_id}/index/retry",
+    response_model=WikiIndexRetryResponse,
+    status_code=202,
+)
+async def retry_page_index(
+    knowledge_base_id: UUID,
+    page_id: UUID,
+    service: WikiServiceDependency,
+) -> Any:
+    try:
+        return await service.retry_page_index(knowledge_base_id, page_id)
+    except WikiError as error:
+        _raise_http_error(error)
+
+
+@router.post(
+    "/index/backfill",
+    response_model=WikiIndexBackfillResponse,
+    status_code=202,
+)
+async def backfill_index(
+    knowledge_base_id: UUID,
+    service: WikiServiceDependency,
+) -> Any:
+    try:
+        return await service.backfill_index(knowledge_base_id)
+    except WikiError as error:
+        _raise_http_error(error)
+
+
 @router.get("/jobs", response_model=list[WikiJobResponse])
 async def list_jobs(
     knowledge_base_id: UUID,
@@ -316,6 +434,7 @@ async def search_pages(
     mode: Literal["hybrid", "semantic", "keyword"] = "hybrid",
     limit: int = Query(default=5, ge=1, le=20),
     claim_limit: int = Query(default=12, ge=1, le=50),
+    cursor: str | None = None,
 ) -> Any:
     try:
         return await service.search(
@@ -324,7 +443,26 @@ async def search_pages(
             mode=mode,
             page_limit=limit,
             claim_limit=claim_limit,
+            cursor=cursor,
         )
+    except WikiCursorError:
+        record_wiki_search(
+            query_fingerprint=sha256(q.casefold().strip().encode("utf-8")).hexdigest()[:16],
+            latency_ms=0.0,
+            dense_hit_count=0,
+            keyword_hit_count=0,
+            alias_hit_count=0,
+            page_count=0,
+            no_answer=True,
+            threshold_filtered_count=0,
+            reranker_degraded=False,
+            degradation_reason="wiki_search_cursor_expired",
+            cursor_expired=True,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "wiki_search_cursor_expired", "message": "Wiki search cursor expired"},
+        ) from None
     except ValueError:
         raise HTTPException(
             status_code=422,

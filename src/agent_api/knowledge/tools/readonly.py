@@ -72,6 +72,7 @@ class ListInput(BaseModel):
 class WikiSearchInput(BaseModel):
     query: str = Field(min_length=1, max_length=200)
     knowledge_base_ids: list[UUID] = Field(default_factory=list, max_length=20)
+    cursor: str | None = Field(default=None, max_length=2048)
 
 
 class WikiReadInput(BaseModel):
@@ -191,19 +192,36 @@ def create_knowledge_tools(
         return result
 
     @tool("wiki_search", args_schema=WikiSearchInput)
-    async def wiki_search(query: str, knowledge_base_ids: list[UUID] | None = None) -> str:
+    async def wiki_search(
+        query: str,
+        knowledge_base_ids: list[UUID] | None = None,
+        cursor: str | None = None,
+    ) -> str:
         """搜索当前范围内启用的 Wiki，只返回有有效原文证据的结论。"""
 
         scope_ids = _scope(knowledge_base_ids)
         if scope_ids is None:
             return json.dumps({"status": "knowledge_scope_unavailable"})
         try:
-            result = await wiki_retrieval.search(query, scope_ids)
+            result = await wiki_retrieval.search(query, scope_ids, cursor=cursor)
         except Exception:
             return json.dumps({"status": "retrieval_unavailable"})
         turn = current_turn.get()
         assert turn is not None
         turn.degraded |= result.degraded
+        if result.no_answer:
+            return json.dumps(
+                {
+                    "status": "no_relevant_knowledge",
+                    "message": "Wiki 中没有足够相关且可核验的知识",
+                    "pages": [],
+                    "degraded": result.degraded,
+                    "degradation_reason": result.degradation_reason,
+                    "no_answer_reason": result.no_answer_reason,
+                    "next_cursor": result.next_cursor,
+                },
+                ensure_ascii=False,
+            )
         pages: list[dict[str, object]] = []
         for page in result.pages:
             claims = [
@@ -232,6 +250,7 @@ def create_knowledge_tools(
                 "degraded": result.degraded,
                 "degradation_reason": result.degradation_reason,
                 "truncation_reason": result.truncation_reason,
+                "next_cursor": result.next_cursor,
             },
             ensure_ascii=False,
         )

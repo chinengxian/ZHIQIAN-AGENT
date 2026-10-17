@@ -608,6 +608,10 @@ class WikiPageVersion(Base):
     __table_args__ = (
         UniqueConstraint("page_id", "version_no", name="uq_wiki_page_version_no"),
         Index("ix_wiki_versions_page_review", "page_id", "review_state"),
+        CheckConstraint(
+            "index_state IN ('not_required', 'pending', 'indexing', 'ready', 'failed')",
+            name="ck_wiki_page_version_index_state",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -624,6 +628,28 @@ class WikiPageVersion(Base):
     base_published_version_id: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), nullable=True
     )
+    index_state: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="not_required",
+        server_default="not_required",
+        comment="独立向量索引生命周期状态；历史版本默认无需索引。",
+    )
+    embedding_fingerprint: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="成功索引或待索引时使用的 Embedding 配置指纹。",
+    )
+    indexed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="独立向量索引最近一次成功完成的时间。",
+    )
+    index_error_code: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="独立索引失败时的稳定错误码。",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -636,7 +662,8 @@ class WikiClaim(Base):
     __table_args__ = (
         UniqueConstraint("page_version_id", "claim_key", name="uq_wiki_claim_version_key"),
         CheckConstraint(
-            "claim_type IN ('summary_fact', 'topic_fact', 'source_excerpt', 'manual')",
+            "claim_type IN ('summary_section', 'summary_fact', 'topic_fact', "
+            "'source_excerpt', 'manual')",
             name="ck_wiki_claim_type",
         ),
     )
@@ -698,13 +725,31 @@ class WikiJob(TimestampMixin, Base):
     """可重试且可恢复的 Wiki 生成任务。"""
 
     __tablename__ = "wiki_jobs"
-    __table_args__ = (Index("ix_wiki_jobs_status_heartbeat", "status", "heartbeat_at"),)
+    __table_args__ = (
+        Index("ix_wiki_jobs_status_heartbeat", "status", "heartbeat_at"),
+        Index("ix_wiki_jobs_page_version_status", "page_version_id", "status"),
+    )
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     knowledge_base_id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False
     )
     document_version_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    page_version_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey(
+            "wiki_page_versions.id",
+            name="fk_wiki_jobs_page_version_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        comment="独立索引任务关联的 Wiki 页面版本；版本删除时保留任务记录。",
+    )
+    embedding_fingerprint: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="任务使用的 Embedding 配置指纹。",
+    )
     job_type: Mapped[str] = mapped_column(String(24), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending")
     stage: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
@@ -716,6 +761,11 @@ class WikiJob(TimestampMixin, Base):
     reserved_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_reference: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="任务失败参考号，用于排查且避免暴露内部异常。",
+    )
     idempotency_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
 
 

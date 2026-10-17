@@ -1,6 +1,8 @@
-from uuid import UUID
+import importlib
+from uuid import UUID, uuid4
 
 import pytest
+from celery.exceptions import Retry
 from pydantic import AnyHttpUrl, SecretStr
 
 from agent_api.core.config import ModelProvider, Settings
@@ -116,5 +118,231 @@ def test_celery_factory_uses_json_and_schedules_outbox_dispatch() -> None:
     assert app.conf.beat_schedule["recover-stale-ingestion-jobs"]["task"] == (
         "agent_api.knowledge.recover_stale_jobs"
     )
+    assert app.conf.beat_schedule["recover-stale-wiki-index-jobs"]["task"] == (
+        "agent_api.knowledge.recover_stale_wiki_index_jobs"
+    )
+    assert app.conf.beat_schedule["recover-stale-wiki-index-jobs"]["schedule"] == 60.0
     # 日志应记录 Celery 应用身份而不是展开包含 broker 凭据的内部配置对象。
     assert "queue-secret" not in repr(app)
+
+
+async def test_wiki_worker_assembles_index_and_delete_events_without_deleting_pg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """索引事件装配完整服务；删除事件只清 Milvus 单元并关闭资源。"""
+
+    worker_settings = Settings(
+        model_provider=ModelProvider.OPENAI,
+        openai_base_url=AnyHttpUrl("https://example.test/v1"),
+        openai_api_key=SecretStr("test-secret"),
+        openai_model="test-model",
+        _env_file=None,  # type: ignore[call-arg]
+    )
+    monkeypatch.setattr("agent_api.core.config.get_settings", lambda: worker_settings)
+    module = importlib.import_module("agent_api.knowledge.worker.celery_app")
+    calls: list[tuple[str, UUID | None]] = []
+
+    class _Database:
+        session_factory = object()
+
+        def __init__(self, url: str) -> None:
+            del url
+            calls.append(("database_open", None))
+
+        async def close(self) -> None:
+            calls.append(("database_close", None))
+
+    class _Milvus:
+        def __init__(self, **kwargs: str) -> None:
+            del kwargs
+            calls.append(("milvus_open", None))
+
+        def close(self) -> None:
+            calls.append(("milvus_close", None))
+
+    class _Index:
+        def __init__(self, client: object, **kwargs: str) -> None:
+            del client, kwargs
+
+        async def delete_page_version(self, version_id: UUID) -> None:
+            calls.append(("delete", version_id))
+
+    class _Repository:
+        def __init__(self, sessions: object, *, embedding_dimension: int) -> None:
+            del sessions, embedding_dimension
+
+    class _Service:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        async def run(self, job_id: UUID) -> None:
+            calls.append(("run", job_id))
+
+    monkeypatch.setattr(module, "DatabaseRuntime", _Database)
+    monkeypatch.setattr(module, "MilvusClient", _Milvus)
+    monkeypatch.setattr(module, "MilvusWikiIndex", _Index)
+    monkeypatch.setattr(module, "SqlAlchemyWikiIndexRepository", _Repository)
+    monkeypatch.setattr(module, "WikiIndexService", _Service)
+    monkeypatch.setattr(module, "create_embedding_adapter", lambda _: object())
+
+    await module._process_event(
+        OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
+        {"job_id": str(JOB_ID)},
+    )
+    await module._process_event(
+        OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED,
+        {"page_version_id": str(VERSION_ID)},
+    )
+
+    async def _recover(_: object) -> int:
+        calls.append(("recover", None))
+        return 2
+
+    monkeypatch.setattr(module, "recover_stale_page_index_jobs", _recover)
+    assert await module._recover_stale_wiki_index_jobs() == 2
+
+    assert ("run", JOB_ID) in calls
+    assert ("delete", VERSION_ID) in calls
+    assert ("recover", None) in calls
+    assert calls.count(("database_close", None)) == 3
+    assert calls.count(("milvus_close", None)) == 2
+
+
+async def test_wiki_index_setup_failures_are_persisted_and_resources_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_settings = Settings(
+        model_provider=ModelProvider.OPENAI,
+        openai_base_url=AnyHttpUrl("https://example.test/v1"),
+        openai_api_key=SecretStr("test-secret"),
+        openai_model="test-model",
+        _env_file=None,  # type: ignore[call-arg]
+    )
+    monkeypatch.setattr("agent_api.core.config.get_settings", lambda: worker_settings)
+    module = importlib.import_module("agent_api.knowledge.worker.celery_app")
+    calls: list[str] = []
+
+    class _Database:
+        session_factory = object()
+
+        def __init__(self, url: str) -> None:
+            del url
+
+        async def close(self) -> None:
+            calls.append("database_close")
+
+    class _BrokenMilvus:
+        def __init__(self, **kwargs: str) -> None:
+            del kwargs
+            raise RuntimeError("secret-milvus-error")
+
+    async def _record(
+        sessions: object,
+        job_id: UUID,
+        *,
+        stage: str,
+        error: BaseException,
+    ) -> None:
+        del sessions, job_id, error
+        calls.append(f"record:{stage}")
+
+    monkeypatch.setattr(module, "DatabaseRuntime", _Database)
+    monkeypatch.setattr(module, "MilvusClient", _BrokenMilvus)
+    monkeypatch.setattr(module, "record_page_index_setup_failure", _record)
+
+    await module._process_event(
+        OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
+        {"job_id": str(JOB_ID)},
+    )
+
+    assert calls == ["record:milvus_setup", "database_close"]
+
+    class _Milvus:
+        def __init__(self, **kwargs: str) -> None:
+            del kwargs
+
+        def close(self) -> None:
+            calls.append("milvus_close")
+
+    monkeypatch.setattr(module, "MilvusClient", _Milvus)
+    monkeypatch.setattr(
+        module,
+        "create_embedding_adapter",
+        lambda _: (_ for _ in ()).throw(RuntimeError("secret-embedding-error")),
+    )
+    await module._process_event(
+        OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
+        {"job_id": str(JOB_ID)},
+    )
+
+    assert "record:embedding_setup" in calls
+    assert calls.count("database_close") == 2
+    assert "milvus_close" in calls
+
+
+async def test_wiki_delete_failure_is_retried_and_database_failure_uses_celery_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_settings = Settings(
+        model_provider=ModelProvider.OPENAI,
+        openai_base_url=AnyHttpUrl("https://example.test/v1"),
+        openai_api_key=SecretStr("test-secret"),
+        openai_model="test-model",
+        _env_file=None,  # type: ignore[call-arg]
+    )
+    monkeypatch.setattr("agent_api.core.config.get_settings", lambda: worker_settings)
+    module = importlib.import_module("agent_api.knowledge.worker.celery_app")
+    calls: list[str] = []
+
+    class _Database:
+        session_factory = object()
+
+        def __init__(self, url: str) -> None:
+            del url
+
+        async def close(self) -> None:
+            calls.append("database_close")
+
+    class _Milvus:
+        def __init__(self, **kwargs: str) -> None:
+            del kwargs
+
+        def close(self) -> None:
+            calls.append("milvus_close")
+
+    class _BrokenDeleteIndex:
+        def __init__(self, client: object, **kwargs: str) -> None:
+            del client, kwargs
+
+        async def delete_page_version(self, version_id: UUID) -> None:
+            del version_id
+            raise RuntimeError("secret-delete-error")
+
+    monkeypatch.setattr(module, "DatabaseRuntime", _Database)
+    monkeypatch.setattr(module, "MilvusClient", _Milvus)
+    monkeypatch.setattr(module, "MilvusWikiIndex", _BrokenDeleteIndex)
+    with pytest.raises(module.WikiIndexWorkerError, match="wiki_index_delete_failed"):
+        await module._process_event(
+            OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED,
+            {"page_version_id": str(VERSION_ID)},
+        )
+    assert calls == ["milvus_close", "database_close"]
+
+    def _run_and_fail(coroutine: object) -> None:
+        coroutine.close()  # type: ignore[attr-defined]
+        raise module.WikiIndexWorkerError("wiki_index_database_unavailable")
+
+    def _retry(**kwargs: object) -> None:
+        assert kwargs["countdown"] == 2
+        assert kwargs["max_retries"] == 5
+        raise Retry("wiki retry")
+
+    monkeypatch.setattr(module.asyncio, "run", _run_and_fail)
+    monkeypatch.setattr(module.process_event, "retry", _retry)
+    with pytest.raises(Retry):
+        module.process_event.run(
+            event_id=str(uuid4()),
+            event_type=OutboxEventType.WIKI_PAGE_INDEX_REQUESTED.value,
+            aggregate_id=str(JOB_ID),
+            payload={"job_id": str(JOB_ID)},
+        )

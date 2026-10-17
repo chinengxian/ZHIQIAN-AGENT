@@ -1,23 +1,33 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from celery import Task  # type: ignore[import-untyped]
+from pymilvus import MilvusClient  # type: ignore[import-untyped]
 
 from agent_api.core.config import get_settings
 from agent_api.knowledge.application.ingestion import IngestionPipelineError
 from agent_api.knowledge.domain.events import OutboxEventType
 from agent_api.knowledge.infrastructure.database.runtime import DatabaseRuntime
+from agent_api.knowledge.infrastructure.embedding.embedding import create_embedding_adapter
 from agent_api.knowledge.infrastructure.jobs.outbox import (
     CeleryEventPublisher,
     OutboxDispatcher,
     SqlAlchemyOutboxRepository,
 )
 from agent_api.knowledge.infrastructure.jobs.repository import SqlAlchemyIngestionRepository
+from agent_api.knowledge.infrastructure.milvus import MilvusWikiIndex
 from agent_api.knowledge.infrastructure.storage.local import LocalFileStorage
 from agent_api.knowledge.wiki.generator import ChatWikiGenerator
+from agent_api.knowledge.wiki.index_jobs import (
+    SqlAlchemyWikiIndexRepository,
+    record_page_index_setup_failure,
+    recover_stale_page_index_jobs,
+)
+from agent_api.knowledge.wiki.indexing import WikiIndexService, embedding_fingerprint
 from agent_api.knowledge.wiki.processor import WikiProcessor
 from agent_api.knowledge.worker.celery_factory import create_celery_app
 from agent_api.knowledge.worker.runtime import KnowledgeWorkerRuntime, handle_event
@@ -25,6 +35,14 @@ from agent_api.llm.strategy import STRATEGIES
 
 settings = get_settings()
 app = create_celery_app(settings)
+
+
+class WikiIndexWorkerError(RuntimeError):
+    """只暴露稳定错误码的 Wiki 索引 Worker 异常。"""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 async def _process_event(event_type: OutboxEventType, payload: dict[str, object]) -> None:
@@ -38,11 +56,80 @@ async def _process_event(event_type: OutboxEventType, payload: dict[str, object]
                 else settings.anthropic_model
             ) or "configured-model"
             processor = WikiProcessor(
-                database.session_factory, ChatWikiGenerator(model, model_name)
+                database.session_factory,
+                ChatWikiGenerator(model, model_name),
+                index_enabled=settings.wiki_index_enabled,
+                embedding_fingerprint=embedding_fingerprint(settings),
             )
             await processor.run(UUID(str(payload["job_id"])))
         finally:
             await database.close()
+        return
+    if event_type in {
+        OutboxEventType.WIKI_PAGE_INDEX_REQUESTED,
+        OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED,
+    }:
+        wiki_database: DatabaseRuntime | None = None
+        wiki_milvus: MilvusClient | None = None
+        stage = "database_setup"
+        job_id: UUID | None = None
+        try:
+            if event_type is OutboxEventType.WIKI_PAGE_INDEX_REQUESTED:
+                job_id = UUID(str(payload["job_id"]))
+            wiki_database = DatabaseRuntime(settings.database_url.get_secret_value())
+            token = settings.milvus_token.get_secret_value() if settings.milvus_token else None
+            options: dict[str, str] = {"uri": settings.milvus_uri}
+            if token:
+                options["token"] = token
+            stage = "milvus_setup"
+            wiki_milvus = await asyncio.to_thread(MilvusClient, **options)
+            index = MilvusWikiIndex(
+                wiki_milvus,
+                search_collection=settings.wiki_milvus_collection_alias,
+                write_collection=settings.wiki_milvus_collection_version,
+            )
+            if event_type is OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED:
+                stage = "delete"
+                await index.delete_page_version(UUID(str(payload["page_version_id"])))
+                return
+            stage = "repository_setup"
+            repository = SqlAlchemyWikiIndexRepository(
+                wiki_database.session_factory,
+                embedding_dimension=settings.embedding_dimension,
+            )
+            stage = "embedding_setup"
+            embedder = create_embedding_adapter(settings)
+            stage = "service_setup"
+            service = WikiIndexService(
+                repository=repository,
+                embedder=embedder,
+                index=index,
+                embedding_dimension=settings.embedding_dimension,
+            )
+            stage = "service_run"
+            assert job_id is not None
+            await service.run(job_id)
+        except Exception as error:
+            if event_type is OutboxEventType.WIKI_PAGE_INDEX_DELETE_REQUESTED:
+                raise WikiIndexWorkerError("wiki_index_delete_failed") from None
+            if wiki_database is None or job_id is None:
+                raise WikiIndexWorkerError("wiki_index_database_unavailable") from None
+            try:
+                await record_page_index_setup_failure(
+                    wiki_database.session_factory,
+                    job_id,
+                    stage=stage,
+                    error=error,
+                )
+            except Exception:
+                raise WikiIndexWorkerError("wiki_index_failure_persist_failed") from None
+        finally:
+            if wiki_milvus is not None:
+                with suppress(Exception):
+                    await asyncio.to_thread(wiki_milvus.close)
+            if wiki_database is not None:
+                with suppress(Exception):
+                    await wiki_database.close()
         return
     async with KnowledgeWorkerRuntime(settings) as runtime:
         if runtime.pipeline is None:
@@ -65,7 +152,7 @@ async def _schedule_durable_retry(job_id: UUID, *, delay_seconds: int) -> None:
 @app.task(  # type: ignore[untyped-decorator]
     bind=True,
     name="agent_api.knowledge.process_event",
-    max_retries=3,
+    max_retries=5,
 )
 def process_event(
     task: Task,
@@ -91,6 +178,14 @@ def process_event(
         except Exception:
             # PostgreSQL 不可用时，先利用 Celery 自身的重试维持任务存活。
             raise task.retry(exc=RuntimeError(error.code), countdown=countdown) from None
+    except WikiIndexWorkerError as error:
+        # PostgreSQL 本身不可用或删除失败时，使用 Celery 的有限退避兜底。
+        countdown = min(300, 2 ** min(task.request.retries + 1, 8))
+        raise task.retry(
+            exc=RuntimeError(error.code),
+            countdown=countdown,
+            max_retries=5,
+        ) from None
 
 
 async def _dispatch_outbox() -> int:
@@ -147,3 +242,18 @@ def recover_stale_wiki_jobs() -> int:
     """周期恢复 Wiki Worker 崩溃后遗留的任务。"""
 
     return asyncio.run(_recover_stale_wiki_jobs())
+
+
+async def _recover_stale_wiki_index_jobs() -> int:
+    database = DatabaseRuntime(settings.database_url.get_secret_value())
+    try:
+        return await recover_stale_page_index_jobs(database.session_factory)
+    finally:
+        await database.close()
+
+
+@app.task(name="agent_api.knowledge.recover_stale_wiki_index_jobs")  # type: ignore[untyped-decorator]
+def recover_stale_wiki_index_jobs() -> int:
+    """每分钟恢复心跳超过五分钟的 Wiki 页面索引任务。"""
+
+    return asyncio.run(_recover_stale_wiki_index_jobs())

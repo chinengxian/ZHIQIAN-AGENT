@@ -177,11 +177,35 @@
       ],
       "expected_documents": ["02-identity-access-control.md", "07-security-incident-response.md"],
       "expected_terms": ["证据移交", "双人签字", "应急账号", "不能推断所有事件工单"],
-      "forbidden_terms": ["所有事件工单都需要两人签字"],
+      "forbidden_terms": ["所有事件工单必须双人签字"],
       "answerable": true
     },
     {
       "id": "Q16",
+      "queries": [
+        "公司内部是否有火星办公室入网白名单政策？",
+        "查找火星办公室网络准入流程和审批人",
+        "不存在的内部政策：火星办公室白名单规则是什么？"
+      ],
+      "expected_documents": [],
+      "expected_terms": [],
+      "forbidden_terms": ["火星办公室", "白名单政策为", "审批人是"],
+      "answerable": false
+    },
+    {
+      "id": "Q17",
+      "queries": [
+        "宇宙密码是多少？",
+        "这些 IT 制度里有没有记录宇宙终极密码？",
+        "查找宇宙密码、星际密钥和银河访问口令"
+      ],
+      "expected_documents": [],
+      "expected_terms": [],
+      "forbidden_terms": ["宇宙密码是", "银河访问口令"],
+      "answerable": false
+    },
+    {
+      "id": "Q18",
       "queries": [
         "企业购买的网络安全保险年度保费是多少？",
         "公司的网络安全险供应商和每年费用是什么？",

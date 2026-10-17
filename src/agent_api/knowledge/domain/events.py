@@ -14,3 +14,7 @@ class OutboxEventType(StrEnum):
     KNOWLEDGE_BASE_DELETION_REQUESTED = "knowledge_base.deletion.requested"
     # 请求根据活动文档版本生成或恢复 Wiki 内容。
     WIKI_DOCUMENT_GENERATE_REQUESTED = "wiki.document.generate.requested"
+    # 请求为一个已发布 Wiki 页面版本构建独立语义索引。
+    WIKI_PAGE_INDEX_REQUESTED = "wiki.page.index.requested"
+    # 请求清理一个历史 Wiki 页面版本在 Milvus 中的可重建单元。
+    WIKI_PAGE_INDEX_DELETE_REQUESTED = "wiki.page.index.delete.requested"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import unicodedata
@@ -7,12 +8,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from time import perf_counter
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent_api.core.config import WikiSearchBackend
 from agent_api.knowledge.application.citations import Source
 from agent_api.knowledge.application.management import DEFAULT_WORKSPACE_ID
 from agent_api.knowledge.infrastructure.database.models import (
@@ -26,9 +28,14 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiPageAlias,
     WikiPageVersion,
 )
+from agent_api.knowledge.infrastructure.observability.events import record_wiki_shadow_diff
+from agent_api.knowledge.wiki.cursor import WikiCursorError
 from agent_api.knowledge.wiki.ranking import reciprocal_rank_fusion, select_mmr
+from agent_api.knowledge.wiki.read_model import VerifiedWikiClaim, WikiReadModel
 
 logger = logging.getLogger(__name__)
+
+RETRIEVABLE_CLAIM_TYPES = ("summary_fact", "topic_fact")
 
 
 class SourceRetrieval(Protocol):
@@ -50,6 +57,31 @@ class WikiRetrievalError(RuntimeError):
     """Wiki 检索无法安全降级时返回稳定错误码。"""
 
 
+class WikiIndependentRetrieval(Protocol):
+    async def search(
+        self,
+        query: str,
+        scope_ids: tuple[UUID, ...],
+        *,
+        mode: str = "hybrid",
+        page_limit: int = 5,
+        claim_limit: int = 12,
+        cursor: str | None = None,
+    ) -> WikiSearchResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class WikiMatchedPageSummary:
+    id: UUID
+    knowledge_base_id: UUID
+    slug: str
+    title: str
+    page_type: str
+    current_version_id: UUID | None = None
+    index_state: str = "not_required"
+    index_error_code: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class WikiMatchedClaim:
     id: UUID
@@ -58,6 +90,7 @@ class WikiMatchedClaim:
     claim_type: str
     score: float
     sources: tuple[Source, ...]
+    also_in_pages: tuple[WikiMatchedPageSummary, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +112,24 @@ class WikiSearchResult:
     degraded: bool
     degradation_reason: str | None
     truncation_reason: str | None
+    no_answer: bool = False
+    no_answer_reason: str | None = None
+    next_cursor: str | None = None
+    collection_version: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WikiShadowMetrics:
+    query_fingerprint: str
+    legacy_page_ids: tuple[UUID, ...]
+    independent_page_ids: tuple[UUID, ...]
+    legacy_claim_ids: tuple[UUID, ...]
+    independent_claim_ids: tuple[UUID, ...]
+    legacy_elapsed_ms: float | None
+    independent_elapsed_ms: float | None
+    legacy_no_answer: bool
+    independent_no_answer: bool | None
+    independent_degradation_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +151,28 @@ class _PageRecord:
     summary: str
     aliases: tuple[str, ...]
     claims: tuple[_ClaimRecord, ...]
+
+
+def _search_source_response(source: Any) -> Source:
+    return Source(
+        citation_id="",
+        chunk_id=source.chunk_id,
+        document_id=source.document_id,
+        document_version_id=source.document_version_id,
+        title=source.document_title,
+        filename=source.filename,
+        page_start=source.page_start,
+        page_end=source.page_end,
+        heading_path=source.heading_path,
+        excerpt=source.excerpt,
+        score=0.0,
+        rank=0,
+        parent_chunk_id=source.parent_chunk_id,
+        focus_start=source.focus_start,
+        focus_end=source.focus_end,
+        valid=source.valid,
+        invalid_reason=source.invalid_reason,
+    )
 
 
 def _normalize_query(value: str) -> str:
@@ -128,14 +201,14 @@ def _escape_like_pattern(value: str) -> str:
 
 
 def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
-    title_score = func.similarity(func.lower(WikiPage.title), query)
-    summary_score = func.similarity(func.lower(WikiPageVersion.summary), query)
-    alias_similarity = func.similarity(func.lower(WikiPageAlias.alias), query)
-    alias_score = func.coalesce(func.max(alias_similarity), 0.0)
-    alias_matched = func.coalesce(func.bool_or(alias_similarity > 0.1), False)
-    alias_exact = func.coalesce(
-        func.bool_or(func.lower(WikiPageAlias.alias) == query), False
+    title_matched = func.lower(WikiPage.title).like(f"{_escape_like_pattern(query)}%", escape="\\")
+    alias_matched = func.coalesce(
+        func.bool_or(
+            func.lower(WikiPageAlias.alias).like(f"{_escape_like_pattern(query)}%", escape="\\")
+        ),
+        False,
     )
+    alias_exact = func.coalesce(func.bool_or(func.lower(WikiPageAlias.alias) == query), False)
     slug_query = query.replace(" ", "-")
     slug_matched = func.lower(WikiPage.slug).like(
         f"{_escape_like_pattern(slug_query)}%", escape="\\"
@@ -143,19 +216,15 @@ def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
     exact_match = or_(
         func.lower(WikiPage.title) == query,
         alias_exact,
-        func.lower(WikiPage.slug) == slug_query,
     )
-    relevance = func.greatest(title_score, summary_score, alias_score)
     return (
         select(
             WikiPage.id,
             WikiPage.title,
             WikiPage.slug,
-            WikiPageVersion.summary,
-            title_score.label("title_score"),
-            summary_score.label("summary_score"),
-            alias_score.label("alias_score"),
+            title_matched.label("title_matched"),
             alias_matched.label("alias_matched"),
+            slug_matched.label("slug_matched"),
             exact_match.label("exact_match"),
         )
         .join(
@@ -173,9 +242,9 @@ def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
             KnowledgeBase.enabled.is_(True),
             WikiConfig.enabled.is_(True),
             or_(
-                title_score > 0.1,
-                summary_score > 0.1,
-                alias_similarity > 0.1,
+                title_matched,
+                alias_matched,
+                alias_exact,
                 slug_matched,
             ),
         )
@@ -183,19 +252,19 @@ def _build_metadata_statement(query: str, scope_ids: tuple[UUID, ...]) -> Any:
             WikiPage.id,
             WikiPage.title,
             WikiPage.slug,
-            WikiPageVersion.summary,
         )
         .order_by(
             exact_match.desc(),
             slug_matched.desc(),
-            relevance.desc(),
+            title_matched.desc(),
+            alias_matched.desc(),
             WikiPage.id,
         )
         .limit(200)
     )
 
 
-class WikiRetrievalService:
+class LegacyWikiRetrievalService:
     """融合页面元数据和原文 chunk 命中，返回当前且可追溯的 Wiki 事实。"""
 
     def __init__(
@@ -233,9 +302,7 @@ class WikiRetrievalService:
         started = perf_counter()
         fingerprint = sha256(normalized.encode()).hexdigest()[:16]
         try:
-            metadata_ids, metadata_fields = await self._metadata_page_ids(
-                normalized, scope_ids
-            )
+            metadata_ids, metadata_fields = await self._metadata_page_ids(normalized, scope_ids)
         except Exception as error:
             raise WikiRetrievalError("wiki_retrieval_unavailable") from error
 
@@ -384,10 +451,10 @@ class WikiRetrievalService:
         ranks = source_ranks or {}
         scored: list[tuple[_ClaimRecord, float, str]] = []
         for claim in claims:
+            if claim.claim_type not in RETRIEVABLE_CLAIM_TYPES:
+                continue
             matched = [
-                ranks[source.chunk_id]
-                for source in claim.sources
-                if source.chunk_id in ranks
+                ranks[source.chunk_id] for source in claim.sources if source.chunk_id in ranks
             ]
             source_score = 1.0 / min(matched) if matched else 0.0
             lexical = _text_relevance(query, claim.text)
@@ -418,7 +485,10 @@ class WikiRetrievalService:
                 raise ValueError("invalid_wiki_query")
             claims = [claim for claim, _ in self.rank_page_claims(normalized, page.claims)]
         else:
-            claims = sorted(page.claims, key=lambda claim: (claim.position, claim.id))
+            claims = sorted(
+                (claim for claim in page.claims if claim.claim_type in RETRIEVABLE_CLAIM_TYPES),
+                key=lambda claim: (claim.position, claim.id),
+            )
         selected = claims[cursor : cursor + limit]
         next_cursor = cursor + len(selected) if cursor + len(selected) < len(claims) else None
         return {
@@ -435,36 +505,13 @@ class WikiRetrievalService:
         query: str,
         scope_ids: tuple[UUID, ...],
     ) -> tuple[list[UUID], dict[UUID, tuple[str, ...]]]:
-        slug_query = query.replace(" ", "-")
         async with self._sessions() as session:
-            rows = list((await session.execute(_build_metadata_statement(query, scope_ids))).all())
-        page_scores: dict[UUID, float] = {}
+            hits = await WikiReadModel(session).search_metadata(query, scope_ids, limit=40)
         matched: dict[UUID, list[str]] = {}
-        exact: dict[UUID, bool] = {}
-        for row in rows:
-            fields = matched.setdefault(row.id, [])
-            if row.title_score > 0.1:
-                fields.append("title")
-            if row.summary_score > 0.1:
-                fields.append("summary")
-            if row.alias_matched:
-                fields.append("alias")
-            if row.slug.casefold().startswith(slug_query):
-                fields.append("slug")
-            page_scores[row.id] = max(
-                page_scores.get(row.id, 0.0),
-                float(row.title_score or 0),
-                float(row.summary_score or 0),
-                float(row.alias_score or 0),
-            )
-            exact[row.id] = bool(row.exact_match)
-        ordered = sorted(
-            page_scores,
-            key=lambda page_id: (-int(exact[page_id]), -page_scores[page_id], str(page_id)),
-        )[:40]
-        return ordered, {
-            page_id: tuple(dict.fromkeys(matched[page_id])) for page_id in ordered
-        }
+        for hit in hits:
+            matched.setdefault(hit.page_id, []).append(hit.matched_field)
+        ordered = [hit.page_id for hit in hits]
+        return ordered, {page_id: tuple(dict.fromkeys(matched[page_id])) for page_id in ordered}
 
     async def _source_page_ids(
         self,
@@ -500,6 +547,7 @@ class WikiRetrievalService:
                             WikiPage.knowledge_base_id.in_(scope_ids),
                             WikiPage.deleted_at.is_(None),
                             WikiClaim.trust_state == "verified",
+                            WikiClaim.claim_type.in_(RETRIEVABLE_CLAIM_TYPES),
                             WikiClaimSource.chunk_id.in_(tuple(source_order)),
                             Document.active_version_id == WikiClaimSource.document_version_id,
                             Document.knowledge_base_id == WikiPage.knowledge_base_id,
@@ -562,74 +610,48 @@ class WikiRetrievalService:
                     )
                 ).all()
             )
-            source_rows = list(
-                (
-                    await session.execute(
-                        select(WikiClaim, WikiClaimSource, Document, Chunk)
-                        .join(WikiPageVersion, WikiClaim.page_version_id == WikiPageVersion.id)
-                        .join(WikiPage, WikiPage.current_version_id == WikiPageVersion.id)
-                        .join(WikiClaimSource, WikiClaimSource.claim_id == WikiClaim.id)
-                        .join(Document, Document.id == WikiClaimSource.document_id)
-                        .join(Chunk, Chunk.id == WikiClaimSource.chunk_id)
-                        .where(
-                            WikiPage.id.in_(page_ids),
-                            WikiClaim.trust_state == "verified",
-                            Document.active_version_id == WikiClaimSource.document_version_id,
-                            Document.knowledge_base_id == WikiPage.knowledge_base_id,
-                            Document.status == "ready",
-                            Document.deleted_at.is_(None),
-                        )
-                        .order_by(WikiClaim.position, WikiClaim.id)
+            claim_ids = tuple(
+                await session.scalars(
+                    select(WikiClaim.id)
+                    .join(WikiPageVersion, WikiClaim.page_version_id == WikiPageVersion.id)
+                    .join(WikiPage, WikiPage.current_version_id == WikiPageVersion.id)
+                    .where(
+                        WikiPage.id.in_(page_ids),
+                        WikiClaim.trust_state == "verified",
+                        WikiClaim.claim_type.in_(RETRIEVABLE_CLAIM_TYPES),
                     )
-                ).all()
+                    .order_by(WikiClaim.position, WikiClaim.id)
+                )
+            )
+            verified_claims = await WikiReadModel(session).load_verified_claims(
+                claim_ids,
+                scope_ids=scope_ids,
+                require_index_ready=False,
             )
         aliases_by_page: dict[UUID, list[str]] = {}
         for page_id, alias in aliases:
             aliases_by_page.setdefault(page_id, []).append(alias)
-        claim_sources: dict[UUID, list[Source]] = {}
-        claims: dict[UUID, WikiClaim] = {}
-        for claim, source, document, chunk in source_rows:
-            if (
-                source.chunk_kind != chunk.kind
-                or source.chunk_ordinal != chunk.ordinal
-                or sha256(chunk.content.encode()).hexdigest() != source.content_sha256
-            ):
-                continue
-            claims[claim.id] = claim
-            claim_sources.setdefault(claim.id, []).append(
-                Source(
-                    citation_id="",
-                    chunk_id=chunk.id,
-                    document_id=document.id,
-                    document_version_id=chunk.document_version_id,
-                    title=document.title,
-                    filename=document.filename,
-                    page_start=chunk.page_start,
-                    page_end=chunk.page_end,
-                    heading_path=tuple(chunk.heading_path),
-                    excerpt=chunk.content[:500],
-                    score=0.0,
-                    rank=0,
-                )
-            )
+        claims_by_version: dict[UUID, list[VerifiedWikiClaim]] = {}
+        for claim in verified_claims:
+            if claim.valid:
+                claims_by_version.setdefault(claim.page_version_id, []).append(claim)
         records: dict[UUID, _PageRecord] = {}
         for page, version in page_rows:
             page_claims = tuple(
                 _ClaimRecord(
-                    id=claim.id,
+                    id=claim.claim_id,
                     text=claim.text,
                     position=claim.position,
                     claim_type=claim.claim_type,
-                    sources=tuple(claim_sources[claim.id]),
+                    sources=tuple(
+                        _search_source_response(source) for source in claim.sources if source.valid
+                    ),
                 )
                 for claim in sorted(
-                    (
-                        item
-                        for item in claims.values()
-                        if item.page_version_id == version.id and item.id in claim_sources
-                    ),
-                    key=lambda item: (item.position, str(item.id)),
+                    claims_by_version.get(version.id, []),
+                    key=lambda item: (item.position, str(item.claim_id)),
                 )
+                if any(source.valid for source in claim.sources)
             )
             records[page.id] = _PageRecord(
                 id=page.id,
@@ -677,3 +699,185 @@ class WikiRetrievalService:
             degradation_reason,
             elapsed_ms,
         )
+
+
+class WikiRetrievalService:
+    """按配置在 legacy、独立检索和 shadow 模式之间路由。"""
+
+    def __init__(
+        self,
+        legacy: LegacyWikiRetrievalService | async_sessionmaker[AsyncSession],
+        independent: WikiIndependentRetrieval | SourceRetrieval | None = None,
+        reranker: WikiReranker | None = None,
+        *,
+        backend: WikiSearchBackend = WikiSearchBackend.LEGACY,
+    ) -> None:
+        # 兼容旧测试和旧调用方：传 sessions/source_retrieval 时自动包成 legacy。
+        if isinstance(legacy, LegacyWikiRetrievalService) or (
+            hasattr(legacy, "search") and not callable(legacy)
+        ):
+            self._legacy = legacy
+            self._independent = (
+                cast(WikiIndependentRetrieval, independent) if independent is not None else None
+            )
+        else:
+            if independent is None:
+                raise TypeError("legacy source retrieval is required")
+            self._legacy = LegacyWikiRetrievalService(
+                legacy,
+                cast(SourceRetrieval, independent),
+                reranker,
+            )
+            self._independent = None
+        self._backend = backend
+        self.last_shadow_metrics: WikiShadowMetrics | None = None
+
+    async def search(
+        self,
+        query: str,
+        scope_ids: tuple[UUID, ...],
+        *,
+        mode: str = "hybrid",
+        page_limit: int = 5,
+        claim_limit: int = 12,
+        cursor: str | None = None,
+        character_budget: int = 12_000,
+    ) -> WikiSearchResult:
+        if self._backend is WikiSearchBackend.LEGACY:
+            if cursor is not None:
+                raise WikiCursorError("wiki_search_cursor_expired")
+            return await self._legacy.search(
+                query,
+                scope_ids,
+                mode=mode,
+                page_limit=page_limit,
+                claim_limit=claim_limit,
+                character_budget=character_budget,
+            )
+        if self._backend is WikiSearchBackend.INDEPENDENT:
+            if self._independent is None:
+                raise WikiRetrievalError("wiki_retrieval_unavailable")
+            return await self._independent.search(
+                query,
+                scope_ids,
+                mode=mode,
+                page_limit=page_limit,
+                claim_limit=claim_limit,
+                cursor=cursor,
+            )
+        if self._independent is None:
+            return await self._legacy.search(
+                query,
+                scope_ids,
+                mode=mode,
+                page_limit=page_limit,
+                claim_limit=claim_limit,
+                character_budget=character_budget,
+            )
+        if cursor is not None:
+            raise WikiCursorError("wiki_search_cursor_expired")
+        legacy_started = perf_counter()
+        legacy_task = self._legacy.search(
+            query,
+            scope_ids,
+            mode=mode,
+            page_limit=page_limit,
+            claim_limit=claim_limit,
+            character_budget=character_budget,
+        )
+        independent_started = perf_counter()
+        independent_task = self._independent.search(
+            query,
+            scope_ids,
+            mode=mode,
+            page_limit=page_limit,
+            claim_limit=claim_limit,
+            cursor=None,
+        )
+        gathered: tuple[WikiSearchResult | BaseException, WikiSearchResult | BaseException]
+        gathered = await asyncio.gather(
+            legacy_task,
+            independent_task,
+            return_exceptions=True,
+        )
+        legacy_result, independent_result = gathered
+        legacy_elapsed = round((perf_counter() - legacy_started) * 1000, 2)
+        independent_elapsed = round((perf_counter() - independent_started) * 1000, 2)
+        if isinstance(legacy_result, BaseException):
+            raise legacy_result
+        self._log_shadow_diff(
+            query,
+            legacy_result,
+            independent_result,
+            legacy_elapsed,
+            independent_elapsed,
+        )
+        return legacy_result
+
+    async def read_page(
+        self,
+        knowledge_base_id: UUID,
+        page_id: UUID,
+        *,
+        query: str = "",
+        cursor: int = 0,
+        limit: int = 20,
+    ) -> dict[str, Any] | None:
+        return await self._legacy.read_page(
+            knowledge_base_id,
+            page_id,
+            query=query,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    def rank_page_claims(
+        self,
+        query: str,
+        claims: Sequence[_ClaimRecord],
+        source_ranks: dict[UUID, int] | None = None,
+    ) -> list[tuple[_ClaimRecord, float]]:
+        return self._legacy.rank_page_claims(query, claims, source_ranks)
+
+    def _log_shadow_diff(
+        self,
+        query: str,
+        legacy_result: WikiSearchResult,
+        independent_result: WikiSearchResult | BaseException,
+        legacy_elapsed_ms: float | None,
+        independent_elapsed_ms: float | None,
+    ) -> None:
+        fingerprint = sha256(_normalize_query(query).encode()).hexdigest()[:16]
+        legacy_page_ids = tuple(page.id for page in legacy_result.pages)
+        legacy_claim_ids = tuple(
+            claim.id for page in legacy_result.pages for claim in page.matched_claims
+        )
+        if isinstance(independent_result, BaseException):
+            self.last_shadow_metrics = WikiShadowMetrics(
+                query_fingerprint=fingerprint,
+                legacy_page_ids=legacy_page_ids,
+                independent_page_ids=(),
+                legacy_claim_ids=legacy_claim_ids,
+                independent_claim_ids=(),
+                legacy_elapsed_ms=legacy_elapsed_ms,
+                independent_elapsed_ms=independent_elapsed_ms,
+                legacy_no_answer=legacy_result.no_answer,
+                independent_no_answer=None,
+                independent_degradation_reason=type(independent_result).__name__,
+            )
+        else:
+            self.last_shadow_metrics = WikiShadowMetrics(
+                query_fingerprint=fingerprint,
+                legacy_page_ids=legacy_page_ids,
+                independent_page_ids=tuple(page.id for page in independent_result.pages),
+                legacy_claim_ids=legacy_claim_ids,
+                independent_claim_ids=tuple(
+                    claim.id for page in independent_result.pages for claim in page.matched_claims
+                ),
+                legacy_elapsed_ms=legacy_elapsed_ms,
+                independent_elapsed_ms=independent_elapsed_ms,
+                legacy_no_answer=legacy_result.no_answer,
+                independent_no_answer=independent_result.no_answer,
+                independent_degradation_reason=independent_result.degradation_reason,
+            )
+        record_wiki_shadow_diff(self.last_shadow_metrics)

@@ -39,6 +39,10 @@ def create_celery_app(settings: Settings) -> Celery:
                 "task": "agent_api.knowledge.recover_stale_wiki_jobs",
                 "schedule": 60.0,
             },
+            "recover-stale-wiki-index-jobs": {
+                "task": "agent_api.knowledge.recover_stale_wiki_index_jobs",
+                "schedule": 60.0,
+            },
         },
     )
     return app

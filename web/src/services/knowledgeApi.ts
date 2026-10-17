@@ -1,4 +1,4 @@
-import type { DocumentProgress, KnowledgeBase, KnowledgeDocument, WikiConfig, WikiJob, WikiPage, WikiPageSummary, WikiSearchResult, WikiVersion } from '../types/knowledge'
+import type { DocumentDetail, DocumentPreview, DocumentProgress, DocumentVersionPage, KnowledgeBase, KnowledgeDocument, WikiConfig, WikiJob, WikiPage, WikiPageSummary, WikiSearchResult, WikiVersion } from '../types/knowledge'
 
 const base = '/api/v1'
 
@@ -36,6 +36,11 @@ export const knowledgeApi = {
   updateBase: (id: string, changes: Partial<Pick<KnowledgeBase, 'name' | 'description' | 'enabled'>>) => request<KnowledgeBase>(`/knowledge-bases/${id}`, json('PATCH', changes)),
   deleteBase: (id: string, confirm: boolean) => request<void>(`/knowledge-bases/${id}?confirm=${confirm}`, { method: 'DELETE' }),
   listDocuments: (id: string) => request<KnowledgeDocument[]>(`/knowledge-bases/${id}/documents`),
+  getDocument: (id: string) => request<DocumentDetail>(`/documents/${id}`),
+  listDocumentVersions: (id: string, options: { cursor?: string | null; limit?: number } = {}) =>
+    request<DocumentVersionPage>(`/documents/${id}/versions${query({ cursor: options.cursor, limit: options.limit })}`),
+  previewDocument: (id: string, options: { versionId?: string | null; cursor?: string | null; limit?: number; anchorChunkId?: string | null } = {}) =>
+    request<DocumentPreview>(`/documents/${id}/preview${query({ version_id: options.versionId, cursor: options.cursor, limit: options.limit, anchor_chunk_id: options.anchorChunkId })}`),
   upload: (id: string, file: File, newVersion = false) => {
     const body = new FormData()
     body.append('file', file)
@@ -47,19 +52,24 @@ export const knowledgeApi = {
   getWikiConfig: (id: string) => request<WikiConfig>(`/knowledge-bases/${id}/wiki/config`),
   updateWikiConfig: (id: string, changes: Partial<Pick<WikiConfig, 'enabled' | 'token_limit'>>) => request<WikiConfig>(`/knowledge-bases/${id}/wiki/config`, json('PATCH', changes)),
   listWikiPages: (id: string, cursor?: string) => request<WikiPageSummary[]>(`/knowledge-bases/${id}/wiki/pages?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`),
-  getWikiPage: (id: string, pageId: string) => request<WikiPage>(`/knowledge-bases/${id}/wiki/pages/${pageId}`),
+  rebuildWikiAggregation: (id: string) => request<{ knowledge_base_id: string; topic_pages: number; summary_pages: number }>(`/knowledge-bases/${id}/wiki/rebuild-aggregation`, { method: 'POST' }),
+  getWikiPage: (id: string, pageId: string, options: { claimCursor?: string | null; claimLimit?: number } = {}) =>
+    request<WikiPage>(`/knowledge-bases/${id}/wiki/pages/${pageId}${query({ claim_cursor: options.claimCursor, claim_limit: options.claimLimit })}`),
   listWikiVersions: (id: string, pageId: string) => request<WikiVersion[]>(`/knowledge-bases/${id}/wiki/pages/${pageId}/versions`),
   listWikiJobs: (id: string) => request<WikiJob[]>(`/knowledge-bases/${id}/wiki/jobs`),
   searchWiki: (
     id: string,
     searchQuery: string,
-    options: { mode?: 'hybrid' | 'semantic' | 'keyword'; limit?: number; claimLimit?: number } = {},
+    options: { mode?: 'hybrid' | 'semantic' | 'keyword'; limit?: number; claimLimit?: number; cursor?: string | null } = {},
   ) => request<WikiSearchResult>(`/knowledge-bases/${id}/wiki/search${query({
     q: searchQuery,
     mode: options.mode ?? 'hybrid',
     limit: options.limit ?? 5,
     claim_limit: options.claimLimit ?? 12,
+    cursor: options.cursor,
   })}`),
+  retryWikiIndex: (id: string, pageId: string) => request<{ job_id: string; page_version_id: string }>(`/knowledge-bases/${id}/wiki/pages/${pageId}/index/retry`, { method: 'POST' }),
+  backfillWikiIndex: (id: string) => request<{ created_jobs: number; existing_jobs: number; skipped_versions: number }>(`/knowledge-bases/${id}/wiki/index/backfill`, { method: 'POST' }),
   editWikiPage: (id: string, pageId: string, baseVersion: string, title: string, content: string) => request<WikiPage>(`/knowledge-bases/${id}/wiki/pages/${pageId}`, json('PUT', { base_version: baseVersion, title, content })),
   revertWikiPage: (id: string, pageId: string, baseVersion: string, targetVersionId: string) => request<WikiPage>(`/knowledge-bases/${id}/wiki/pages/${pageId}/revert`, json('POST', { base_version: baseVersion, target_version_id: targetVersionId })),
   reviewWikiPage: (id: string, pageId: string, candidateVersionId: string, baseVersion: string, decision: 'publish' | 'reject') => request<WikiVersion>(`/knowledge-bases/${id}/wiki/pages/${pageId}/review`, json('POST', { candidate_version_id: candidateVersionId, base_version: baseVersion, decision })),

@@ -17,12 +17,19 @@ class Source:
     excerpt: str
     score: float
     rank: int
+    parent_chunk_id: UUID | None = None
+    focus_start: int | None = None
+    focus_end: int | None = None
+    valid: bool = True
+    invalid_reason: str | None = None
 
     def public_dict(self) -> dict[str, object]:
         result = asdict(self)
         result["chunk_id"] = str(self.chunk_id)
         result["document_id"] = str(self.document_id)
         result["document_version_id"] = str(self.document_version_id)
+        if self.parent_chunk_id is not None:
+            result["parent_chunk_id"] = str(self.parent_chunk_id)
         result["heading_path"] = list(self.heading_path)
         return result
 

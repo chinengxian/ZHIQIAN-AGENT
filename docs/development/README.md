@@ -12,6 +12,7 @@
 - 多模型策略增量需求：[`../requirements/REQ-004.md`](../requirements/REQ-004.md)
 - 原生知识库与多级 RAG 需求：[`../requirements/REQ-005.md`](../requirements/REQ-005.md)
 - Wiki 需求与验收：[`../requirements/REQ-006.md`](../requirements/REQ-006.md)（confirmed）
+- 文档详情与正文预览需求：[`../requirements/REQ-007.md`](../requirements/REQ-007.md)（confirmed）
 - 待决策事项：[`../decisions/DEC-001.md`](../decisions/DEC-001.md)
 - 前端框架决定：[`../decisions/DEC-002.md`](../decisions/DEC-002.md)
 - 首批多模型供应商决定：[`../decisions/DEC-003.md`](../decisions/DEC-003.md)
@@ -29,6 +30,8 @@
 - Wiki 实施计划：[`../superpowers/plans/2026-09-22-wiki-synthesis.md`](../superpowers/plans/2026-09-22-wiki-synthesis.md)（approved）
 - Wiki 来源驱动混合检索设计：[`../superpowers/specs/2026-10-06-wiki-provenance-hybrid-search-design.md`](../superpowers/specs/2026-10-06-wiki-provenance-hybrid-search-design.md)（confirmed）
 - Wiki 来源驱动混合检索计划：[`../superpowers/plans/2026-10-06-wiki-provenance-hybrid-search.md`](../superpowers/plans/2026-10-06-wiki-provenance-hybrid-search.md)（approved）
+- 文档详情与正文预览技术设计：[`../superpowers/specs/2026-10-05-document-inspection-design.md`](../superpowers/specs/2026-10-05-document-inspection-design.md)（approved）
+- 文档详情与正文预览实施计划：[`../superpowers/plans/2026-10-05-document-inspection.md`](../superpowers/plans/2026-10-05-document-inspection.md)（approved）
 - 原生知识库中文链路说明：[`knowledge-infrastructure-flow.md`](knowledge-infrastructure-flow.md)
 - 集成验收报告：[`../verification/VERIFY-001.md`](../verification/VERIFY-001.md)
 - Agent 记忆改造验收：[`../verification/VERIFY-002.md`](../verification/VERIFY-002.md)
@@ -54,6 +57,11 @@
 - 原生知识库集成验收任务：[`../tasks/TASK-025.md`](../tasks/TASK-025.md)
 - Wiki 设计任务（done）：[`../tasks/TASK-026.md`](../tasks/TASK-026.md)
 - Wiki 实施验证：[`../verification/VERIFY-005.md`](../verification/VERIFY-005.md)
+- 文档查看规划任务（done）：[`../tasks/TASK-032.md`](../tasks/TASK-032.md)
+- 文档查看后端任务（done）：[`../tasks/TASK-033.md`](../tasks/TASK-033.md)
+- 文档查看前端任务（done）：[`../tasks/TASK-034.md`](../tasks/TASK-034.md)
+- 文档查看集成验收任务（done）：[`../tasks/TASK-035.md`](../tasks/TASK-035.md)
+- 文档查看集成验收：[`../verification/VERIFY-006.md`](../verification/VERIFY-006.md)
 
 ## 项目状态
 
@@ -65,6 +73,7 @@
 - 增量改造：TASK-009～TASK-012 全部完成；`create_agent` 短期记忆、前端新契约和桌面／移动全栈验收均通过。
 - 多模型策略：REQ-004 已完成。TASK-016 与 TASK-017 均为 `done`，VERIFY-003 为 `PASS`。最终新鲜证据为 12 项聚焦验收、69 个后端测试、Ruff／format／mypy／依赖门，以及固定 Node v22.23.2 下 20 个前端测试、构建和 desktop/mobile E2E；未选中畸形 URL、不可变注册表、未知 provider 与同／异会话并发要求均已显式覆盖。
 - 原生知识库开发：REQ-005 的 TASK-019～TASK-025 均已完成，最终证据见 VERIFY-004。四格式上传、异步入库、真实 Milvus 检索、选定范围聊天与引用已通过真实 API/Worker 和桌面／移动浏览器闭环；真实容器后端 183 项、真实浏览器 4 项、前端单测 27 项均通过。固定集 Recall@8=1.0；真实付费供应商联网未运行。Wiki 规格已确认，TASK-026 完成，TASK-027～031 按依赖实施。
+- 文档查看增量：REQ-007 已完成。TASK-032～TASK-035 均为 `done`，最终证据见 VERIFY-006；已补充文档详情 API、版本分页、正文预览、前端详情深链、Wiki 来源跳转与真实 API/数据库/浏览器闭环。
 - Git：当前目录现为 Git 仓库；原生知识库设计基线为 `83c58e2`，新任务从该修订开始。
 
 ## Wiki 固定检索评测
@@ -90,3 +99,5 @@ $env:AGENT_WIKI_TEST_DATABASE_URL='postgresql+asyncpg://<user>:<password>@127.0.
 REQ-003 与 REQ-004 均已完成，证据分别见 VERIFY-002 与 VERIFY-003。若继续多模型工作，从已关闭的 TASK-016／TASK-017 和 VERIFY-003 的范围边界恢复；当前没有遗留实现阻碍。部署时用户仍须在私有 `.env` 显式增加 `AGENT_MODEL_PROVIDER` 并重启；真实付费供应商验证为 `not_run`，生产持久化、工具调用、请求级选模、热切换和记忆治理不在当前范围。
 
 恢复原生知识库开发时先看 VERIFY-004 与已关闭的 TASK-025；Wiki 从 REQ-006、技术设计、实施计划及 VERIFY-005 恢复。TASK-027～TASK-030 已完成；TASK-031 还需真实付费模型质量和供应商用量对照。
+
+恢复文档查看功能时，从 REQ-007、`2026-10-05-document-inspection-design.md`、TASK-033～TASK-035 和 VERIFY-006 恢复；当前范围已完成，不依赖 TASK-031 的付费模型验证。后续若要做原文件下载、PDF/Office 原生阅读或正文编辑，应另建需求。

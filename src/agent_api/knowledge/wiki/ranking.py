@@ -2,10 +2,70 @@ from __future__ import annotations
 
 import re
 from collections.abc import Hashable, Sequence
-from typing import TypeVar
+from dataclasses import dataclass
+from typing import Protocol, TypeVar
+from uuid import UUID
 
 RankKey = TypeVar("RankKey", bound=Hashable)
 MmrKey = TypeVar("MmrKey")
+
+
+@dataclass(frozen=True, slots=True)
+class WikiScoredCandidate:
+    unit_id: UUID
+    page_id: UUID
+    claim_id: UUID
+    rrf_score: float
+    dense_score: float | None
+    keyword_score: float | None
+    keyword_coverage: float
+    rerank_score: float | None
+    exact_metadata_match: bool
+
+
+class WikiScorer(Protocol):
+    async def score(self, query: str, texts: list[str]) -> list[float]: ...
+
+
+def _candidate_rank_score(candidate: WikiScoredCandidate) -> float:
+    if candidate.rerank_score is not None:
+        return candidate.rerank_score
+    values = [
+        candidate.rrf_score,
+        candidate.keyword_coverage,
+    ]
+    if candidate.dense_score is not None:
+        values.append(candidate.dense_score)
+    if candidate.keyword_score is not None:
+        values.append(candidate.keyword_score)
+    return max(values)
+
+
+def deduplicate_scored_candidates(
+    candidates: Sequence[WikiScoredCandidate],
+    *,
+    fact_fingerprints: dict[UUID, str],
+) -> list[WikiScoredCandidate]:
+    """按事实指纹去重；同事实保留相关性最高且 ID 稳定最小的候选。"""
+
+    best_by_fingerprint: dict[str, WikiScoredCandidate] = {}
+    for candidate in candidates:
+        fingerprint = fact_fingerprints[candidate.unit_id]
+        current = best_by_fingerprint.get(fingerprint)
+        if current is None:
+            best_by_fingerprint[fingerprint] = candidate
+            continue
+        candidate_score = _candidate_rank_score(candidate)
+        current_score = _candidate_rank_score(current)
+        if candidate_score > current_score or (
+            candidate_score == current_score and str(candidate.unit_id) < str(current.unit_id)
+        ):
+            best_by_fingerprint[fingerprint] = candidate
+    ordered = sorted(
+        best_by_fingerprint.values(),
+        key=lambda candidate: (-_candidate_rank_score(candidate), str(candidate.unit_id)),
+    )
+    return ordered
 
 
 def reciprocal_rank_fusion(
@@ -32,9 +92,7 @@ def reciprocal_rank_fusion(
                 first_seen[item] = sequence
                 sequence += 1
             scores[item] = scores.get(item, 0.0) + 1.0 / (k + rank)
-    return dict(
-        sorted(scores.items(), key=lambda item: (-item[1], first_seen[item[0]]))
-    )
+    return dict(sorted(scores.items(), key=lambda item: (-item[1], first_seen[item[0]])))
 
 
 def _tokens(text: str) -> set[str]:
@@ -80,8 +138,7 @@ def select_mmr(
             ) -> tuple[float, int]:
                 index, candidate = item
                 redundancy = max(
-                    _jaccard(token_sets[index], selected_set)
-                    for selected_set in selected_sets
+                    _jaccard(token_sets[index], selected_set) for selected_set in selected_sets
                 )
                 value = lambda_ * candidate[1] - (1 - lambda_) * redundancy
                 return value, -index

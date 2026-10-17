@@ -3,7 +3,12 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from agent_api.core.config import EmbeddingProvider, ModelProvider, Settings
+from agent_api.core.config import (
+    EmbeddingProvider,
+    ModelProvider,
+    Settings,
+    WikiSearchBackend,
+)
 
 
 def knowledge_settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -42,6 +47,106 @@ def test_knowledge_configuration_keeps_credentials_secret(tmp_path: Path) -> Non
     assert "embedding-secret" not in repr(settings)
     assert "milvus-secret" not in repr(settings)
     assert "secret@db" not in repr(settings)
+
+
+def test_wiki_index_defaults_are_safe_and_legacy_compatible(tmp_path: Path) -> None:
+    settings = knowledge_settings(tmp_path)
+
+    assert settings.wiki_index_enabled is False
+    assert settings.wiki_search_backend is WikiSearchBackend.LEGACY
+    assert settings.wiki_milvus_collection_alias == "wiki_units"
+    assert settings.wiki_milvus_collection_version == "wiki_units_v1"
+    assert settings.wiki_index_protocol_version == "wiki-index-v1"
+    assert settings.wiki_relevance_profile == "wiki-relevance-v1"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("wiki_dense_threshold", -0.01),
+        ("wiki_dense_threshold", 1.01),
+        ("wiki_rerank_threshold", -0.01),
+        ("wiki_rerank_threshold", 1.01),
+        ("wiki_keyword_coverage_threshold", -0.01),
+        ("wiki_keyword_coverage_threshold", 1.01),
+    ],
+)
+def test_wiki_thresholds_must_be_in_closed_unit_interval(
+    tmp_path: Path,
+    field: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValidationError, match=field):
+        knowledge_settings(tmp_path, **{field: value})
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "wiki_milvus_collection_alias",
+        "wiki_milvus_collection_version",
+        "wiki_index_protocol_version",
+        "wiki_relevance_profile",
+    ],
+)
+def test_enabled_wiki_index_rejects_blank_identity_fields(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    with pytest.raises(ValidationError) as captured:
+        knowledge_settings(tmp_path, wiki_index_enabled=True, **{field: "   "})
+
+    assert any(detail["loc"] == (field,) for detail in captured.value.errors())
+
+
+@pytest.mark.parametrize("backend", ["shadow", "independent"])
+def test_non_legacy_wiki_backend_requires_enabled_index(
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    with pytest.raises(ValidationError, match="wiki_index_enabled"):
+        knowledge_settings(
+            tmp_path,
+            wiki_search_backend=backend,
+            wiki_index_enabled=False,
+        )
+
+
+def test_legacy_wiki_backend_allows_disabled_index(tmp_path: Path) -> None:
+    settings = knowledge_settings(
+        tmp_path,
+        wiki_search_backend="legacy",
+        wiki_index_enabled=False,
+    )
+
+    assert settings.wiki_search_backend is WikiSearchBackend.LEGACY
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [WikiSearchBackend.SHADOW, WikiSearchBackend.INDEPENDENT],
+)
+def test_disabled_knowledge_rejects_non_legacy_backend_without_index(
+    backend: WikiSearchBackend,
+) -> None:
+    secret = "pure-chat-secret"
+
+    with pytest.raises(ValidationError) as captured:
+        Settings(
+            model_provider=ModelProvider.OPENAI,
+            openai_base_url="https://chat.example.test/v1",
+            openai_api_key=SecretStr(secret),
+            openai_model="chat-model",
+            knowledge_enabled=False,
+            wiki_search_backend=backend,
+            wiki_index_enabled=False,
+            _env_file=None,  # type: ignore[call-arg]
+        )
+
+    error = captured.value
+    assert any(detail["loc"] == ("wiki_index_enabled",) for detail in error.errors())
+    assert secret not in str(error)
+    assert secret not in repr(error)
 
 
 def test_embedding_provider_defaults_to_dashscope() -> None:
@@ -109,3 +214,5 @@ def test_disabled_knowledge_preserves_minimal_chat_configuration() -> None:
     )
 
     assert settings.knowledge_enabled is False
+    assert settings.wiki_search_backend is WikiSearchBackend.LEGACY
+    assert settings.wiki_index_enabled is False

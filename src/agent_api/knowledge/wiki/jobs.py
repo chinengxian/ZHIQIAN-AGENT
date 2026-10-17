@@ -15,7 +15,7 @@ from agent_api.knowledge.infrastructure.database.models import (
     WikiJob,
 )
 
-WIKI_PIPELINE_VERSION = "wiki-v1"
+WIKI_PIPELINE_VERSION = "wiki-v2"
 
 
 async def schedule_document_wiki(

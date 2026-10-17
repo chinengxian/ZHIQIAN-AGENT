@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from uuid import UUID
 
@@ -39,3 +40,27 @@ def test_public_source_omits_storage_path_and_embedding() -> None:
     payload = source.public_dict()
     assert payload["citation_id"] == "[1]"
     assert not {"file_path", "storage_path", "embedding", "dense_vector"} & payload.keys()
+
+
+def test_public_source_serializes_parent_chunk_id_for_json_payloads() -> None:
+    parent_chunk_id = UUID(int=4)
+    source = Source(
+        citation_id="[1]",
+        chunk_id=UUID(int=1),
+        document_id=UUID(int=2),
+        document_version_id=UUID(int=3),
+        title="指南",
+        filename="guide.pdf",
+        page_start=2,
+        page_end=2,
+        heading_path=("安装",),
+        excerpt="正文片段",
+        score=0.8,
+        rank=1,
+        parent_chunk_id=parent_chunk_id,
+    )
+
+    payload = source.public_dict()
+
+    assert payload["parent_chunk_id"] == str(parent_chunk_id)
+    assert json.dumps({"sources": [payload]}, ensure_ascii=False)

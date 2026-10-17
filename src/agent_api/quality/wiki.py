@@ -35,6 +35,11 @@ class WikiQualityPlan:
 WikiQualityRunner = Callable[[tuple[str, ...], dict[str, str]], int]
 
 _LINT_FILES = (
+    "src/agent_api/knowledge/wiki",
+    "src/agent_api/knowledge/infrastructure/milvus/wiki_index.py",
+    "src/agent_api/knowledge/infrastructure/observability/events.py",
+    "src/agent_api/core/config.py",
+    "src/agent_api/core/lifespan.py",
     "src/agent_api/quality/wiki.py",
     "tests/eval/wiki_eval_report.py",
     "tests/eval/test_wiki_eval_report.py",
